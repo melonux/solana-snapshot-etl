@@ -6,6 +6,23 @@
 
 **`solana-snapshot-etl` efficiently extracts all accounts in a snapshot** to load them into an external system.
 
+## Project Status
+
+This repository is a maintained fork of the original project by terorie:
+
+- Original upstream (archived): https://github.com/riptl/solana-snapshot-etl
+- This maintained fork: https://github.com/melonux/solana-snapshot-etl
+
+The goal of this fork is to keep the ETL workflow usable with modern Solana/Agave snapshots and provide practical operational diagnostics.
+
+### Key changes in this fork
+
+- Updated AppendVec account layout parsing for modern snapshots.
+- Added Token-2022 account decoding support (account, mint, multisig) in SQLite output.
+- Added parser diagnostics and compatibility counters in SQLite summary logs.
+- Added unpacked snapshot progress logging with total files and percentage processed.
+- Clarified CSV behavior (writes to stdout).
+
 ## Motivation
 
 Solana nodes periodically backup their account database into a `.tar.zst` "snapshot" stream.
@@ -23,7 +40,7 @@ Despite archives being readily available, the ecosystem was missing an easy-to-u
 ## Building
 
 ```shell
-cargo install --git https://github.com/terorie/solana-snapshot-etl --features=standalone --bins
+cargo install --git https://github.com/melonux/solana-snapshot-etl --features=standalone --bins
 ```
 
 ## Usage
@@ -76,14 +93,18 @@ solana-snapshot-etl snapshot-139240745-*.tar.zst --sqlite-out snapshot.db
 The resulting SQLite database contains the following tables.
 
 - `account`
-- `token_account` (SPL Token Program)
-- `token_mint` (SPL Token Program)
-- `token_multisig` (SPL Token Program)
+- `token_account` (SPL Token Program and Token-2022 Program)
+- `token_mint` (SPL Token Program and Token-2022 Program)
+- `token_multisig` (SPL Token Program and Token-2022 Program)
 - `token_metadata` (MPL Metadata Program)
 
 #### CSV
 
-Coming soon!
+The CSV target writes records to stdout. Redirect stdout to save into a file.
+
+```shell
+solana-snapshot-etl snapshot-139240745-*.tar.zst --csv > snapshot.csv
+```
 
 #### Geyser plugin
 
