@@ -2,13 +2,16 @@ use borsh::BorshDeserialize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::{error, warn};
 use rusqlite::{params, Connection};
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::program_pack::Pack;
 use solana_snapshot_etl::append_vec::{AppendVec, StoredAccountMeta};
 use solana_snapshot_etl::parallel::{AppendVecConsumer, GenericResult};
 use solana_snapshot_etl::{append_vec_iter, AppendVecIterator};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
 use crate::mpl_metadata;
@@ -33,6 +36,17 @@ struct Progress {
 pub(crate) struct IndexStats {
     pub(crate) accounts_total: u64,
     pub(crate) token_accounts_total: u64,
+    pub(crate) skipped_append_vecs: u64,
+    pub(crate) append_vecs_total: u64,
+    pub(crate) nonempty_zero_account_append_vecs: u64,
+    pub(crate) spl_token_owner_accounts_seen: u64,
+    pub(crate) spl_token_accounts_parsed: u64,
+    pub(crate) spl_token_unexpected_size: u64,
+    pub(crate) spl_token_unpack_failed: u64,
+    pub(crate) token_2022_owner_accounts_seen: u64,
+    pub(crate) token_2022_accounts_parsed: u64,
+    pub(crate) token_2022_unexpected_size: u64,
+    pub(crate) token_2022_unpack_failed: u64,
 }
 
 impl SqliteIndexer {
@@ -173,14 +187,48 @@ CREATE TABLE token_metadata (
         let mut worker = Worker {
             db: &self.db,
             progress: Arc::clone(&self.progress),
+            spl_token_owner_accounts_seen: 0,
+            spl_token_accounts_parsed: 0,
+            spl_token_unexpected_size: 0,
+            spl_token_unpack_failed: 0,
+            token_2022_owner_accounts_seen: 0,
+            token_2022_accounts_parsed: 0,
+            token_2022_unexpected_size: 0,
+            token_2022_unpack_failed: 0,
         };
-        for append_vec in iterator {
-            worker.on_append_vec(append_vec?)?;
+        let mut skipped_append_vecs = 0u64;
+        let mut append_vecs_total = 0u64;
+        let mut nonempty_zero_account_append_vecs = 0u64;
+        for (append_vec_idx, append_vec) in iterator.enumerate() {
+            match append_vec {
+                Ok(append_vec) => {
+                    append_vecs_total += 1;
+                    let parsed_accounts = worker.on_append_vec_count(append_vec)?;
+                    if parsed_accounts == 0 {
+                        nonempty_zero_account_append_vecs += 1;
+                    }
+                }
+                Err(err) => {
+                    skipped_append_vecs += 1;
+                    warn!("[sqlite] Skipping append vec #{}: {}", append_vec_idx, err);
+                }
+            }
         }
         self.db.pragma_update(None, "query_only", true)?;
         let stats = IndexStats {
             accounts_total: self.progress.accounts_counter.get(),
             token_accounts_total: self.progress.token_accounts_counter.get(),
+            skipped_append_vecs,
+            append_vecs_total,
+            nonempty_zero_account_append_vecs,
+            spl_token_owner_accounts_seen: worker.spl_token_owner_accounts_seen,
+            spl_token_accounts_parsed: worker.spl_token_accounts_parsed,
+            spl_token_unexpected_size: worker.spl_token_unexpected_size,
+            spl_token_unpack_failed: worker.spl_token_unpack_failed,
+            token_2022_owner_accounts_seen: worker.token_2022_owner_accounts_seen,
+            token_2022_accounts_parsed: worker.token_2022_accounts_parsed,
+            token_2022_unexpected_size: worker.token_2022_unexpected_size,
+            token_2022_unpack_failed: worker.token_2022_unpack_failed,
         };
         self.db_temp_guard.promote(self.db_path)?;
         let _ = &self.multi_progress;
@@ -191,27 +239,114 @@ CREATE TABLE token_metadata (
 struct Worker<'a> {
     db: &'a Connection,
     progress: Arc<Progress>,
+    spl_token_owner_accounts_seen: u64,
+    spl_token_accounts_parsed: u64,
+    spl_token_unexpected_size: u64,
+    spl_token_unpack_failed: u64,
+    token_2022_owner_accounts_seen: u64,
+    token_2022_accounts_parsed: u64,
+    token_2022_unexpected_size: u64,
+    token_2022_unpack_failed: u64,
+}
+
+fn token_2022_program_id() -> &'static Pubkey {
+    static TOKEN_2022_ID: OnceLock<Pubkey> = OnceLock::new();
+    TOKEN_2022_ID.get_or_init(|| {
+        Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+            .expect("invalid Token-2022 program id")
+    })
 }
 
 impl<'a> AppendVecConsumer for Worker<'a> {
     fn on_append_vec(&mut self, append_vec: AppendVec) -> GenericResult<()> {
-        for acc in append_vec_iter(Rc::new(append_vec)) {
-            self.insert_account(&acc.access().unwrap())?;
-        }
+        let _ = self.on_append_vec_count(append_vec)?;
         Ok(())
     }
 }
 
 impl<'a> Worker<'a> {
+    fn on_append_vec_count(&mut self, append_vec: AppendVec) -> Result<u64> {
+        let append_vec_len = append_vec.len();
+        let append_vec_rc = Rc::new(append_vec);
+        let mut parsed_accounts = 0u64;
+
+        for acc in append_vec_iter(Rc::clone(&append_vec_rc)) {
+            self.insert_account(&acc.access().unwrap())?;
+            parsed_accounts += 1;
+        }
+
+        if append_vec_len > 0 && parsed_accounts == 0 {
+            warn!(
+                "[sqlite] Non-empty append vec produced 0 accounts (len={})",
+                append_vec_len
+            );
+        }
+
+        Ok(parsed_accounts)
+    }
     fn insert_account(&mut self, account: &StoredAccountMeta) -> Result<()> {
         self.insert_account_meta(account)?;
         if account.account_meta.owner == spl_token::id() {
+            self.spl_token_owner_accounts_seen += 1;
             self.insert_token(account)?;
+        } else if account.account_meta.owner == *token_2022_program_id() {
+            self.token_2022_owner_accounts_seen += 1;
+            self.insert_token_2022(account)?;
         }
         if account.account_meta.owner == mpl_metadata::id() {
             self.insert_token_metadata(account)?;
         }
         self.progress.accounts_counter.inc();
+        Ok(())
+    }
+
+    fn insert_token_2022(&mut self, account: &StoredAccountMeta) -> Result<()> {
+        let mut parsed = false;
+        match account.meta.data_len as usize {
+            spl_token_2022::state::Account::LEN => {
+                match spl_token_2022::state::Account::unpack(account.data) {
+                    Ok(token_account) => {
+                        self.insert_token_account_2022(account, &token_account)?;
+                        parsed = true;
+                    }
+                    Err(_) => {
+                        self.token_2022_unpack_failed += 1;
+                    }
+                }
+            }
+            spl_token_2022::state::Mint::LEN => {
+                match spl_token_2022::state::Mint::unpack(account.data) {
+                    Ok(token_mint) => {
+                        self.insert_token_mint_2022(account, &token_mint)?;
+                        parsed = true;
+                    }
+                    Err(_) => {
+                        self.token_2022_unpack_failed += 1;
+                    }
+                }
+            }
+            spl_token_2022::state::Multisig::LEN => {
+                match spl_token_2022::state::Multisig::unpack(account.data) {
+                    Ok(token_multisig) => {
+                        self.insert_token_multisig_2022(account, &token_multisig)?;
+                        parsed = true;
+                    }
+                    Err(_) => {
+                        self.token_2022_unpack_failed += 1;
+                    }
+                }
+            }
+            _ => {
+                self.token_2022_unexpected_size += 1;
+                return Ok(());
+            }
+        }
+
+        if parsed {
+            self.token_2022_accounts_parsed += 1;
+            self.progress.token_accounts_counter.inc();
+        }
+
         Ok(())
     }
 
@@ -233,31 +368,52 @@ INSERT OR REPLACE INTO account (pubkey, data_len, owner, lamports, executable, r
     }
 
     fn insert_token(&mut self, account: &StoredAccountMeta) -> Result<()> {
+        let mut parsed = false;
         match account.meta.data_len as usize {
             spl_token::state::Account::LEN => {
-                if let Ok(token_account) = spl_token::state::Account::unpack(account.data) {
-                    self.insert_token_account(account, &token_account)?;
+                match spl_token::state::Account::unpack(account.data) {
+                    Ok(token_account) => {
+                        self.insert_token_account(account, &token_account)?;
+                        parsed = true;
+                    }
+                    Err(_) => {
+                        self.spl_token_unpack_failed += 1;
+                    }
                 }
             }
             spl_token::state::Mint::LEN => {
-                if let Ok(token_mint) = spl_token::state::Mint::unpack(account.data) {
-                    self.insert_token_mint(account, &token_mint)?;
+                match spl_token::state::Mint::unpack(account.data) {
+                    Ok(token_mint) => {
+                        self.insert_token_mint(account, &token_mint)?;
+                        parsed = true;
+                    }
+                    Err(_) => {
+                        self.spl_token_unpack_failed += 1;
+                    }
                 }
             }
             spl_token::state::Multisig::LEN => {
-                if let Ok(token_multisig) = spl_token::state::Multisig::unpack(account.data) {
-                    self.insert_token_multisig(account, &token_multisig)?;
+                match spl_token::state::Multisig::unpack(account.data) {
+                    Ok(token_multisig) => {
+                        self.insert_token_multisig(account, &token_multisig)?;
+                        parsed = true;
+                    }
+                    Err(_) => {
+                        self.spl_token_unpack_failed += 1;
+                    }
                 }
             }
             _ => {
-                warn!(
-                    "Token program account {} has unexpected size {}",
-                    account.meta.pubkey, account.meta.data_len
-                );
+                self.spl_token_unexpected_size += 1;
                 return Ok(());
             }
         }
-        self.progress.token_accounts_counter.inc();
+
+        if parsed {
+            self.spl_token_accounts_parsed += 1;
+            self.progress.token_accounts_counter.inc();
+        }
+
         Ok(())
     }
 
@@ -306,6 +462,68 @@ INSERT OR REPLACE INTO token_mint (pubkey, mint_authority, supply, decimals, is_
         &mut self,
         account: &StoredAccountMeta,
         token_multisig: &spl_token::state::Multisig,
+    ) -> Result<()> {
+        let mut token_multisig_insert = self.db.prepare_cached(
+            "\
+INSERT OR REPLACE INTO token_multisig (pubkey, signer, m, n)
+    VALUES (?, ?, ?, ?);",
+        )?;
+        for signer in &token_multisig.signers[..token_multisig.n as usize] {
+            token_multisig_insert.insert(params![
+                account.meta.pubkey.as_ref(),
+                signer.as_ref(),
+                token_multisig.m,
+                token_multisig.n
+            ])?;
+        }
+        Ok(())
+    }
+
+    fn insert_token_account_2022(
+        &mut self,
+        account: &StoredAccountMeta,
+        token_account: &spl_token_2022::state::Account,
+    ) -> Result<()> {
+        let mut token_account_insert = self.db.prepare_cached("\
+INSERT OR REPLACE INTO token_account (pubkey, mint, owner, amount, delegate, state, is_native, delegated_amount, close_authority)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);")?;
+        token_account_insert.insert(params![
+            account.meta.pubkey.as_ref(),
+            token_account.mint.as_ref(),
+            token_account.owner.as_ref(),
+            token_account.amount as i64,
+            Option::<[u8; 32]>::from(token_account.delegate.map(|key| key.to_bytes())),
+            token_account.state as u8,
+            Option::<u64>::from(token_account.is_native),
+            token_account.delegated_amount as i64,
+            Option::<[u8; 32]>::from(token_account.close_authority.map(|key| key.to_bytes())),
+        ])?;
+        Ok(())
+    }
+
+    fn insert_token_mint_2022(
+        &mut self,
+        account: &StoredAccountMeta,
+        token_mint: &spl_token_2022::state::Mint,
+    ) -> Result<()> {
+        let mut token_mint_insert = self.db.prepare_cached("\
+INSERT OR REPLACE INTO token_mint (pubkey, mint_authority, supply, decimals, is_initialized, freeze_authority)
+    VALUES (?, ?, ?, ?, ?, ?);")?;
+        token_mint_insert.insert(params![
+            account.meta.pubkey.as_ref(),
+            Option::<[u8; 32]>::from(token_mint.mint_authority.map(|key| key.to_bytes()),),
+            token_mint.supply as i64,
+            token_mint.decimals,
+            token_mint.is_initialized,
+            Option::<[u8; 32]>::from(token_mint.freeze_authority.map(|key| key.to_bytes())),
+        ])?;
+        Ok(())
+    }
+
+    fn insert_token_multisig_2022(
+        &mut self,
+        account: &StoredAccountMeta,
+        token_multisig: &spl_token_2022::state::Multisig,
     ) -> Result<()> {
         let mut token_multisig_insert = self.db.prepare_cached(
             "\

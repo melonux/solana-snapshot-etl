@@ -3,8 +3,7 @@ use crate::{
     DeserializableVersionedBank, ReadProgressTracking, Result, SerializableAccountStorageEntry,
     SnapshotError, SnapshotExtractor, SNAPSHOTS_DIR,
 };
-use itertools::Itertools;
-use log::info;
+use log::{info, warn};
 use solana_runtime::snapshot_utils::SNAPSHOT_STATUS_CACHE_FILENAME;
 use std::fs::OpenOptions;
 use std::io::BufReader;
@@ -20,7 +19,7 @@ pub struct UnpackedSnapshotExtractor {
 
 impl SnapshotExtractor for UnpackedSnapshotExtractor {
     fn iter(&mut self) -> AppendVecIterator<'_> {
-        Box::new(self.unboxed_iter())
+        self.unboxed_iter()
     }
 }
 
@@ -76,23 +75,51 @@ impl UnpackedSnapshotExtractor {
         })
     }
 
-    pub fn unboxed_iter(&self) -> impl Iterator<Item = Result<AppendVec>> + '_ {
-        std::iter::once(self.iter_streams())
-            .flatten_ok()
-            .flatten_ok()
+    pub fn unboxed_iter(&self) -> AppendVecIterator<'_> {
+        match self.iter_streams() {
+            Ok(iter) => Box::new(iter),
+            Err(err) => Box::new(std::iter::once(Err(err))),
+        }
     }
 
     fn iter_streams(&self) -> Result<impl Iterator<Item = Result<AppendVec>> + '_> {
         let accounts_dir = self.root.join("accounts");
-        Ok(accounts_dir
+        let warn_accounts_dir = accounts_dir.clone();
+        let parsed_files = accounts_dir
             .read_dir()?
             .filter_map(|f| f.ok())
-            .filter_map(|f| {
+            .filter_map(move |f| {
                 let name = f.file_name();
-                parse_append_vec_name(&f.file_name()).map(move |parsed| (parsed, name))
+                let parsed = parse_append_vec_name(&name);
+                if parsed.is_none() {
+                    warn!(
+                        "Skipping non-appendvec file in accounts dir: {}",
+                        warn_accounts_dir.join(&name).display()
+                    );
+                }
+                parsed.map(|(slot, version)| (slot, version, accounts_dir.join(name)))
             })
-            .map(move |((slot, version), name)| {
-                self.open_append_vec(slot, version, &accounts_dir.join(name))
+            .collect::<Vec<_>>();
+
+        let total_files = parsed_files.len();
+        info!("Found {} appendvec files to process", total_files);
+
+        Ok(parsed_files
+            .into_iter()
+            .enumerate()
+            .map(move |(idx, (slot, version, path))| {
+                let processed = idx + 1;
+                if total_files > 0 {
+                    let percent = (processed as f64 * 100.0) / total_files as f64;
+                    info!(
+                        "AppendVec progress: {}/{} ({:.2}%) file={}",
+                        processed,
+                        total_files,
+                        percent,
+                        path.display()
+                    );
+                }
+                self.open_append_vec(slot, version, &path)
             }))
     }
 
@@ -105,13 +132,33 @@ impl UnpackedSnapshotExtractor {
             .unwrap_or(&[]);
         let known_vec = known_vecs.iter().find(|entry| entry.id == (id as usize));
         let known_vec = match known_vec {
-            None => return Err(SnapshotError::UnexpectedAppendVec),
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "appendvec {} (slot={}, id={}) does not exist in snapshot manifest",
+                        path.display(),
+                        slot,
+                        id
+                    ),
+                )
+                .into())
+            }
             Some(v) => v,
         };
 
-        Ok(AppendVec::new_from_file(
-            path,
-            known_vec.accounts_current_len,
-        )?)
+        Ok(AppendVec::new_from_file(path, known_vec.accounts_current_len).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to open/parse appendvec {} (slot={}, id={}, expected_len={}): {}",
+                    path.display(),
+                    slot,
+                    id,
+                    known_vec.accounts_current_len,
+                    e
+                ),
+            )
+        })?)
     }
 }

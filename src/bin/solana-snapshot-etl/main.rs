@@ -5,7 +5,7 @@ use crate::programs::ProgramDumper;
 use crate::sqlite::SqliteIndexer;
 use clap::{ArgGroup, Parser};
 use indicatif::{ProgressBar, ProgressBarIter, ProgressStyle};
-use log::{error, info};
+use log::{error, info, warn};
 use reqwest::blocking::Response;
 use solana_snapshot_etl::archived::ArchiveSnapshotExtractor;
 use solana_snapshot_etl::parallel::AppendVecConsumer;
@@ -62,10 +62,18 @@ fn _main() -> Result<(), Box<dyn std::error::Error>> {
     if args.csv {
         info!("Dumping to CSV");
         let mut writer = CsvDumper::new();
-        for append_vec in loader.iter() {
-            writer.dump_append_vec(append_vec?);
+        let mut skipped_append_vecs = 0u64;
+        for (append_vec_idx, append_vec) in loader.iter().enumerate() {
+            match append_vec {
+                Ok(append_vec) => writer.dump_append_vec(append_vec),
+                Err(err) => {
+                    skipped_append_vecs += 1;
+                    warn!("[csv] Skipping append vec #{}: {}", append_vec_idx, err);
+                }
+            }
         }
         drop(writer);
+        info!("[csv] Skipped {} append vec files", skipped_append_vecs);
         println!("Done!");
     }
     if let Some(geyser_config_path) = args.geyser {
@@ -76,10 +84,18 @@ fn _main() -> Result<(), Box<dyn std::error::Error>> {
             "Geyser plugin does not accept account data notifications"
         );
         let mut dumper = GeyserDumper::new(plugin);
-        for append_vec in loader.iter() {
-            dumper.on_append_vec(append_vec?)?;
+        let mut skipped_append_vecs = 0u64;
+        for (append_vec_idx, append_vec) in loader.iter().enumerate() {
+            match append_vec {
+                Ok(append_vec) => dumper.on_append_vec(append_vec)?,
+                Err(err) => {
+                    skipped_append_vecs += 1;
+                    warn!("[geyser] Skipping append vec #{}: {}", append_vec_idx, err);
+                }
+            }
         }
         drop(dumper);
+        info!("[geyser] Skipped {} append vec files", skipped_append_vecs);
         println!("Done!");
     }
     if let Some(sqlite_out_path) = args.sqlite_out {
@@ -98,6 +114,44 @@ fn _main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Done!");
         info!("Dumped {} accounts", stats.accounts_total);
         info!("Dumped {} token accounts", stats.token_accounts_total);
+        info!("Skipped {} append vec files", stats.skipped_append_vecs);
+        info!("Processed {} append vec files", stats.append_vecs_total);
+        info!(
+            "Non-empty append vec files producing 0 accounts: {}",
+            stats.nonempty_zero_account_append_vecs
+        );
+        info!(
+            "SPL-Token owner accounts seen: {}",
+            stats.spl_token_owner_accounts_seen
+        );
+        info!(
+            "SPL-Token accounts parsed successfully: {}",
+            stats.spl_token_accounts_parsed
+        );
+        info!(
+            "SPL-Token accounts with unexpected size: {}",
+            stats.spl_token_unexpected_size
+        );
+        info!(
+            "SPL-Token accounts with unpack failure: {}",
+            stats.spl_token_unpack_failed
+        );
+        info!(
+            "Token-2022 owner accounts seen (currently not decoded): {}",
+            stats.token_2022_owner_accounts_seen
+        );
+        info!(
+            "Token-2022 accounts parsed successfully: {}",
+            stats.token_2022_accounts_parsed
+        );
+        info!(
+            "Token-2022 accounts with unexpected size: {}",
+            stats.token_2022_unexpected_size
+        );
+        info!(
+            "Token-2022 accounts with unpack failure: {}",
+            stats.token_2022_unpack_failed
+        );
     }
     if let Some(programs) = args.programs_out {
         info!("Dumping program accounts to {}", &programs);
@@ -112,10 +166,18 @@ fn _main() -> Result<(), Box<dyn std::error::Error>> {
             )
         };
         let mut dumper = ProgramDumper::new(writer);
-        for append_vec in loader.iter() {
-            dumper.on_append_vec(append_vec?)?;
+        let mut skipped_append_vecs = 0u64;
+        for (append_vec_idx, append_vec) in loader.iter().enumerate() {
+            match append_vec {
+                Ok(append_vec) => dumper.on_append_vec(append_vec)?,
+                Err(err) => {
+                    skipped_append_vecs += 1;
+                    warn!("[programs] Skipping append vec #{}: {}", append_vec_idx, err);
+                }
+            }
         }
         drop(dumper);
+        info!("[programs] Skipped {} append vec files", skipped_append_vecs);
         info!("Done!");
     }
     Ok(())
