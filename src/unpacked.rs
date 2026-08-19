@@ -31,13 +31,19 @@ impl UnpackedSnapshotExtractor {
             return Err(SnapshotError::NoStatusCache);
         }
 
-        let snapshot_files = snapshots_dir.read_dir()?;
-
-        let snapshot_file_path = snapshot_files
+        let latest_snapshot_slot = snapshots_dir
+            .read_dir()?
             .filter_map(|entry| entry.ok())
-            .find(|entry| u64::from_str(&entry.file_name().to_string_lossy()).is_ok())
-            .map(|entry| entry.path().join(entry.file_name()))
+            .filter_map(|entry| u64::from_str(&entry.file_name().to_string_lossy()).ok())
+            .max()
             .ok_or(SnapshotError::NoSnapshotManifest)?;
+
+        let snapshot_file_path = snapshots_dir
+            .join(latest_snapshot_slot.to_string())
+            .join(latest_snapshot_slot.to_string());
+        if !snapshot_file_path.is_file() {
+            return Err(SnapshotError::NoSnapshotManifest);
+        }
 
         info!("Opening snapshot manifest: {:?}", snapshot_file_path);
         let snapshot_file = OpenOptions::new().read(true).open(&snapshot_file_path)?;
