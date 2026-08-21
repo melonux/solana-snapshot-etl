@@ -2,8 +2,8 @@ use borsh::BorshDeserialize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::{error, warn};
 use rusqlite::{params, Connection};
-use solana_sdk::pubkey::Pubkey;
 use solana_sdk::program_pack::Pack;
+use solana_sdk::pubkey::Pubkey;
 use solana_snapshot_etl::append_vec::{AppendVec, StoredAccountMeta};
 use solana_snapshot_etl::parallel::{AppendVecConsumer, GenericResult};
 use solana_snapshot_etl::{append_vec_iter, AppendVecIterator};
@@ -381,17 +381,15 @@ INSERT OR REPLACE INTO account (pubkey, data_len, owner, lamports, executable, r
                     }
                 }
             }
-            spl_token::state::Mint::LEN => {
-                match spl_token::state::Mint::unpack(account.data) {
-                    Ok(token_mint) => {
-                        self.insert_token_mint(account, &token_mint)?;
-                        parsed = true;
-                    }
-                    Err(_) => {
-                        self.spl_token_unpack_failed += 1;
-                    }
+            spl_token::state::Mint::LEN => match spl_token::state::Mint::unpack(account.data) {
+                Ok(token_mint) => {
+                    self.insert_token_mint(account, &token_mint)?;
+                    parsed = true;
                 }
-            }
+                Err(_) => {
+                    self.spl_token_unpack_failed += 1;
+                }
+            },
             spl_token::state::Multisig::LEN => {
                 match spl_token::state::Multisig::unpack(account.data) {
                     Ok(token_multisig) => {

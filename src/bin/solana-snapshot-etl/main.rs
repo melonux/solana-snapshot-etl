@@ -1,3 +1,4 @@
+use crate::clickhouse::ClickhouseIndexer;
 use crate::csv::CsvDumper;
 use crate::geyser::GeyserDumper;
 use crate::geyser_plugin::load_plugin;
@@ -15,6 +16,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{stdout, IoSliceMut, Read, Write};
 use std::path::{Path, PathBuf};
 
+mod clickhouse;
 mod csv;
 mod geyser;
 mod geyser_plugin;
@@ -27,7 +29,7 @@ mod sqlite;
 #[clap(group(
     ArgGroup::new("action")
         .required(true)
-        .args(&["csv", "geyser", "sqlite-out", "programs-out"]),
+        .args(&["csv", "geyser", "sqlite-out", "clickhouse", "programs-out"]),
 ))]
 struct Args {
     #[clap(help = "Snapshot source (unpacked snapshot, archive file, or HTTP link)")]
@@ -36,6 +38,12 @@ struct Args {
     csv: bool,
     #[clap(long, help = "Export to new SQLite3 DB at this path")]
     sqlite_out: Option<String>,
+    #[clap(
+        long,
+        action,
+        help = "Write to ClickHouse configured by CLICKHOUSE_URL"
+    )]
+    clickhouse: bool,
     #[clap(long, help = "SQLite3 cache size in MB")]
     sqlite_cache_size: Option<i64>,
     #[clap(long, action, help = "Index token program data")]
@@ -97,6 +105,20 @@ fn _main() -> Result<(), Box<dyn std::error::Error>> {
         drop(dumper);
         info!("[geyser] Skipped {} append vec files", skipped_append_vecs);
         println!("Done!");
+    }
+    if args.clickhouse {
+        dotenvy::dotenv().ok();
+        let clickhouse_url = std::env::var("CLICKHOUSE_URL")
+            .map_err(|_| "CLICKHOUSE_URL must be set in the environment or .env file")?;
+        let snapshot_slot = loader.snapshot_slot();
+        info!("Dumping snapshot slot {} to ClickHouse", snapshot_slot);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let stats = runtime.block_on(
+            ClickhouseIndexer::new(clickhouse_url, snapshot_slot)?.insert_all(loader.iter()),
+        )?;
+        log_clickhouse_index_stats(&stats);
     }
     if let Some(sqlite_out_path) = args.sqlite_out {
         info!("Dumping to SQLite3: {}", &sqlite_out_path);
@@ -172,15 +194,73 @@ fn _main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(append_vec) => dumper.on_append_vec(append_vec)?,
                 Err(err) => {
                     skipped_append_vecs += 1;
-                    warn!("[programs] Skipping append vec #{}: {}", append_vec_idx, err);
+                    warn!(
+                        "[programs] Skipping append vec #{}: {}",
+                        append_vec_idx, err
+                    );
                 }
             }
         }
         drop(dumper);
-        info!("[programs] Skipped {} append vec files", skipped_append_vecs);
+        info!(
+            "[programs] Skipped {} append vec files",
+            skipped_append_vecs
+        );
         info!("Done!");
     }
     Ok(())
+}
+
+fn log_clickhouse_index_stats(stats: &crate::clickhouse::IndexStats) {
+    info!("[clickhouse] Dumped {} accounts", stats.accounts_total);
+    info!(
+        "[clickhouse] Dumped {} token accounts",
+        stats.token_accounts_total
+    );
+    info!(
+        "[clickhouse] Skipped {} append vec files",
+        stats.skipped_append_vecs
+    );
+    info!(
+        "[clickhouse] Processed {} append vec files",
+        stats.append_vecs_total
+    );
+    info!(
+        "[clickhouse] Non-empty append vec files producing 0 accounts: {}",
+        stats.nonempty_zero_account_append_vecs
+    );
+    info!(
+        "[clickhouse] SPL-Token owner accounts seen: {}",
+        stats.spl_token_owner_accounts_seen
+    );
+    info!(
+        "[clickhouse] SPL-Token accounts parsed successfully: {}",
+        stats.spl_token_accounts_parsed
+    );
+    info!(
+        "[clickhouse] SPL-Token accounts with unexpected size: {}",
+        stats.spl_token_unexpected_size
+    );
+    info!(
+        "[clickhouse] SPL-Token accounts with unpack failure: {}",
+        stats.spl_token_unpack_failed
+    );
+    info!(
+        "[clickhouse] Token-2022 owner accounts seen: {}",
+        stats.token_2022_owner_accounts_seen
+    );
+    info!(
+        "[clickhouse] Token-2022 accounts parsed successfully: {}",
+        stats.token_2022_accounts_parsed
+    );
+    info!(
+        "[clickhouse] Token-2022 accounts with unexpected size: {}",
+        stats.token_2022_unexpected_size
+    );
+    info!(
+        "[clickhouse] Token-2022 accounts with unpack failure: {}",
+        stats.token_2022_unpack_failed
+    );
 }
 
 struct LoadProgressTracking {}
@@ -281,6 +361,14 @@ impl SnapshotExtractor for SupportedLoader {
             SupportedLoader::Unpacked(loader) => Box::new(loader.iter()),
             SupportedLoader::ArchiveFile(loader) => Box::new(loader.iter()),
             SupportedLoader::ArchiveDownload(loader) => Box::new(loader.iter()),
+        }
+    }
+
+    fn snapshot_slot(&self) -> u64 {
+        match self {
+            SupportedLoader::Unpacked(loader) => loader.snapshot_slot(),
+            SupportedLoader::ArchiveFile(loader) => loader.snapshot_slot(),
+            SupportedLoader::ArchiveDownload(loader) => loader.snapshot_slot(),
         }
     }
 }

@@ -5,3 +5,6 @@
 unpacked_snapshot/
 *.tar
 *.zst
+.env
+agave/
+.vscode/

@@ -14,12 +14,17 @@ use std::time::Instant;
 /// Extracts account data from snapshots that were unarchived to a file system.
 pub struct UnpackedSnapshotExtractor {
     root: PathBuf,
+    snapshot_slot: u64,
     accounts_db_fields: AccountsDbFields<SerializableAccountStorageEntry>,
 }
 
 impl SnapshotExtractor for UnpackedSnapshotExtractor {
     fn iter(&mut self) -> AppendVecIterator<'_> {
         self.unboxed_iter()
+    }
+
+    fn snapshot_slot(&self) -> u64 {
+        self.snapshot_slot
     }
 }
 
@@ -58,6 +63,7 @@ impl UnpackedSnapshotExtractor {
 
         let pre_unpack = Instant::now();
         let versioned_bank: DeserializableVersionedBank = deserialize_from(&mut snapshot_file)?;
+        let snapshot_slot = versioned_bank.slot;
         drop(versioned_bank);
         let versioned_bank_post_time = Instant::now();
 
@@ -77,6 +83,7 @@ impl UnpackedSnapshotExtractor {
 
         Ok(UnpackedSnapshotExtractor {
             root: path.to_path_buf(),
+            snapshot_slot,
             accounts_db_fields,
         })
     }
@@ -153,18 +160,20 @@ impl UnpackedSnapshotExtractor {
             Some(v) => v,
         };
 
-        Ok(AppendVec::new_from_file(path, known_vec.accounts_current_len).map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!(
-                    "failed to open/parse appendvec {} (slot={}, id={}, expected_len={}): {}",
-                    path.display(),
-                    slot,
-                    id,
-                    known_vec.accounts_current_len,
-                    e
-                ),
-            )
-        })?)
+        Ok(
+            AppendVec::new_from_file(path, known_vec.accounts_current_len).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to open/parse appendvec {} (slot={}, id={}, expected_len={}): {}",
+                        path.display(),
+                        slot,
+                        id,
+                        known_vec.accounts_current_len,
+                        e
+                    ),
+                )
+            })?,
+        )
     }
 }

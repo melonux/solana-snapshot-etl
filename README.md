@@ -98,6 +98,25 @@ The resulting SQLite database contains the following tables.
 - `token_multisig` (SPL Token Program and Token-2022 Program)
 - `token_metadata` (MPL Metadata Program)
 
+#### ClickHouse
+
+Create the tables in [`docs/clickhouse_schema.md`](docs/clickhouse_schema.md) first, then put the
+HTTP endpoint in a local `.env` file:
+
+```shell
+CLICKHOUSE_URL=http://user:password@clickhouse.example:8123
+# Percent-encode URL-reserved characters in username or password, for example @ as %40.
+```
+
+Run the importer with `--clickhouse`:
+
+```shell
+solana-snapshot-etl snapshot-139240745-*.tar.zst --clickhouse
+```
+
+Rows are parsed and written directly to ClickHouse with HTTP `RowBinary`. Inserts are streamed and
+committed per table at a 250,000-row or 64 MiB threshold; no SQLite database is created.
+
 #### CSV
 
 The CSV target writes records to stdout. Redirect stdout to save into a file.
