@@ -13,6 +13,7 @@ use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use url::Url;
 
 use crate::mpl_metadata;
@@ -23,11 +24,14 @@ const TOKEN_ACCOUNT_TABLE: &str = "raw_token_account";
 const TOKEN_MINT_TABLE: &str = "raw_token_mint";
 const TOKEN_METADATA_TABLE: &str = "raw_token_metadata";
 
-// Larger inserts reduce MergeTree part creation while RowBinary is streamed in 256 KiB chunks by
-// the client, so these limits do not retain the complete batch in process memory.
+// Larger inserts reduce MergeTree part creation. The exporter also force-commits every open
+// RowBinary stream regularly, so sparse derived tables cannot leave an idle chunked request open
+// long enough for ClickHouse or a reverse proxy to close it.
 const MAX_BATCH_ROWS: u64 = 250_000;
 const MAX_BATCH_BYTES: u64 = 64 * 1024 * 1024;
-const COMMIT_CHECK_INTERVAL: u16 = 1_024;
+const BATCH_LIMIT_CHECK_INTERVAL: u16 = 1_024;
+const FLUSH_CHECK_INTERVAL: u16 = 1_024;
+const MAX_OPEN_INSERT_AGE: Duration = Duration::from_secs(15);
 
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -270,6 +274,8 @@ struct ClickhouseSink {
     token_account_rows_since_commit_check: u16,
     token_mint_rows_since_commit_check: u16,
     token_metadata_rows_since_commit_check: u16,
+    flush_check_counter: u16,
+    last_force_commit: Instant,
 }
 
 impl ClickhouseSink {
@@ -283,6 +289,8 @@ impl ClickhouseSink {
             token_account_rows_since_commit_check: 0,
             token_mint_rows_since_commit_check: 0,
             token_metadata_rows_since_commit_check: 0,
+            flush_check_counter: 0,
+            last_force_commit: Instant::now(),
         }
     }
 
@@ -318,6 +326,28 @@ impl ClickhouseSink {
         .await
     }
 
+    async fn maybe_force_commit(&mut self) -> Result<()> {
+        self.flush_check_counter += 1;
+        if self.flush_check_counter != FLUSH_CHECK_INTERVAL {
+            return Ok(());
+        }
+        self.flush_check_counter = 0;
+
+        if self.last_force_commit.elapsed() >= MAX_OPEN_INSERT_AGE {
+            self.force_commit_all().await?;
+        }
+        Ok(())
+    }
+
+    async fn force_commit_all(&mut self) -> Result<()> {
+        self.account.force_commit().await?;
+        self.token_account.force_commit().await?;
+        self.token_mint.force_commit().await?;
+        self.token_metadata.force_commit().await?;
+        self.last_force_commit = Instant::now();
+        Ok(())
+    }
+
     async fn end(self) -> Result<()> {
         self.account.end().await?;
         self.token_account.end().await?;
@@ -339,7 +369,7 @@ async fn check_batch_limit<T: Row>(
     rows_since_commit_check: &mut u16,
 ) -> Result<()> {
     *rows_since_commit_check += 1;
-    if *rows_since_commit_check == COMMIT_CHECK_INTERVAL {
+    if *rows_since_commit_check == BATCH_LIMIT_CHECK_INTERVAL {
         inserter.commit().await?;
         *rows_since_commit_check = 0;
     }
@@ -407,6 +437,7 @@ impl<'a> Worker<'a> {
         }
 
         self.progress.accounts.inc();
+        self.sink.maybe_force_commit().await?;
         Ok(())
     }
 
