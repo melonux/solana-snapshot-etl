@@ -53,6 +53,10 @@ The basic command-line usage is as follows:
 ```
 USAGE:
     solana-snapshot-etl [OPTIONS] <LOAD_FLAGS> <SOURCE>
+
+    # or continuously consume incremental archives
+    solana-snapshot-etl [OPTIONS] <LOAD_FLAGS> \
+      --incremental-snapshot-dir <DIR> --last-processed-slot <SLOT>
 ```
 
 ### Sources
@@ -77,6 +81,32 @@ Stream snapshot from HTTP source or S3 bucket:
 ```shell
 solana-snapshot-etl 'https://my-solana-node.bdnodes.net/snapshot.tar.zst?auth=xxx' ...
 ```
+
+#### Incremental snapshot directory
+
+To continuously apply incremental snapshots to an already indexed slot, provide the directory
+and the highest slot that has already been processed. The producer should publish completed
+archives with an atomic rename.
+
+```shell
+solana-snapshot-etl \
+  --incremental-snapshot-dir /path/to/incremental-snapshots \
+  --last-processed-slot 441050694 \
+  --clickhouse
+```
+
+The importer considers files named
+`incremental-snapshot-<base-slot>-<slot>-<accounts-hash>.tar.zst`. In each round it chooses the
+eligible archive with the largest ending slot (`base-slot <= last-processed-slot < slot`). When an
+eligible archive with the largest ending slot (`base-slot <= last-processed-slot < slot`). The
+filename hash is part of the standard naming convention but is not verified by the importer.
+While processing an archive, it skips `accounts/<slot>.<id>` entries at slots already processed.
+After a successful write, the current slot advances, all recognized archives ending at or below it
+are deleted, and the directory is scanned again. If no usable archive is available, it waits five
+seconds by default; change this with `--incremental-poll-interval-secs`.
+
+`--sqlite-out` is persistent in this mode: an existing database is opened and updated in place;
+otherwise a new database is created at the requested path.
 
 ### Targets
 

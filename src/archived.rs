@@ -17,6 +17,7 @@ where
     Source: Read + Unpin + 'static,
 {
     snapshot_slot: u64,
+    minimum_append_vec_slot: Option<u64>,
     accounts_db_fields: AccountsDbFields<SerializableAccountStorageEntry>,
     _archive: Pin<Box<Archive<zstd::Decoder<'static, BufReader<Source>>>>>,
     entries: Option<Entries<'static, zstd::Decoder<'static, BufReader<Source>>>>,
@@ -38,8 +39,11 @@ where
         Some(
             self.accounts_db_fields
                 .0
-                .values()
-                .map(|entries| entries.len() as u64)
+                .iter()
+                .filter(|(slot, _)| {
+                    should_process_append_vec_slot(self.minimum_append_vec_slot, **slot)
+                })
+                .map(|(_, entries)| entries.len() as u64)
                 .sum(),
         )
     }
@@ -99,6 +103,7 @@ where
 
         Ok(ArchiveSnapshotExtractor {
             snapshot_slot,
+            minimum_append_vec_slot: None,
             _archive: archive,
             accounts_db_fields,
             entries: Some(entries),
@@ -120,8 +125,18 @@ where
                     Err(e) => return Some(Err(e.into())),
                 };
                 let (slot, id) = path.file_name().and_then(parse_append_vec_name)?;
+                if !should_process_append_vec_slot(self.minimum_append_vec_slot, slot) {
+                    return None;
+                }
                 Some(self.process_entry(&mut entry, slot, id))
             })
+    }
+
+    /// Skip AppendVec files from slots that have already been applied by an earlier
+    /// incremental snapshot.
+    pub fn with_minimum_append_vec_slot(mut self, slot: u64) -> Self {
+        self.minimum_append_vec_slot = Some(slot);
+        self
     }
 
     fn process_entry(
@@ -184,8 +199,25 @@ where
     }
 }
 
+fn should_process_append_vec_slot(minimum_append_vec_slot: Option<u64>, slot: u64) -> bool {
+    minimum_append_vec_slot.map_or(true, |minimum_slot| slot > minimum_slot)
+}
+
 impl ArchiveSnapshotExtractor<File> {
     pub fn open(path: &Path) -> Result<Self> {
         Self::from_reader(File::open(path)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_process_append_vec_slot;
+
+    #[test]
+    fn skips_append_vecs_from_already_processed_slots() {
+        assert!(!should_process_append_vec_slot(Some(1_000), 999));
+        assert!(!should_process_append_vec_slot(Some(1_000), 1_000));
+        assert!(should_process_append_vec_slot(Some(1_000), 1_001));
+        assert!(should_process_append_vec_slot(None, 1));
     }
 }

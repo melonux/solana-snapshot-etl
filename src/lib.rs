@@ -10,6 +10,7 @@ pub mod append_vec;
 pub mod solana;
 
 pub mod archived;
+pub mod incremental;
 pub mod unpacked;
 
 #[cfg(feature = "parallel")]

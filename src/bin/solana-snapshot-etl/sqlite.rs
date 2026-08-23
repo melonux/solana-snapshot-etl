@@ -20,11 +20,18 @@ pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub(crate) struct SqliteIndexer {
     db: Connection,
-    db_path: PathBuf,
-    db_temp_guard: TempFileGuard,
+    output: SqliteOutput,
 
     multi_progress: MultiProgress,
     progress: Arc<Progress>,
+}
+
+enum SqliteOutput {
+    Temporary {
+        db_path: PathBuf,
+        db_temp_guard: TempFileGuard,
+    },
+    Persistent,
 }
 
 struct Progress {
@@ -60,6 +67,32 @@ impl SqliteIndexer {
         // Open database.
         let db = Self::create_db(&db_temp_path)?;
 
+        Self::from_connection(
+            db,
+            SqliteOutput::Temporary {
+                db_path,
+                db_temp_guard,
+            },
+        )
+    }
+
+    /// Open a database that is updated in place while consuming incremental snapshots.
+    ///
+    /// Unlike [`Self::new`], this mode keeps the database at its requested path so that
+    /// multiple snapshot rounds can update the same account state.
+    pub(crate) fn open_incremental(db_path: PathBuf) -> Result<Self> {
+        let db = if db_path.exists() {
+            let db = Connection::open(&db_path)?;
+            Self::configure_db(&db)?;
+            db
+        } else {
+            Self::create_db(&db_path)?
+        };
+
+        Self::from_connection(db, SqliteOutput::Persistent)
+    }
+
+    fn from_connection(db: Connection, output: SqliteOutput) -> Result<Self> {
         // Create progress bars.
         let spinner_style = ProgressStyle::with_template(
             "{prefix:>13.bold.dim} {spinner} rate={per_sec:>13} total={human_pos:>11}",
@@ -90,8 +123,7 @@ impl SqliteIndexer {
 
         Ok(Self {
             db,
-            db_path,
-            db_temp_guard,
+            output,
 
             multi_progress,
             progress: Arc::new(Progress {
@@ -104,9 +136,7 @@ impl SqliteIndexer {
 
     fn create_db(path: &Path) -> Result<Connection> {
         let db = Connection::open(&path)?;
-        db.pragma_update(None, "synchronous", false)?;
-        db.pragma_update(None, "journal_mode", "off")?;
-        db.pragma_update(None, "locking_mode", "exclusive")?;
+        Self::configure_db(&db)?;
         db.execute(
             "\
 CREATE TABLE account  (
@@ -177,13 +207,20 @@ CREATE TABLE token_metadata (
         Ok(db)
     }
 
+    fn configure_db(db: &Connection) -> Result<()> {
+        db.pragma_update(None, "synchronous", false)?;
+        db.pragma_update(None, "journal_mode", "off")?;
+        db.pragma_update(None, "locking_mode", "exclusive")?;
+        Ok(())
+    }
+
     pub(crate) fn set_cache_size(&mut self, size_mib: i64) -> Result<()> {
         let size = size_mib * 1024;
         self.db.pragma_update(None, "cache_size", -size)?;
         Ok(())
     }
 
-    pub(crate) fn insert_all(mut self, iterator: AppendVecIterator) -> Result<IndexStats> {
+    pub(crate) fn insert_all(&mut self, iterator: AppendVecIterator) -> Result<IndexStats> {
         let mut worker = Worker {
             db: &self.db,
             progress: Arc::clone(&self.progress),
@@ -214,8 +251,7 @@ CREATE TABLE token_metadata (
                 }
             }
         }
-        self.db.pragma_update(None, "query_only", true)?;
-        let stats = IndexStats {
+        Ok(IndexStats {
             accounts_total: self.progress.accounts_counter.get(),
             token_accounts_total: self.progress.token_accounts_counter.get(),
             skipped_append_vecs,
@@ -229,10 +265,20 @@ CREATE TABLE token_metadata (
             token_2022_accounts_parsed: worker.token_2022_accounts_parsed,
             token_2022_unexpected_size: worker.token_2022_unexpected_size,
             token_2022_unpack_failed: worker.token_2022_unpack_failed,
-        };
-        self.db_temp_guard.promote(self.db_path)?;
+        })
+    }
+
+    pub(crate) fn finish(mut self) -> Result<()> {
+        if let SqliteOutput::Temporary {
+            db_path,
+            db_temp_guard,
+        } = &mut self.output
+        {
+            self.db.pragma_update(None, "query_only", true)?;
+            db_temp_guard.promote(db_path)?;
+        }
         let _ = &self.multi_progress;
-        Ok(stats)
+        Ok(())
     }
 }
 
