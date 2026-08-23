@@ -82,3 +82,19 @@ pub struct Uses {
 pub enum CollectionDetails {
     V1 { size: u64 },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserializes_optional_token_standard() {
+        // Option::Some(ProgrammableNonFungible = 4), followed by
+        // Option::None collection and Option::None uses.
+        let mut data = &[1, 4, 0, 0][..];
+        let metadata_ext = MetadataExtV1_2::deserialize(&mut data).unwrap();
+
+        assert_eq!(metadata_ext.token_standard, Some(4));
+        assert!(data.is_empty());
+    }
+}

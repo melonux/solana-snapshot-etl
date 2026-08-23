@@ -82,11 +82,11 @@ Stream snapshot from HTTP source or S3 bucket:
 solana-snapshot-etl 'https://my-solana-node.bdnodes.net/snapshot.tar.zst?auth=xxx' ...
 ```
 
-#### Incremental snapshot directory
+#### Snapshot watch directory
 
-To continuously apply incremental snapshots to an already indexed slot, provide the directory
-and the highest slot that has already been processed. The producer should publish completed
-archives with an atomic rename.
+To continuously apply full and incremental snapshots to an already indexed slot, provide the
+directory and the highest slot already processed. The producer should publish completed archives
+with an atomic rename. This mode currently writes to ClickHouse only.
 
 ```shell
 solana-snapshot-etl \
@@ -95,18 +95,22 @@ solana-snapshot-etl \
   --clickhouse
 ```
 
-The importer considers files named
-`incremental-snapshot-<base-slot>-<slot>-<accounts-hash>.tar.zst`. In each round it chooses the
-eligible archive with the largest ending slot (`base-slot <= last-processed-slot < slot`). When an
-eligible archive with the largest ending slot (`base-slot <= last-processed-slot < slot`). The
-filename hash is part of the standard naming convention but is not verified by the importer.
-While processing an archive, it skips `accounts/<slot>.<id>` entries at slots already processed.
-After a successful write, the current slot advances, all recognized archives ending at or below it
-are deleted, and the directory is scanned again. If no usable archive is available, it waits five
-seconds by default; change this with `--incremental-poll-interval-secs`.
+The importer recognizes both full files named
+`snapshot-<slot>-<accounts-hash>.tar.zst` and incremental files named
+`incremental-snapshot-<base-slot>-<slot>-<accounts-hash>.tar.zst`.
 
-`--sqlite-out` is persistent in this mode: an existing database is opened and updated in place;
-otherwise a new database is created at the requested path.
+In each round it first chooses an eligible incremental with the largest ending slot
+(`base-slot <= last-processed-slot < slot`). If no incremental can be applied, it uses the newest
+full snapshot beyond the current slot. This lets a full snapshot bridge a missing incremental base:
+with current slot `1000`, incremental `[1100, 2000]`, and full snapshot `1100`, the importer loads
+the full snapshot first, then applies the incremental.
+
+While processing either archive type, it skips `accounts/<slot>.<id>` entries at slots already
+processed. Thus a full snapshot only contributes the account changes after the current slot, and
+CloseAccount records follow the same tombstone path as in an incremental archive. After a
+successful write, the current slot advances, all recognized full and incremental archives ending
+at or below it are deleted, and the directory is scanned again. If no usable archive is available,
+it waits five seconds by default; change this with `--incremental-poll-interval-secs`.
 
 ### Targets
 

@@ -10,7 +10,8 @@ use log::{error, info, warn};
 use reqwest::blocking::Response;
 use solana_snapshot_etl::archived::ArchiveSnapshotExtractor;
 use solana_snapshot_etl::incremental::{
-    discover as discover_incremental_snapshots, eligible_candidates, remove_processed,
+    discover as discover_incremental_snapshots, discover_full as discover_full_snapshots,
+    eligible_candidates, eligible_full_candidates, remove_processed, FullSnapshot,
     IncrementalSnapshot,
 };
 use solana_snapshot_etl::parallel::AppendVecConsumer;
@@ -50,28 +51,25 @@ struct Args {
     #[clap(
         long,
         value_name = "DIR",
-        help = "Continuously consume incremental .tar.zst snapshots from this directory"
+        help = "Continuously consume full and incremental .tar.zst snapshots from this directory"
     )]
     incremental_snapshot_dir: Option<PathBuf>,
     #[clap(
         long,
         value_name = "SLOT",
-        help = "Highest slot already processed before incremental consumption starts"
+        help = "Highest slot already processed before snapshot consumption starts"
     )]
     last_processed_slot: Option<u64>,
     #[clap(
         long,
         default_value_t = 5,
         value_name = "SECONDS",
-        help = "Delay before re-scanning an incremental snapshot directory when no usable archive exists"
+        help = "Delay before re-scanning a snapshot directory when no usable archive exists"
     )]
     incremental_poll_interval_secs: u64,
     #[clap(long, action, help = "Write CSV to stdout")]
     csv: bool,
-    #[clap(
-        long,
-        help = "Export to a new SQLite3 DB at this path (or update it in incremental directory mode)"
-    )]
+    #[clap(long, help = "Export to new SQLite3 DB at this path")]
     sqlite_out: Option<String>,
     #[clap(
         long,
@@ -235,7 +233,6 @@ fn process_single_snapshot(
             "Token-2022 accounts with unpack failure: {}",
             stats.token_2022_unpack_failed
         );
-        indexer.finish()?;
     }
     if let Some(programs) = &args.programs_out {
         info!("Dumping program accounts to {}", &programs);
@@ -274,103 +271,100 @@ fn process_single_snapshot(
 }
 
 enum IncrementalOutput {
-    Csv(CsvDumper),
-    Geyser(GeyserDumper),
     Clickhouse {
         clickhouse_url: String,
         runtime: tokio::runtime::Runtime,
     },
-    Sqlite(SqliteIndexer),
-    Programs(ProgramDumper),
+}
+
+enum WatchedSnapshot {
+    Incremental(IncrementalSnapshot),
+    Full(FullSnapshot),
+}
+
+impl WatchedSnapshot {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Incremental(snapshot) => snapshot.path(),
+            Self::Full(snapshot) => snapshot.path(),
+        }
+    }
+
+    fn slot(&self) -> u64 {
+        match self {
+            Self::Incremental(snapshot) => snapshot.slot(),
+            Self::Full(snapshot) => snapshot.slot(),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Incremental(_) => "incremental",
+            Self::Full(_) => "full",
+        }
+    }
+
+    fn new_loader(
+        &self,
+        last_processed_slot: u64,
+    ) -> Result<SupportedLoader, Box<dyn std::error::Error>> {
+        match self {
+            Self::Incremental(snapshot) => {
+                SupportedLoader::new_incremental_snapshot(snapshot.path(), last_processed_slot)
+            }
+            Self::Full(snapshot) => {
+                SupportedLoader::new_full_snapshot(snapshot.path(), last_processed_slot)
+            }
+        }
+    }
+
+    fn log_verification(&self) {
+        match self {
+            Self::Incremental(snapshot) => info!(
+                "Verifying incremental snapshot {} (base={}, slot={})",
+                snapshot.path().display(),
+                snapshot.base_slot(),
+                snapshot.slot()
+            ),
+            Self::Full(snapshot) => info!(
+                "Verifying full snapshot {} (slot={})",
+                snapshot.path().display(),
+                snapshot.slot()
+            ),
+        }
+    }
 }
 
 impl IncrementalOutput {
     fn new(args: &Args) -> Result<Self, Box<dyn std::error::Error>> {
-        if args.csv {
-            return Ok(Self::Csv(CsvDumper::new()));
+        if !args.clickhouse {
+            return Err("--incremental-snapshot-dir currently requires --clickhouse".into());
         }
-        if let Some(geyser_config_path) = &args.geyser {
-            info!("Dumping incremental snapshots to Geyser plugin: {geyser_config_path}");
-            let plugin = unsafe { load_plugin(geyser_config_path)? };
-            assert!(
-                plugin.account_data_notifications_enabled(),
-                "Geyser plugin does not accept account data notifications"
-            );
-            return Ok(Self::Geyser(GeyserDumper::new(plugin)));
-        }
-        if args.clickhouse {
-            dotenvy::dotenv().ok();
-            let clickhouse_url = std::env::var("CLICKHOUSE_URL")
-                .map_err(|_| "CLICKHOUSE_URL must be set in the environment or .env file")?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            return Ok(Self::Clickhouse {
-                clickhouse_url,
-                runtime,
-            });
-        }
-        if let Some(sqlite_out_path) = &args.sqlite_out {
-            info!("Updating SQLite3 database: {sqlite_out_path}");
-            let mut indexer = SqliteIndexer::open_incremental(PathBuf::from(sqlite_out_path))?;
-            if let Some(cache_size) = args.sqlite_cache_size {
-                indexer.set_cache_size(cache_size)?;
-            }
-            return Ok(Self::Sqlite(indexer));
-        }
-        if let Some(programs) = &args.programs_out {
-            info!("Writing programs from incremental snapshots to {programs}");
-            let writer: Box<dyn Write> = if programs == "-" {
-                Box::new(stdout())
-            } else {
-                Box::new(
-                    OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(programs)?,
-                )
-            };
-            return Ok(Self::Programs(ProgramDumper::new(writer)));
-        }
-        unreachable!("clap requires one output action")
+        dotenvy::dotenv().ok();
+        let clickhouse_url = std::env::var("CLICKHOUSE_URL")
+            .map_err(|_| "CLICKHOUSE_URL must be set in the environment or .env file")?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        Ok(Self::Clickhouse {
+            clickhouse_url,
+            runtime,
+        })
     }
 
-    fn process(&mut self, loader: &mut SupportedLoader) -> Result<(), Box<dyn std::error::Error>> {
+    fn process(
+        &mut self,
+        loader: &mut SupportedLoader,
+        snapshot_kind: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         match self {
-            Self::Csv(writer) => {
-                let mut skipped_append_vecs = 0u64;
-                for (append_vec_idx, append_vec) in loader.iter().enumerate() {
-                    match append_vec {
-                        Ok(append_vec) => writer.dump_append_vec(append_vec),
-                        Err(err) => {
-                            skipped_append_vecs += 1;
-                            warn!("[csv] Skipping append vec #{append_vec_idx}: {err}");
-                        }
-                    }
-                }
-                writer.flush()?;
-                info!("[csv] Skipped {skipped_append_vecs} append vec files");
-            }
-            Self::Geyser(dumper) => {
-                let mut skipped_append_vecs = 0u64;
-                for (append_vec_idx, append_vec) in loader.iter().enumerate() {
-                    match append_vec {
-                        Ok(append_vec) => dumper.on_append_vec(append_vec)?,
-                        Err(err) => {
-                            skipped_append_vecs += 1;
-                            warn!("[geyser] Skipping append vec #{append_vec_idx}: {err}");
-                        }
-                    }
-                }
-                info!("[geyser] Skipped {skipped_append_vecs} append vec files");
-            }
             Self::Clickhouse {
                 clickhouse_url,
                 runtime,
             } => {
                 let snapshot_slot = loader.snapshot_slot();
                 let append_vec_count = loader.append_vec_count_hint();
-                info!("Dumping incremental snapshot slot {snapshot_slot} to ClickHouse");
+                info!("Dumping {snapshot_kind} snapshot slot {snapshot_slot} to ClickHouse");
                 let stats = runtime.block_on(
                     ClickhouseIndexer::new(
                         clickhouse_url.clone(),
@@ -380,23 +374,6 @@ impl IncrementalOutput {
                     .insert_all(loader.iter()),
                 )?;
                 log_clickhouse_index_stats(&stats);
-            }
-            Self::Sqlite(indexer) => {
-                let stats = indexer.insert_all(loader.iter())?;
-                log_sqlite_index_stats(&stats);
-            }
-            Self::Programs(dumper) => {
-                let mut skipped_append_vecs = 0u64;
-                for (append_vec_idx, append_vec) in loader.iter().enumerate() {
-                    match append_vec {
-                        Ok(append_vec) => dumper.on_append_vec(append_vec)?,
-                        Err(err) => {
-                            skipped_append_vecs += 1;
-                            warn!("[programs] Skipping append vec #{append_vec_idx}: {err}");
-                        }
-                    }
-                }
-                info!("[programs] Skipped {skipped_append_vecs} append vec files");
             }
         }
         Ok(())
@@ -413,37 +390,40 @@ fn run_incremental_snapshots(
     let poll_interval = Duration::from_secs(args.incremental_poll_interval_secs);
 
     info!(
-        "Watching incremental snapshot directory {} from slot {}",
+        "Watching snapshot directory {} from slot {}",
         directory.display(),
         last_processed_slot
     );
 
     loop {
+        // Prefer an already-applicable incremental archive.  If there is a gap
+        // (for example, current=1000 and the next incremental is based at
+        // 1100), a newer full snapshot can bridge the state forward.
         let candidates = eligible_candidates(
             discover_incremental_snapshots(directory)?,
             last_processed_slot,
+        )
+        .into_iter()
+        .map(WatchedSnapshot::Incremental)
+        .chain(
+            eligible_full_candidates(discover_full_snapshots(directory)?, last_processed_slot)
+                .into_iter()
+                .map(WatchedSnapshot::Full),
         );
-        let mut selected: Option<(IncrementalSnapshot, SupportedLoader)> = None;
+        let mut selected: Option<(WatchedSnapshot, SupportedLoader)> = None;
 
         for candidate in candidates {
             if invalid_archives.contains(candidate.path()) {
                 continue;
             }
 
-            info!(
-                "Verifying incremental snapshot {} (base={}, slot={})",
-                candidate.path().display(),
-                candidate.base_slot(),
-                candidate.slot()
-            );
-            let loader = match SupportedLoader::new_incremental_snapshot(
-                candidate.path(),
-                last_processed_slot,
-            ) {
+            candidate.log_verification();
+            let loader = match candidate.new_loader(last_processed_slot) {
                 Ok(loader) => loader,
                 Err(err) => {
                     warn!(
-                        "Ignoring unreadable incremental snapshot {}: {}",
+                        "Ignoring unreadable {} snapshot {}: {}",
+                        candidate.kind(),
                         candidate.path().display(),
                         err
                     );
@@ -454,7 +434,8 @@ fn run_incremental_snapshots(
 
             if loader.snapshot_slot() != candidate.slot() {
                 warn!(
-                    "Ignoring incremental snapshot {}: filename expects slot={}, manifest has slot={}",
+                    "Ignoring {} snapshot {}: filename expects slot={}, manifest has slot={}",
+                    candidate.kind(),
                     candidate.path().display(),
                     candidate.slot(),
                     loader.snapshot_slot(),
@@ -471,9 +452,10 @@ fn run_incremental_snapshots(
             continue;
         };
 
-        if let Err(err) = output.process(&mut loader) {
+        if let Err(err) = output.process(&mut loader, candidate.kind()) {
             error!(
-                "Failed to process incremental snapshot {}: {}. The file was retained and slot {} remains current",
+                "Failed to process {} snapshot {}: {}. The file was retained and slot {} remains current",
+                candidate.kind(),
                 candidate.path().display(),
                 err,
                 last_processed_slot
@@ -487,7 +469,7 @@ fn run_incremental_snapshots(
         match remove_processed(directory, last_processed_slot) {
             Ok(removed) => {
                 for path in removed {
-                    info!("Removed processed incremental snapshot {}", path.display());
+                    info!("Removed processed snapshot {}", path.display());
                 }
             }
             Err(err) => warn!(
@@ -549,57 +531,9 @@ fn log_clickhouse_index_stats(stats: &crate::clickhouse::IndexStats) {
         "[clickhouse] Token-2022 accounts with unpack failure: {}",
         stats.token_2022_unpack_failed
     );
-}
-
-fn log_sqlite_index_stats(stats: &crate::sqlite::IndexStats) {
-    info!("[sqlite] Dumped {} accounts", stats.accounts_total);
     info!(
-        "[sqlite] Dumped {} token accounts",
-        stats.token_accounts_total
-    );
-    info!(
-        "[sqlite] Skipped {} append vec files",
-        stats.skipped_append_vecs
-    );
-    info!(
-        "[sqlite] Processed {} append vec files",
-        stats.append_vecs_total
-    );
-    info!(
-        "[sqlite] Non-empty append vec files producing 0 accounts: {}",
-        stats.nonempty_zero_account_append_vecs
-    );
-    info!(
-        "[sqlite] SPL-Token owner accounts seen: {}",
-        stats.spl_token_owner_accounts_seen
-    );
-    info!(
-        "[sqlite] SPL-Token accounts parsed successfully: {}",
-        stats.spl_token_accounts_parsed
-    );
-    info!(
-        "[sqlite] SPL-Token accounts with unexpected size: {}",
-        stats.spl_token_unexpected_size
-    );
-    info!(
-        "[sqlite] SPL-Token accounts with unpack failure: {}",
-        stats.spl_token_unpack_failed
-    );
-    info!(
-        "[sqlite] Token-2022 owner accounts seen: {}",
-        stats.token_2022_owner_accounts_seen
-    );
-    info!(
-        "[sqlite] Token-2022 accounts parsed successfully: {}",
-        stats.token_2022_accounts_parsed
-    );
-    info!(
-        "[sqlite] Token-2022 accounts with unexpected size: {}",
-        stats.token_2022_unexpected_size
-    );
-    info!(
-        "[sqlite] Token-2022 accounts with unpack failure: {}",
-        stats.token_2022_unpack_failed
+        "[clickhouse] Zero-lamport token-account close candidates: {}",
+        stats.token_account_close_candidates
     );
 }
 
@@ -699,6 +633,16 @@ impl SupportedLoader {
         last_processed_slot: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         info!("Reading incremental snapshot archive");
+        let loader =
+            ArchiveSnapshotExtractor::open(path)?.with_minimum_append_vec_slot(last_processed_slot);
+        Ok(Self::ArchiveFile(loader))
+    }
+
+    fn new_full_snapshot(
+        path: &Path,
+        last_processed_slot: u64,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        info!("Reading full snapshot archive");
         let loader =
             ArchiveSnapshotExtractor::open(path)?.with_minimum_append_vec_slot(last_processed_slot);
         Ok(Self::ArchiveFile(loader))

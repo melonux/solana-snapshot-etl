@@ -369,6 +369,7 @@ CREATE TABLE token_metadata (
     primary_sale_happened INTEGER(1) NOT NULL,
     is_mutable INTEGER(1) NOT NULL,
     edition_nonce INTEGER(2) NULL,
+    token_standard INTEGER(1) NULL,
     collection_verified INTEGER(1) NULL,
     collection_key BLOB(32) NULL
 );
@@ -419,6 +420,7 @@ match account_key {
 - `primary_sale_happened`：是否已完成首次销售；
 - `is_mutable`：是否可变；
 - `edition_nonce`：edition nonce（可选）；
+- `token_standard`：Metaplex `TokenStandard` 枚举值（可选）：`0=NonFungible`、`1=FungibleAsset`、`2=Fungible`、`3=NonFungibleEdition`、`4=ProgrammableNonFungible`、`5=ProgrammableNonFungibleEdition`；
 - `collection_verified`：collection 是否校验有效；
 - `collection_key`：collection 的 key（可选）。
 

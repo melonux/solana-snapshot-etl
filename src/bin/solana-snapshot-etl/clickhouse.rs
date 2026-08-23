@@ -9,6 +9,7 @@ use solana_sdk::program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
 use solana_snapshot_etl::append_vec::{AppendVec, StoredAccountMeta};
 use solana_snapshot_etl::{append_vec_iter, AppendVecIterator};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +25,28 @@ const TOKEN_ACCOUNT_TABLE: &str = "raw_token_account";
 const TOKEN_MINT_TABLE: &str = "raw_token_mint";
 const TOKEN_METADATA_TABLE: &str = "raw_token_metadata";
 
+// A CloseAccount leaves a zero-lamport, zeroed token account in an incremental
+// snapshot.  It can no longer be unpacked, so look up its previous L1 identity
+// and append a tombstone after the streamed inserts have committed.
+const CLOSE_TOKEN_ACCOUNT_TOMBSTONES_QUERY: &str = r#"
+INSERT INTO raw_token_account
+    (pubkey, mint, owner, amount, delegate, delegated_amount, state, close_authority, is_deleted, updated_slot)
+SELECT
+    pubkey,
+    mint,
+    owner,
+    toUInt64(0),
+    delegate,
+    toUInt64(0),
+    state,
+    close_authority,
+    toUInt8(1),
+    ?
+FROM raw_token_account FINAL
+WHERE is_deleted = 0
+  AND pubkey IN ?
+"#;
+
 // Larger inserts reduce MergeTree part creation. The exporter also force-commits every open
 // RowBinary stream regularly, so sparse derived tables cannot leave an idle chunked request open
 // long enough for ClickHouse or a reverse proxy to close it.
@@ -32,10 +55,12 @@ const MAX_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 const BATCH_LIMIT_CHECK_INTERVAL: u16 = 1_024;
 const FLUSH_CHECK_INTERVAL: u16 = 1_024;
 const MAX_OPEN_INSERT_AGE: Duration = Duration::from_secs(15);
+const CLOSE_TOMBSTONE_BATCH_SIZE: usize = 10_000;
 
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub(crate) struct ClickhouseIndexer {
+    client: Client,
     sink: ClickhouseSink,
     snapshot_slot: u64,
     multi_progress: MultiProgress,
@@ -63,6 +88,7 @@ pub(crate) struct IndexStats {
     pub(crate) token_2022_accounts_parsed: u64,
     pub(crate) token_2022_unexpected_size: u64,
     pub(crate) token_2022_unpack_failed: u64,
+    pub(crate) token_account_close_candidates: u64,
 }
 
 #[derive(Row, Serialize)]
@@ -85,6 +111,7 @@ struct TokenAccountRow {
     delegated_amount: u64,
     state: u8,
     close_authority: Option<String>,
+    is_deleted: bool,
     updated_slot: u64,
 }
 
@@ -107,6 +134,7 @@ struct TokenMetadataRow {
     uri: String,
     update_authority: String,
     is_mutable: bool,
+    token_standard: Option<u8>,
     seller_fee_basis_points: u16,
     creators: Vec<String>,
     updated_slot: u64,
@@ -159,8 +187,11 @@ impl ClickhouseIndexer {
             ),
         });
 
+        let client = new_clickhouse_client(&connection_url)?;
+
         Ok(Self {
-            sink: ClickhouseSink::new(&new_clickhouse_client(&connection_url)?),
+            sink: ClickhouseSink::new(&client),
+            client,
             snapshot_slot,
             multi_progress,
             progress,
@@ -183,6 +214,7 @@ impl ClickhouseIndexer {
             token_2022_accounts_parsed: 0,
             token_2022_unexpected_size: 0,
             token_2022_unpack_failed: 0,
+            closed_token_accounts: HashSet::new(),
         };
         let mut skipped_append_vecs = 0;
         let mut append_vecs_total = 0;
@@ -215,9 +247,17 @@ impl ClickhouseIndexer {
         let token_2022_accounts_parsed = worker.token_2022_accounts_parsed;
         let token_2022_unexpected_size = worker.token_2022_unexpected_size;
         let token_2022_unpack_failed = worker.token_2022_unpack_failed;
+        let closed_token_accounts = std::mem::take(&mut worker.closed_token_accounts);
+        let token_account_close_candidates = closed_token_accounts.len() as u64;
         drop(worker);
 
         self.sink.end().await?;
+        write_close_token_account_tombstones(
+            &self.client,
+            self.snapshot_slot,
+            &closed_token_accounts,
+        )
+        .await?;
         self.progress.append_vecs.finish_with_message("done");
         let _ = &self.multi_progress;
 
@@ -235,6 +275,7 @@ impl ClickhouseIndexer {
             token_2022_accounts_parsed,
             token_2022_unexpected_size,
             token_2022_unpack_failed,
+            token_account_close_candidates,
         })
     }
 }
@@ -414,6 +455,7 @@ struct Worker<'a> {
     token_2022_accounts_parsed: u64,
     token_2022_unexpected_size: u64,
     token_2022_unpack_failed: u64,
+    closed_token_accounts: HashSet<String>,
 }
 
 impl<'a> Worker<'a> {
@@ -485,13 +527,17 @@ impl<'a> Worker<'a> {
                                     .close_authority
                                     .map(pubkey_string)
                                     .into(),
+                                is_deleted: false,
                                 updated_slot: self.snapshot_slot,
                             })
                             .await?;
                         self.spl_token_accounts_parsed += 1;
                         self.progress.tokens.inc();
                     }
-                    Err(_) => self.spl_token_unpack_failed += 1,
+                    Err(_) => {
+                        self.spl_token_unpack_failed += 1;
+                        self.record_close_candidate(account);
+                    }
                 }
             }
             spl_token::state::Mint::LEN => match spl_token::state::Mint::unpack(account.data) {
@@ -536,13 +582,17 @@ impl<'a> Worker<'a> {
                                     .close_authority
                                     .map(pubkey_string)
                                     .into(),
+                                is_deleted: false,
                                 updated_slot: self.snapshot_slot,
                             })
                             .await?;
                         self.token_2022_accounts_parsed += 1;
                         self.progress.tokens.inc();
                     }
-                    Err(_) => self.token_2022_unpack_failed += 1,
+                    Err(_) => {
+                        self.token_2022_unpack_failed += 1;
+                        self.record_close_candidate(account);
+                    }
                 }
             }
             spl_token_2022::state::Mint::LEN => {
@@ -594,6 +644,11 @@ impl<'a> Worker<'a> {
                 account.meta.pubkey, err
             )
         })?;
+        let metadata_ext = mpl_metadata::MetadataExt::deserialize(&mut data).ok();
+        let metadata_ext_v1_2 = metadata_ext
+            .as_ref()
+            .and_then(|_| mpl_metadata::MetadataExtV1_2::deserialize(&mut data).ok());
+
         self.sink
             .write_token_metadata(&TokenMetadataRow {
                 mint: pubkey_string(metadata.mint),
@@ -602,6 +657,7 @@ impl<'a> Worker<'a> {
                 uri: metadata.data.uri,
                 update_authority: pubkey_string(metadata.update_authority),
                 is_mutable: metadata.is_mutable,
+                token_standard: metadata_ext_v1_2.and_then(|metadata| metadata.token_standard),
                 seller_fee_basis_points: metadata.data.seller_fee_basis_points,
                 creators: metadata
                     .data
@@ -616,6 +672,41 @@ impl<'a> Worker<'a> {
         self.progress.metadata.inc();
         Ok(())
     }
+
+    /// A successful CloseAccount writes zero lamports and clears the 165-byte
+    /// data buffer. The old mint and holder are therefore unavailable from the
+    /// snapshot record, but are available in the previous L1 row by pubkey.
+    ///
+    /// Zero-lamport malformed/uninitialized accounts can also reach this path.
+    /// They are harmless: the later server-side lookup only creates a tombstone
+    /// when the pubkey already has a live raw_token_account row.
+    fn record_close_candidate(&mut self, account: &StoredAccountMeta<'_>) {
+        if is_close_tombstone_candidate(account.account_meta.lamports) {
+            self.closed_token_accounts
+                .insert(pubkey_string(account.meta.pubkey));
+        }
+    }
+}
+
+fn is_close_tombstone_candidate(lamports: u64) -> bool {
+    lamports == 0
+}
+
+async fn write_close_token_account_tombstones(
+    client: &Client,
+    snapshot_slot: u64,
+    closed_token_accounts: &HashSet<String>,
+) -> Result<()> {
+    let pubkeys = closed_token_accounts.iter().collect::<Vec<_>>();
+    for pubkeys in pubkeys.chunks(CLOSE_TOMBSTONE_BATCH_SIZE) {
+        client
+            .query(CLOSE_TOKEN_ACCOUNT_TOMBSTONES_QUERY)
+            .bind(snapshot_slot)
+            .bind(pubkeys)
+            .execute()
+            .await?;
+    }
+    Ok(())
 }
 
 fn pubkey_string(pubkey: Pubkey) -> String {
@@ -681,6 +772,7 @@ mod tests {
                 "delegated_amount",
                 "state",
                 "close_authority",
+                "is_deleted",
                 "updated_slot",
             ]
         );
@@ -705,6 +797,7 @@ mod tests {
                 "uri",
                 "update_authority",
                 "is_mutable",
+                "token_standard",
                 "seller_fee_basis_points",
                 "creators",
                 "updated_slot"
@@ -722,5 +815,21 @@ mod tests {
         assert_eq!(connection.endpoint, "http://clickhouse.example:8123/");
         assert_eq!(connection.user.as_deref(), Some("user@name"));
         assert_eq!(connection.password.as_deref(), Some("pass:word"));
+    }
+
+    #[test]
+    fn zeroed_token_account_is_a_close_tombstone_candidate() {
+        let zeroed_data = vec![0; spl_token::state::Account::LEN];
+
+        assert!(spl_token::state::Account::unpack(&zeroed_data).is_err());
+        assert!(is_close_tombstone_candidate(0));
+        assert!(!is_close_tombstone_candidate(1));
+    }
+
+    #[test]
+    fn close_tombstone_query_replaces_the_existing_token_account_row() {
+        assert!(CLOSE_TOKEN_ACCOUNT_TOMBSTONES_QUERY.contains("FROM raw_token_account FINAL"));
+        assert!(CLOSE_TOKEN_ACCOUNT_TOMBSTONES_QUERY.contains("is_deleted"));
+        assert!(CLOSE_TOKEN_ACCOUNT_TOMBSTONES_QUERY.contains("pubkey IN ?"));
     }
 }

@@ -60,10 +60,6 @@ impl CsvDumper {
             self.accounts_spinner.set_position(self.accounts_count);
         }
     }
-
-    pub(crate) fn flush(&mut self) -> csv::Result<()> {
-        Ok(self.writer.flush()?)
-    }
 }
 
 impl Drop for CsvDumper {
