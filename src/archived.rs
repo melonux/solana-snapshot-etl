@@ -33,6 +33,16 @@ where
     fn snapshot_slot(&self) -> u64 {
         self.snapshot_slot
     }
+
+    fn append_vec_count_hint(&self) -> Option<u64> {
+        Some(
+            self.accounts_db_fields
+                .0
+                .values()
+                .map(|entries| entries.len() as u64)
+                .sum(),
+        )
+    }
 }
 
 impl<Source> ArchiveSnapshotExtractor<Source>

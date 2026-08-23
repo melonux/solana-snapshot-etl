@@ -19,7 +19,7 @@ use url::Url;
 use crate::mpl_metadata;
 
 const DATABASE: &str = "solana";
-const ACCOUNT_TABLE: &str = "account";
+const ACCOUNT_TABLE: &str = "raw_account";
 const TOKEN_ACCOUNT_TABLE: &str = "raw_token_account";
 const TOKEN_MINT_TABLE: &str = "raw_token_mint";
 const TOKEN_METADATA_TABLE: &str = "raw_token_metadata";
@@ -43,6 +43,7 @@ pub(crate) struct ClickhouseIndexer {
 }
 
 struct Progress {
+    append_vecs: ProgressBar,
     accounts: ProgressCounter,
     tokens: ProgressCounter,
     metadata: ProgressCounter,
@@ -83,15 +84,18 @@ struct TokenAccountRow {
     delegate: Option<String>,
     delegated_amount: u64,
     state: u8,
+    close_authority: Option<String>,
     updated_slot: u64,
 }
 
 #[derive(Row, Serialize)]
 struct TokenMintRow {
     mint: String,
+    mint_authority: Option<String>,
     supply: u64,
     decimals: u8,
     is_initialized: bool,
+    freeze_authority: Option<String>,
     updated_slot: u64,
 }
 
@@ -101,17 +105,37 @@ struct TokenMetadataRow {
     name: String,
     symbol: String,
     uri: String,
+    update_authority: String,
     is_mutable: bool,
+    seller_fee_basis_points: u16,
+    creators: Vec<String>,
     updated_slot: u64,
 }
 
 impl ClickhouseIndexer {
-    pub(crate) fn new(connection_url: String, snapshot_slot: u64) -> Result<Self> {
+    pub(crate) fn new(
+        connection_url: String,
+        snapshot_slot: u64,
+        append_vec_count: Option<u64>,
+    ) -> Result<Self> {
         let spinner_style = ProgressStyle::with_template(
             "{prefix:>13.bold.dim} {spinner} rate={per_sec:>13} total={human_pos:>11}",
         )?;
         let multi_progress = MultiProgress::new();
+        let append_vec_style = ProgressStyle::with_template(
+            "{prefix:>13.bold.dim} [{bar:40.cyan/blue}] {pos:>7}/{len:>7} ({percent:>3}%)",
+        )?;
+        let append_vecs = multi_progress.add(match append_vec_count {
+            Some(total) => ProgressBar::new(total)
+                .with_style(append_vec_style)
+                .with_prefix("append_vecs"),
+            None => ProgressBar::new_spinner()
+                .with_style(spinner_style.clone())
+                .with_prefix("append_vecs"),
+        });
+
         let progress = Arc::new(Progress {
+            append_vecs,
             accounts: ProgressCounter::new(
                 multi_progress.add(
                     ProgressBar::new_spinner()
@@ -180,6 +204,7 @@ impl ClickhouseIndexer {
                     );
                 }
             }
+            self.progress.append_vecs.inc(1);
         }
 
         let spl_token_owner_accounts_seen = worker.spl_token_owner_accounts_seen;
@@ -193,6 +218,7 @@ impl ClickhouseIndexer {
         drop(worker);
 
         self.sink.end().await?;
+        self.progress.append_vecs.finish_with_message("done");
         let _ = &self.multi_progress;
 
         Ok(IndexStats {
@@ -455,6 +481,10 @@ impl<'a> Worker<'a> {
                                 delegate: token_account.delegate.map(pubkey_string).into(),
                                 delegated_amount: token_account.delegated_amount,
                                 state: token_account.state as u8,
+                                close_authority: token_account
+                                    .close_authority
+                                    .map(pubkey_string)
+                                    .into(),
                                 updated_slot: self.snapshot_slot,
                             })
                             .await?;
@@ -469,9 +499,11 @@ impl<'a> Worker<'a> {
                     self.sink
                         .write_token_mint(&TokenMintRow {
                             mint: pubkey_string(account.meta.pubkey),
+                            mint_authority: token_mint.mint_authority.map(pubkey_string).into(),
                             supply: token_mint.supply,
                             decimals: token_mint.decimals,
                             is_initialized: token_mint.is_initialized,
+                            freeze_authority: token_mint.freeze_authority.map(pubkey_string).into(),
                             updated_slot: self.snapshot_slot,
                         })
                         .await?;
@@ -500,6 +532,10 @@ impl<'a> Worker<'a> {
                                 delegate: token_account.delegate.map(pubkey_string).into(),
                                 delegated_amount: token_account.delegated_amount,
                                 state: token_account.state as u8,
+                                close_authority: token_account
+                                    .close_authority
+                                    .map(pubkey_string)
+                                    .into(),
                                 updated_slot: self.snapshot_slot,
                             })
                             .await?;
@@ -515,9 +551,14 @@ impl<'a> Worker<'a> {
                         self.sink
                             .write_token_mint(&TokenMintRow {
                                 mint: pubkey_string(account.meta.pubkey),
+                                mint_authority: token_mint.mint_authority.map(pubkey_string).into(),
                                 supply: token_mint.supply,
                                 decimals: token_mint.decimals,
                                 is_initialized: token_mint.is_initialized,
+                                freeze_authority: token_mint
+                                    .freeze_authority
+                                    .map(pubkey_string)
+                                    .into(),
                                 updated_slot: self.snapshot_slot,
                             })
                             .await?;
@@ -559,7 +600,16 @@ impl<'a> Worker<'a> {
                 name: metadata.data.name,
                 symbol: metadata.data.symbol,
                 uri: metadata.data.uri,
+                update_authority: pubkey_string(metadata.update_authority),
                 is_mutable: metadata.is_mutable,
+                seller_fee_basis_points: metadata.data.seller_fee_basis_points,
+                creators: metadata
+                    .data
+                    .creators
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|creator| pubkey_string(creator.address))
+                    .collect(),
                 updated_slot: self.snapshot_slot,
             })
             .await?;
@@ -630,6 +680,7 @@ mod tests {
                 "delegate",
                 "delegated_amount",
                 "state",
+                "close_authority",
                 "updated_slot",
             ]
         );
@@ -637,9 +688,11 @@ mod tests {
             <TokenMintRow as Row>::COLUMN_NAMES,
             [
                 "mint",
+                "mint_authority",
                 "supply",
                 "decimals",
                 "is_initialized",
+                "freeze_authority",
                 "updated_slot"
             ]
         );
@@ -650,7 +703,10 @@ mod tests {
                 "name",
                 "symbol",
                 "uri",
+                "update_authority",
                 "is_mutable",
+                "seller_fee_basis_points",
+                "creators",
                 "updated_slot"
             ]
         );

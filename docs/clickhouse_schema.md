@@ -1,10 +1,7 @@
-本文件记录了 clickhouse 上已创建的表格的 schema
-
-```
 -- ========================================
--- 0. account: 原始账户快照表（未解析的原始元信息）
+-- 0. raw_account: 原始账户快照表（未解析的原始元信息）
 -- ========================================
-CREATE TABLE solana.account
+CREATE TABLE solana.raw_account
 (
     pubkey       String              COMMENT '账户自身的地址（base58），唯一标识一个账户',
     owner        LowCardinality(String) COMMENT '拥有该账户的 Program 地址，决定 data 字段应如何解析，如 Token Program、System Program 等；取值集合有限，适合字典编码',
@@ -31,6 +28,7 @@ CREATE TABLE solana.raw_token_account
     delegated_amount  UInt64 DEFAULT 0    COMMENT '被授权可转出的最大数量，没有授权则为 0',
     state             Enum8('uninitialized' = 0, 'initialized' = 1, 'frozen' = 2)
                                           COMMENT '账户状态：uninitialized 未初始化（无效数据），initialized 正常可用，frozen 已被冻结；Enum8 本身已是紧凑编码，无需再套 LowCardinality',
+    close_authority   Nullable(String)    COMMENT '有权限关闭此账户并收回 rent 押金的地址，没有设置则为空；常与 owner 相同，不适合字典编码',
     updated_slot      UInt64              COMMENT '本条快照数据采集时对应的 slot 高度，用于版本去重'
 )
 ENGINE = ReplacingMergeTree(updated_slot)
@@ -57,9 +55,11 @@ ALTER TABLE solana.raw_token_account MATERIALIZE PROJECTION proj_by_owner;
 CREATE TABLE solana.raw_token_mint
 (
     mint              String              COMMENT 'token 地址，唯一标识一个 token',
+    mint_authority    Nullable(String)    COMMENT '有权限增发新 token 的地址，若已被永久放弃增发权限则为空；常为创建者个人钱包，不适合字典编码',
     supply            UInt64              COMMENT '当前总供应量，最小单位整数，需配合 decimals 换算',
     decimals          UInt8               COMMENT '小数位数，决定 amount/supply 如何换算成人类可读数量',
     is_initialized    Bool                COMMENT '该 mint 账户是否已正常初始化',
+    freeze_authority  Nullable(String)    COMMENT '有权限冻结某个持币账户的地址，若已放弃该权限则为空；常与 mint_authority 相同，不适合字典编码',
     updated_slot      UInt64              COMMENT '本条快照数据采集时对应的 slot 高度，用于版本去重'
 )
 ENGINE = ReplacingMergeTree(updated_slot)
@@ -76,10 +76,13 @@ CREATE TABLE solana.raw_token_metadata
     name                     String              COMMENT 'token 名称，如 "USD Coin"',
     symbol                   String              COMMENT 'token 代号，如 "USDC"',
     uri                      String              COMMENT '指向链下 JSON 文件的链接，里面包含 logo 图片地址、描述等详细信息',
+    update_authority         LowCardinality(String) COMMENT '有权限修改这些展示信息的地址；大量 token 由 launchpad（如 pump.fun）批量创建并共用同一个程序控制的地址，实际 distinct 值远小于总行数，适合字典编码',
     is_mutable               Bool                COMMENT '这些展示信息以后是否还能被修改',
+    seller_fee_basis_points  UInt16 DEFAULT 0    COMMENT '版税比例（万分之一为单位），主要用于 NFT，普通 token 一般为 0',
+    creators                 Array(String) DEFAULT []
+                                                  COMMENT '创作者地址列表，主要用于 NFT 分成场景，普通 token 一般为空；地址随创作者个人变化，不适合字典编码',
     updated_slot             UInt64              COMMENT '本条快照数据采集时对应的 slot 高度，用于版本去重'
 )
 ENGINE = ReplacingMergeTree(updated_slot)
 ORDER BY mint
-COMMENT 'L1: Metaplex Token Metadata 账户快照表，记录每个 token 的名称/图标等展示信息，并非所有 token 都存在对应记录';
-```
+COMMENT 'L1: Metaplex Token Metadata 账户快照表，记录每个 token 的名称/图标等展示信息，并非所有 token 都存在对应记录';```

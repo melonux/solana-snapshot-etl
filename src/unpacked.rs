@@ -26,6 +26,15 @@ impl SnapshotExtractor for UnpackedSnapshotExtractor {
     fn snapshot_slot(&self) -> u64 {
         self.snapshot_slot
     }
+
+    fn append_vec_count_hint(&self) -> Option<u64> {
+        self.root.join("accounts").read_dir().ok().map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| parse_append_vec_name(&entry.file_name()).is_some())
+                .count() as u64
+        })
+    }
 }
 
 impl UnpackedSnapshotExtractor {

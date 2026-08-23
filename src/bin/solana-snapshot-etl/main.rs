@@ -111,12 +111,14 @@ fn _main() -> Result<(), Box<dyn std::error::Error>> {
         let clickhouse_url = std::env::var("CLICKHOUSE_URL")
             .map_err(|_| "CLICKHOUSE_URL must be set in the environment or .env file")?;
         let snapshot_slot = loader.snapshot_slot();
+        let append_vec_count = loader.append_vec_count_hint();
         info!("Dumping snapshot slot {} to ClickHouse", snapshot_slot);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         let stats = runtime.block_on(
-            ClickhouseIndexer::new(clickhouse_url, snapshot_slot)?.insert_all(loader.iter()),
+            ClickhouseIndexer::new(clickhouse_url, snapshot_slot, append_vec_count)?
+                .insert_all(loader.iter()),
         )?;
         log_clickhouse_index_stats(&stats);
     }
@@ -369,6 +371,14 @@ impl SnapshotExtractor for SupportedLoader {
             SupportedLoader::Unpacked(loader) => loader.snapshot_slot(),
             SupportedLoader::ArchiveFile(loader) => loader.snapshot_slot(),
             SupportedLoader::ArchiveDownload(loader) => loader.snapshot_slot(),
+        }
+    }
+
+    fn append_vec_count_hint(&self) -> Option<u64> {
+        match self {
+            SupportedLoader::Unpacked(loader) => loader.append_vec_count_hint(),
+            SupportedLoader::ArchiveFile(loader) => loader.append_vec_count_hint(),
+            SupportedLoader::ArchiveDownload(loader) => loader.append_vec_count_hint(),
         }
     }
 }

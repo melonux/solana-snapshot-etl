@@ -44,6 +44,12 @@ pub type AppendVecIterator<'a> = Box<dyn Iterator<Item = Result<AppendVec>> + 'a
 pub trait SnapshotExtractor: Sized {
     fn iter(&mut self) -> AppendVecIterator<'_>;
     fn snapshot_slot(&self) -> u64;
+
+    /// Returns the expected number of AppendVec files when it can be determined without
+    /// consuming the snapshot stream.
+    fn append_vec_count_hint(&self) -> Option<u64> {
+        None
+    }
 }
 
 fn parse_append_vec_name(name: &OsStr) -> Option<(u64, u64)> {
