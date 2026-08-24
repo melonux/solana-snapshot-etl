@@ -291,6 +291,23 @@ append_vec.slot() > last_processed_slot
 
 ---
 
+### 6.1 Full 的 ClickHouse 快速入库路径
+
+由于 Agave 在归档 full snapshot 时使用 `TombstonesFilter::Exclude`，full archive
+不会包含需要传播的 tombstone。项目因此按 snapshot 类型选择入库路径：
+
+- **full**：直接把 AppendVec 中的 canonical 账户写入 `raw_account` 和各个解析表；不建立
+  关闭账户候选集合，也不在所有写入完成后执行 `raw_token_account FINAL` 回查和 tombstone
+  写入。这避免了一次额外的 HashMap 扫描和 ClickHouse `IN` 查询批次，适合重建 full 基线；
+- **incremental**：保留候选收集、按 pubkey 回查 live token 行、复制业务字段并写入
+  `is_deleted=1` tombstone 的完整流程，因为这些 tombstone 是增量包传播 full 基线删除状态所
+  必需的。
+
+这只是入库流程优化，不改变表引擎或版本语义：`raw_token_account` 仍使用
+`ReplacingMergeTree(updated_slot, is_deleted)`，后续增量仍可覆盖 full 写入的行。对于已经有
+旧数据、且中间漏掉了 incremental 的数据库，不能把新的 full 当作删除历史的补丁；full 本身
+不携带这些历史 tombstone，应该从新的 full 重新建立基线，再连续应用之后的 incremental。
+
 ## 7. 完整链路总结
 
 ~~~text

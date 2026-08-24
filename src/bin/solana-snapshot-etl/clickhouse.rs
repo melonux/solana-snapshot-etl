@@ -52,6 +52,30 @@ const CLOSE_TOMBSTONE_BATCH_SIZE: usize = 2_000;
 
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+/// Describes how the archive is being applied to ClickHouse.
+///
+/// Full archives are canonical checkpoints and Agave deliberately excludes
+/// tombstone records from them. Incremental archives retain tombstones so that
+/// they can delete rows that were present in the full base.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SnapshotKind {
+    Full,
+    Incremental,
+}
+
+impl SnapshotKind {
+    fn collect_close_tombstones(self) -> bool {
+        matches!(self, Self::Incremental)
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Incremental => "incremental",
+        }
+    }
+}
+
 pub(crate) struct ClickhouseIndexer {
     client: Client,
     sink: ClickhouseSink,
@@ -65,6 +89,40 @@ struct Progress {
     accounts: ProgressCounter,
     tokens: ProgressCounter,
     metadata: ProgressCounter,
+}
+
+impl Progress {
+    /// Estimate remaining time from the complete run average. The built-in
+    /// indicatif ETA uses a short recent-rate window, which is unstable because
+    /// AppendVec sizes vary considerably.
+    fn inc_append_vec(&self) {
+        self.append_vecs.inc(1);
+        let completed = self.append_vecs.position();
+        let Some(total) = self.append_vecs.length() else {
+            return;
+        };
+        if completed == 0 {
+            return;
+        }
+
+        let remaining = total.saturating_sub(completed);
+        let average_seconds = self.append_vecs.elapsed().as_secs_f64() / completed as f64;
+        let eta_seconds = average_seconds * remaining as f64;
+        self.append_vecs
+            .set_message(format!("avg_eta={}", format_duration(eta_seconds)));
+    }
+}
+
+fn format_duration(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "unknown".to_owned();
+    }
+
+    let total_seconds = seconds.ceil().min(u64::MAX as f64) as u64;
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 pub(crate) struct IndexStats {
@@ -154,19 +212,21 @@ impl ClickhouseIndexer {
         append_vec_count: Option<u64>,
     ) -> Result<Self> {
         let spinner_style = ProgressStyle::with_template(
-            "{prefix:>13.bold.dim} {spinner} rate={per_sec:>13} total={human_pos:>11}",
+            "{prefix:>13.bold.dim} {spinner} rate={per_sec:>13} total={human_pos:>11} elapsed={elapsed_precise} {msg}",
         )?;
         let multi_progress = MultiProgress::new();
         let append_vec_style = ProgressStyle::with_template(
-            "{prefix:>13.bold.dim} [{bar:40.cyan/blue}] {pos:>7}/{len:>7} ({percent:>3}%)",
+            "{prefix:>13.bold.dim} [{bar:40.cyan/blue}] {pos:>7}/{len:>7} ({percent:>3}%) elapsed={elapsed_precise} {msg}",
         )?;
         let append_vecs = multi_progress.add(match append_vec_count {
             Some(total) => ProgressBar::new(total)
                 .with_style(append_vec_style)
-                .with_prefix("append_vecs"),
+                .with_prefix("append_vecs")
+                .with_message("avg_eta=calculating"),
             None => ProgressBar::new_spinner()
                 .with_style(spinner_style.clone())
-                .with_prefix("append_vecs"),
+                .with_prefix("append_vecs")
+                .with_message("avg_eta=unknown"),
         });
 
         let progress = Arc::new(Progress {
@@ -208,11 +268,14 @@ impl ClickhouseIndexer {
     pub(crate) async fn insert_all(
         mut self,
         iterator: AppendVecIterator<'_>,
+        snapshot_kind: SnapshotKind,
     ) -> Result<IndexStats> {
+        let collect_close_tombstones = snapshot_kind.collect_close_tombstones();
         let mut worker = Worker {
             sink: &mut self.sink,
             snapshot_slot: self.snapshot_slot,
             progress: Arc::clone(&self.progress),
+            collect_close_tombstones,
             spl_token_owner_accounts_seen: 0,
             spl_token_accounts_parsed: 0,
             spl_token_unexpected_size: 0,
@@ -243,7 +306,7 @@ impl ClickhouseIndexer {
                     );
                 }
             }
-            self.progress.append_vecs.inc(1);
+            self.progress.inc_append_vec();
         }
 
         let spl_token_owner_accounts_seen = worker.spl_token_owner_accounts_seen;
@@ -255,12 +318,22 @@ impl ClickhouseIndexer {
         let token_2022_unexpected_size = worker.token_2022_unexpected_size;
         let token_2022_unpack_failed = worker.token_2022_unpack_failed;
         let closed_token_accounts = std::mem::take(&mut worker.closed_token_accounts);
-        let token_account_close_candidates = closed_token_accounts.len() as u64;
+        let token_account_close_candidates = if collect_close_tombstones {
+            closed_token_accounts.len() as u64
+        } else {
+            0
+        };
         drop(worker);
 
         self.sink.end().await?;
-        let token_accounts_marked_deleted =
-            write_close_token_account_tombstones(&self.client, &closed_token_accounts).await?;
+        let token_accounts_marked_deleted = if collect_close_tombstones {
+            write_close_token_account_tombstones(&self.client, &closed_token_accounts).await?
+        } else {
+            info!(
+                "[clickhouse] Full snapshot: skipped tombstone candidate scan (archive excludes tombstones)"
+            );
+            0
+        };
         self.progress.append_vecs.finish_with_message("done");
         let _ = &self.multi_progress;
 
@@ -328,7 +401,7 @@ impl ClickhouseIndexer {
                     );
                 }
             }
-            self.progress.append_vecs.inc(1);
+            self.progress.inc_append_vec();
         }
 
         let token_accounts_marked_deleted =
@@ -512,6 +585,7 @@ struct Worker<'a> {
     sink: &'a mut ClickhouseSink,
     snapshot_slot: u64,
     progress: Arc<Progress>,
+    collect_close_tombstones: bool,
     spl_token_owner_accounts_seen: u64,
     spl_token_accounts_parsed: u64,
     spl_token_unexpected_size: u64,
@@ -565,12 +639,14 @@ impl<'a> Worker<'a> {
         // AccountsDb normalizes a zero-lamport account before writing it to an
         // AppendVec.  This check must therefore happen before dispatching by
         // owner: a closed token account has the default owner and no data left.
-        if is_canonical_empty_account(
-            account.meta.data_len,
-            account.account_meta.lamports,
-            account.account_meta.owner,
-            account.account_meta.executable,
-        ) {
+        if self.collect_close_tombstones
+            && is_canonical_empty_account(
+                account.meta.data_len,
+                account.account_meta.lamports,
+                account.account_meta.owner,
+                account.account_meta.executable,
+            )
+        {
             self.record_close_candidate(account, account_slot);
         }
 
@@ -770,7 +846,9 @@ impl<'a> Worker<'a> {
     /// They are harmless: the later server-side lookup only creates a tombstone
     /// when the pubkey already has a live raw_token_account row.
     fn record_close_candidate(&mut self, account: &StoredAccountMeta<'_>, account_slot: u64) {
-        if is_close_tombstone_candidate(account.account_meta.lamports) {
+        if self.collect_close_tombstones
+            && is_close_tombstone_candidate(account.account_meta.lamports)
+        {
             remember_close_candidate(&mut self.closed_token_accounts, account, account_slot);
         }
     }
@@ -1029,6 +1107,19 @@ mod tests {
     #[test]
     fn account_version_orders_by_slot() {
         assert!(AccountVersion { updated_slot: 2 } > AccountVersion { updated_slot: 1 });
+    }
+
+    #[test]
+    fn formats_average_eta_as_hours_minutes_seconds() {
+        assert_eq!(format_duration(0.0), "00:00:00");
+        assert_eq!(format_duration(3_661.1), "01:01:02");
+        assert_eq!(format_duration(f64::NAN), "unknown");
+    }
+
+    #[test]
+    fn only_incremental_archives_collect_close_tombstones() {
+        assert!(!SnapshotKind::Full.collect_close_tombstones());
+        assert!(SnapshotKind::Incremental.collect_close_tombstones());
     }
 
     #[test]

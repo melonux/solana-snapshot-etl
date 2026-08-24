@@ -1,4 +1,4 @@
-use crate::clickhouse::{ClickhouseIndexer, CloseTombstoneStats};
+use crate::clickhouse::{ClickhouseIndexer, CloseTombstoneStats, SnapshotKind};
 use crate::csv::CsvDumper;
 use crate::geyser::GeyserDumper;
 use crate::geyser_plugin::load_plugin;
@@ -207,13 +207,18 @@ fn process_single_snapshot(
             .map_err(|_| "CLICKHOUSE_URL must be set in the environment or .env file")?;
         let snapshot_slot = loader.snapshot_slot();
         let append_vec_count = loader.append_vec_count_hint();
-        info!("Dumping snapshot slot {} to ClickHouse", snapshot_slot);
+        let snapshot_kind = snapshot_kind_from_source(args.source.as_deref().unwrap_or_default());
+        info!(
+            "Dumping {} snapshot slot {} to ClickHouse",
+            snapshot_kind.as_str(),
+            snapshot_slot
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         let stats = runtime.block_on(
             ClickhouseIndexer::new(clickhouse_url, snapshot_slot, append_vec_count)?
-                .insert_all(loader.iter()),
+                .insert_all(loader.iter(), snapshot_kind),
         )?;
         log_clickhouse_index_stats(&stats);
     }
@@ -308,6 +313,27 @@ fn process_single_snapshot(
     Ok(())
 }
 
+/// A single-source invocation has no `WatchedSnapshot` wrapper from which to
+/// obtain the archive kind. Solana's archive filename is sufficient here; an
+/// unpacked directory (or a conventional `snapshot-...` archive) is treated
+/// as a full checkpoint. Unknown archive names conservatively keep the
+/// incremental tombstone path enabled so a renamed incremental archive cannot
+/// silently lose deletions.
+fn snapshot_kind_from_source(source: &str) -> SnapshotKind {
+    let source_without_query = source.split('?').next().unwrap_or(source);
+    let file_name = Path::new(source_without_query)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if file_name.starts_with("incremental-snapshot-") {
+        SnapshotKind::Incremental
+    } else if file_name.starts_with("snapshot-") || Path::new(source).is_dir() {
+        SnapshotKind::Full
+    } else {
+        SnapshotKind::Incremental
+    }
+}
+
 enum IncrementalOutput {
     Clickhouse {
         clickhouse_url: String,
@@ -393,7 +419,7 @@ impl IncrementalOutput {
     fn process(
         &mut self,
         loader: &mut SupportedLoader,
-        snapshot_kind: &str,
+        snapshot_kind: SnapshotKind,
     ) -> Result<(), Box<dyn std::error::Error>> {
         match self {
             Self::Clickhouse {
@@ -402,14 +428,17 @@ impl IncrementalOutput {
             } => {
                 let snapshot_slot = loader.snapshot_slot();
                 let append_vec_count = loader.append_vec_count_hint();
-                info!("Dumping {snapshot_kind} snapshot slot {snapshot_slot} to ClickHouse");
+                info!(
+                    "Dumping {} snapshot slot {snapshot_slot} to ClickHouse",
+                    snapshot_kind.as_str()
+                );
                 let stats = runtime.block_on(
                     ClickhouseIndexer::new(
                         clickhouse_url.clone(),
                         snapshot_slot,
                         append_vec_count,
                     )?
-                    .insert_all(loader.iter()),
+                    .insert_all(loader.iter(), snapshot_kind),
                 )?;
                 log_clickhouse_index_stats(&stats);
             }
@@ -490,7 +519,11 @@ fn run_incremental_snapshots(
             continue;
         };
 
-        if let Err(err) = output.process(&mut loader, candidate.kind()) {
+        let snapshot_kind = match &candidate {
+            WatchedSnapshot::Incremental(_) => SnapshotKind::Incremental,
+            WatchedSnapshot::Full(_) => SnapshotKind::Full,
+        };
+        if let Err(err) = output.process(&mut loader, snapshot_kind) {
             error!(
                 "Failed to process {} snapshot {}: {}. The file was retained and slot {} remains current",
                 candidate.kind(),
@@ -694,6 +727,8 @@ impl SupportedLoader {
         last_processed_slot: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         info!("Reading incremental snapshot archive");
+        // The archive can repeat storage from the full base. Only apply files
+        // newer than the database watermark.
         let loader =
             ArchiveSnapshotExtractor::open(path)?.with_minimum_append_vec_slot(last_processed_slot);
         Ok(Self::ArchiveFile(loader))
@@ -704,6 +739,9 @@ impl SupportedLoader {
         last_processed_slot: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         info!("Reading full snapshot archive");
+        // Full archives are canonical, but watch mode may discover one after
+        // some slots are already indexed. Keep the same slot filter so files
+        // at or below the database watermark are not rewritten.
         let loader =
             ArchiveSnapshotExtractor::open(path)?.with_minimum_append_vec_slot(last_processed_slot);
         Ok(Self::ArchiveFile(loader))

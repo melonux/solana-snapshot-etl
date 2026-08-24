@@ -132,8 +132,9 @@ where
             })
     }
 
-    /// Skip AppendVec files from slots that have already been applied by an earlier
-    /// incremental snapshot.
+    /// Skip AppendVec files from slots that have already been applied by the
+    /// current database watermark. This is used for both incremental archives
+    /// and a newer full archive discovered by snapshot-watch mode.
     pub fn with_minimum_append_vec_slot(mut self, slot: u64) -> Self {
         self.minimum_append_vec_slot = Some(slot);
         self

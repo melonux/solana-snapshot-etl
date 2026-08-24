@@ -106,8 +106,10 @@ with current slot `1000`, incremental `[1100, 2000]`, and full snapshot `1100`, 
 the full snapshot first, then applies the incremental.
 
 While processing either archive type, it skips `accounts/<slot>.<id>` entries at slots already
-processed. Thus a full snapshot only contributes the account changes after the current slot, and
-CloseAccount records follow the same tombstone path as in an incremental archive. After a
+processed. Thus a full snapshot only contributes the account changes after the current slot. Full
+archives use a fast ClickHouse path: Agave excludes tombstones from full archives, so the importer
+does not perform the extra close-candidate lookup for them. Incremental archives retain that
+tombstone path because it is needed to delete token accounts from the full base. After a
 successful write, the current slot advances, all recognized full and incremental archives ending
 at or below it are deleted, and the directory is scanned again. If no usable archive is available,
 it waits five seconds by default; change this with `--incremental-poll-interval-secs`.
