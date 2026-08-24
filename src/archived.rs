@@ -159,6 +159,8 @@ where
         Ok(AppendVec::new_from_reader(
             entry,
             known_vec.accounts_current_len,
+            slot,
+            id,
         )?)
     }
 

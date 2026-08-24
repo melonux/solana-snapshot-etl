@@ -1,87 +1,174 @@
 # Solana Snapshot 解析过程详解
 
-本文以这个仓库的实现为基础，说明 snapshot 是如何被读取、解析、映射成 SQLite 表的。重点解释：
+本文说明本项目如何解析 Solana snapshot，以及为什么当前 ETL 使用 `updated_slot` 作为账户版本、使用 tombstone 表达 SPL Token 账户删除。项目仍支持 SQLite 输出；SQLite 和 ClickHouse 共用前面的 AppendVec 与程序账户解析流程，本文重点补充当前 ClickHouse 增量入库语义。
 
-- snapshot 里每个账户是怎么布局的；
-- 代码中用什么结构体、偏移量和对齐规则从二进制数据里取字段；
-- 这些字段最终如何落到 SQLite 的 `account`、`token_account`、`token_mint`、`token_multisig` 和 `token_metadata` 表。
+这里需要先区分两件事：
 
-核心代码入口：
+1. snapshot 中的 AppendVec 是账户的物理存储文件；
+2. AccountsDb index 才是 Solana 判断某个 pubkey 当前有效版本的逻辑依据。
 
-- `src/append_vec.rs`：定义 `AppendVec`、`StoredMeta`、`AccountMeta` 与 account 的内存布局；
-- `src/solana.rs`：定义 `DeserializableVersionedBank` 与 `AccountsDbFields<T>`，负责从 snapshot manifest 读取 bank 结构；
-- `src/bin/solana-snapshot-etl/sqlite.rs`：负责把解析出的账户数据落库。
+因此，snapshot 不是交易日志，也不是可以依靠 AppendVec 文件顺序重放的历史记录。它是 Agave 在某个 bank slot 上整理出来的 canonical checkpoint。
 
----
+核心代码：
 
-## 1. 解析入口：snapshot manifest 与 bank
-
-Solana snapshot 并不是简单的 “账户列表 JSON” 或 “某个表 dump”。它本质上是一个经过序列化的 Solana runtime state，里面包含：
-
-- 当前 bank / slot / epoch 信息；
-- accounts DB 的索引结构；
-- 每个 append vec 中存放的所有账户数据。
-
-这个项目在读取 snapshot 时会先定位 snapshot manifest 文件，然后用 bincode 反序列化为 `DeserializableVersionedBank`：
-
-```rust
-let versioned_bank: DeserializableVersionedBank = deserialize_from(&mut snapshot_file)?;
-```
-
-`DeserializableVersionedBank` 里有一组关键字段：
-
-- `slot`: 当前 snapshot 对应的 slot；
-- `epoch`: 当前 epoch；
-- `block_height`: 区块高度；
-- `accounts_data_len`: snapshot 中 accounts 数据段的大致长度；
-- `epoch_stakes`：epoch stake 信息；
-- `hash`、`parent_hash`、`parent_slot`：链上下文。
-
-另外还有一个非常关键的结构：
-
-```rust
-pub struct AccountsDbFields<T>(
-    pub HashMap<Slot, Vec<T>>,
-    pub StoredMetaWriteVersion,
-    pub Slot,
-    pub BankHashInfo,
-    pub Vec<Slot>,
-    pub Vec<(Slot, Hash)>,
-);
-```
-
-它表示：
-
-- `HashMap<Slot, Vec<T>>`：每个 slot 对应一组账户数据；
-- `StoredMetaWriteVersion`：账户写版本；
-- `Slot`：当前 slot；
-- `BankHashInfo`：bank hash；
-- 后面两个字段：最近根 slot 和其 hash 列表。
-
-也就是说，真正的账户不是直接从这个 “manifest” 文件里抽取，而是从 `AccountsDbFields` 里对应的 `Vec<T>` 继续找出各个 append vec，再去解析 append vec 中的账户记录。
+- `src/append_vec.rs`：本项目解析 AppendVec 二进制布局；
+- `src/archived.rs`、`src/unpacked.rs`：读取 tar archive 或已解压 snapshot；
+- `src/bin/solana-snapshot-etl/sqlite.rs`：可选的 SQLite 输出；
+- `src/bin/solana-snapshot-etl/clickhouse.rs`：解析账户并写入 ClickHouse；
+- `agave/runtime/src/accounts_background_service.rs`：官方 full/incremental snapshot 生成前的 flush、clean、shrink 流程；
+- `agave/snapshots/src/archive.rs`：官方归档时过滤 obsolete 账户和 tombstone 的流程；
+- `agave/runtime/src/serde_snapshot.rs`：官方 snapshot manifest 和 AccountsDb 字段；
+- `agave/accounts-db/src/accounts_db.rs`：官方 AccountsDb index、duplicate 和 obsolete 处理。
 
 ---
 
-## 2. snapshot 中账户的真实存储结构：AppendVec
+## 1. Full 和 incremental snapshot 的官方语义
 
-Solana 的 account 存储使用的是 `AppendVec`，这是一个“追加型连续内存块”。它的特点是：
+### 1.1 Full snapshot
 
-- 每个账户在文件中按顺序追加；
-- 读取时用 mmap 直接映射到内存；
-- 账户记录由多个 metadata 段拼接而成；
-- 每个账户还会按 8 字节边界对齐，避免非对齐访问造成崩溃。
+Agave 在生成 full snapshot 前大致执行：
 
-代码中的关键定义是：
+~~~text
+set_latest_full_snapshot_slot(S)
+  -> force_flush_accounts_cache()
+  -> clean_accounts()
+  -> shrink_ancient_slots()
+  -> shrink_candidate_slots()
+  -> get_snapshot_storages(None)
+  -> serialize + archive
+~~~
 
-```rust
+可参见 [accounts_background_service.rs](../agave/runtime/src/accounts_background_service.rs) 和 [bank.rs](../agave/runtime/src/bank.rs)。
+
+`get_snapshot_storages(None)` 获取当前 bank slot 之前仍有账户的 storage。由于此前已经执行 clean 和 shrink，归档内容不是原始 AppendVec 历史，而是经过 AccountsDb 整理后的状态。
+
+full archive 通过 `AccountStorageReader` 排除：
+
+- 已标记为 obsolete 的旧账户记录；
+- tombstone 记录。
+
+因此，full snapshot 可以作为完整基线直接重建账户表，但它不会携带“某个旧账户何时被删除”的历史 tombstone。
+
+### 1.2 Incremental snapshot
+
+incremental snapshot 的 base slot 是最近一次 full snapshot 的 slot，而不是上一个 incremental snapshot 的 slot：
+
+~~~text
+full:              S_full
+incremental:       [S_full, S_incremental]
+~~~
+
+官方调用的是：
+
+~~~rust
+bank.get_snapshot_storages(Some(full_snapshot_slot))
+~~~
+
+也就是选取 `storage.slot() > S_full` 的 storage。后一个增量包仍可能包含 base 之后旧范围内的 storage：
+
+~~~text
+[S_full, 1200]
+[S_full, 1400]
+~~~
+
+第二个包不是简单的“前一个包再加 1201～1400 的文件”。旧 slot 的 storage 可能在中间经历 shrink，因而文件名、AppendVec ID、长度、offset 和物理内容都可能变化。
+
+incremental archive 与 full archive 的关键区别是：
+
+~~~rust
+Full        -> TombstonesFilter::Exclude
+Incremental -> TombstonesFilter::Include
+~~~
+
+这是因为 full 已经是完整状态，而 incremental 必须把 full base 中需要删除的账户传播下去。
+
+### 1.3 官方如何加载 full + incremental
+
+官方加载时先解压 full，再解压 incremental，然后把两组 storage 合并，最后重新构建 AccountsDb index。incremental 的 bank fields 代表最新 bank 状态，但账户 storage 是 full 和 incremental 的并集。
+
+加载 archive 时，Agave 还可能重新映射 AppendVec ID，以避免 full 与 incremental 的文件 ID 冲突。这说明 AppendVec ID 不是跨 snapshot 稳定的版本号。
+
+---
+
+## 2. AccountsDb 如何决定账户的逻辑版本
+
+### 2.1 一个 slot 只有一个 storage
+
+官方 snapshot manifest 的 `SlotAccountStorageEntries` 在真实 snapshot 中每个 slot 只有一个 storage entry。加载器如果发现同一 slot 有多个 storage，会直接报错。
+
+所以“同一个 slot 下多个不同 AppendVec ID 如何排序”不是正常的 canonical snapshot 场景。物理运行时可能在 shrink 过程中暂时同时存在旧、新 storage，但 snapshot 导出完成后只保留一个有效 storage。
+
+### 2.2 同一个 pubkey 的多个版本
+
+在 AccountsDb index 中，同一个 pubkey 可以暂时拥有多个不同 slot 的索引项：
+
+~~~text
+pubkey -> [(slot_1, location_1), (slot_2, location_2), ...]
+~~~
+
+官方最终取最大 slot 作为当前版本，较低 slot 的项标记为 duplicate/obsolete。官方代码在启动时明确按最高 slot 保留账户，其余版本用于计算 duplicate 数据并随后清理。
+
+因此，逻辑版本关系是：
+
+~~~text
+(pubkey, 最大 updated_slot) = 当前有效状态
+~~~
+
+不是：
+
+~~~text
+(pubkey, append_vec_id, account.offset) = 当前有效状态
+~~~
+
+正常导出的 canonical archive 通常已经过滤掉旧版本，所以实际 archive 中每个 pubkey 通常只出现一条非 tombstone 记录。AccountsDb 之所以仍然支持跨 slot duplicate，是为了启动重建和兼容尚未清理的存储。
+
+同一 pubkey、同一 slot 的多个有效版本不应出现在 canonical archive 中。若遇到这种情况，应视为异常，不能用 AppendVec ID 或 offset 声称恢复了真实交易顺序。
+
+### 2.3 shrink 为什么会重写旧 slot 文件
+
+shrink 会创建一个新的 storage，但新 storage 保持原来的 slot：
+
+~~~text
+old: (slot, old_append_vec_id, old_offset)
+new: (同一个 slot, new_append_vec_id, new_offset)
+~~~
+
+AccountsDb index 只把同一账户的物理位置替换成新的 `(store_id, offset)`。所以后续 snapshot 中旧 slot 文件内容发生变化，并不代表旧 slot 又发生了链上交易；通常只是物理压缩和重组。
+
+### 2.4 AppendVec 遍历顺序没有业务含义
+
+归档时官方 `AccountStoragesOrderer` 会按照文件大小交错排列 storage，以优化 I/O。构建 index 时还会随机并发扫描 storage。
+
+因此以下顺序都不能当作交易顺序：
+
+- tar 中 AppendVec 文件出现的顺序；
+- AppendVec 文件 ID 的大小；
+- 账户在 AppendVec 内的 byte offset；
+- `append_vec_id` 和 `account.offset` 的字典序。
+
+当前 snapshot wire 中原先名为 `write_version` 的字段已经是 unused/兼容字段，通常为 0。它不能用于恢复 snapshot 内的同 slot 写入顺序。
+
+---
+
+## 3. AppendVec 的二进制布局
+
+本项目的底层解析仍然从 AppendVec 的固定内存布局开始。一个账户记录大致是：
+
+~~~text
+[ StoredMeta ][ AccountMeta ][ Hash ][ account_data ][ padding ]
+~~~
+
+关键结构位于 `src/append_vec.rs`：
+
+~~~rust
 pub struct StoredMeta {
     pub write_version: StoredMetaWriteVersion,
     pub data_len: u64,
     pub pubkey: Pubkey,
 }
-```
+~~~
 
-```rust
+~~~rust
 #[repr(C)]
 pub struct AccountMeta {
     pub lamports: u64,
@@ -89,542 +176,149 @@ pub struct AccountMeta {
     pub owner: Pubkey,
     pub executable: bool,
 }
-```
+~~~
 
-并且 `StoredAccountMeta` 把它们组合起来：
+读取一个账户时，解析器依次读取 `StoredMeta`、`AccountMeta`、账户 hash 和 `data_len` 字节的 data，并将下一个 offset 向上对齐到 8 字节边界。
 
-```rust
-pub struct StoredAccountMeta<'a> {
-    pub meta: &'a StoredMeta,
-    pub account_meta: &'a AccountMeta,
-    pub data: &'a [u8],
-    pub offset: usize,
-    pub stored_size: usize,
-    pub hash: &'a Hash,
-}
-```
+这里的 `offset` 只是文件内物理地址，用于读取数据；它不是版本字段。
 
-这表示一个账户在 append vec 中的布局大致是：
+---
 
-```text
-[ StoredMeta ][ AccountMeta ][ Hash ][ account_data ]
-```
+## 4. 从通用账户到 Token 账户
+
+解析出 `StoredAccountMeta` 后，代码根据 `account.account_meta.owner` 分流：
+
+~~~text
+owner == SPL Token Program
+    -> spl_token::state::Account/Mint::unpack
+
+owner == Token-2022 Program
+    -> spl_token_2022::state::Account/Mint::unpack
+
+owner == Metaplex Metadata Program
+    -> Borsh deserialize Metadata
+~~~
+
+SPL Token 和 Token-2022 的账户 data 不是通用 AppendVec 元数据，而是各自程序定义的二进制结构。必须先通过对应 crate 的 `unpack` 解析，再写入 ClickHouse 的业务字段。
+
+同理，Metaplex metadata 账户要按照其 Borsh 结构反序列化，不能把 data bytes 当成 SPL Token 数据。
+
+---
+
+## 5. CloseAccount 和 tombstone
+
+### 5.1 为什么关闭后看不到原来的 token 字段
+
+AccountsDb 会把 zero-lamport 账户规范化为 canonical empty account，通常表现为：
+
+~~~text
+lamports = 0
+data_len = 0
+owner = Pubkey::default()
+executable = false
+~~~
+
+因此 CloseAccount 归档记录中已经没有原来的 mint、token owner、close authority 等信息。仅靠这个空账户无法重新 unpack 出 SPL Token Account。
+
+它只能作为删除候选：
+
+1. 记录 empty account 的 pubkey 和 AppendVec 所属 slot；
+2. 查询 ClickHouse 中该 pubkey 当前未删除的 token 行；
+3. 复制原行的 mint、owner 等业务字段；
+4. 写入一条更高 `updated_slot`、`is_deleted=1` 的 tombstone。
+
+如果数据库中没有该 pubkey 的 live token 行，则忽略候选，因为普通账户也可能是 canonical empty account。
+
+### 5.2 Full 和 incremental 对 tombstone 的区别
+
+- full snapshot 排除 tombstone；
+- incremental snapshot 保留 tombstone。
+
+所以从 full 开始重建时，已关闭的 token account 不需要插入删除行；它本来就不应出现在基线中。
+
+但在已有数据库上持续消费 incremental 时，必须处理 tombstone，否则旧的 live token 行会一直保留，导致 holder 和 token 分布统计错误。
+
+### 5.3 ClickHouse 表的最终版本设计
+
+`raw_token_account` 保留 `is_deleted` 和 `updated_slot`，不再保留 AppendVec 物理位置字段：
+
+~~~sql
+is_deleted   UInt8 DEFAULT 0
+updated_slot UInt64
+ENGINE = ReplacingMergeTree(updated_slot, is_deleted)
+ORDER BY pubkey
+~~~
 
 其中：
 
-- `StoredMeta`：写版本 + 数据长度 + pubkey；
-- `AccountMeta`：lamports + rent_epoch + owner + executable；
-- `Hash`：当前账户的 hash；
-- `account_data`：账户原始数据 bytes，长度为 `meta.data_len`；
+- `is_deleted = 0`：正常 token account；
+- `is_deleted = 1`：CloseAccount tombstone；
+- `updated_slot`：账户版本所属的链上 slot；
+- `append_vec_id`、`account_offset`、`final_version`：不再作为业务字段或版本字段。
+
+强一致查询仍应使用：
+
+~~~sql
+SELECT *
+FROM solana.raw_token_account FINAL
+WHERE is_deleted = 0;
+~~~
+
+完整 DDL 以 [clickhouse_schema.md](clickhouse_schema.md) 为准。
 
 ---
 
-## 3. 偏移量和 8 字节对齐：为什么要这么做
+## 6. 增量 ETL 的截止 slot 和文件过滤
 
-这一段是 Solana snapshot 解析最关键的底层细节。
+项目可以维护一个 `last_processed_slot`，每次只处理：
 
-在 `append_vec.rs` 中，偏移计算非常精确：
+~~~text
+append_vec.slot() > last_processed_slot
+~~~
 
-```rust
-pub const ALIGN_BOUNDARY_OFFSET: usize = mem::size_of::<u64>();
-macro_rules! u64_align {
-    ($addr: expr) => {
-        ($addr + (ALIGN_BOUNDARY_OFFSET - 1)) & !(ALIGN_BOUNDARY_OFFSET - 1)
-    };
-}
-```
+这样做的依据不是“旧文件不会变化”，而是：
 
-也就是说，所有记录在内存中按 8 字节边界对齐。`get_slice` 会在读数据时检查边界：
+1. 旧 slot 文件即使变化，通常只是 shrink 的物理重组；
+2. 账户逻辑版本仍由 slot 决定；
+3. 已经处理过的 slot 不需要因为 AppendVec ID/offset 改变而再次写入；
+4. 后续 incremental 通常是从同一个 full base 累积到更高 slot 的 storage 集合。
 
-```rust
-fn get_slice(&self, offset: usize, size: usize) -> Option<(&[u8], usize)> {
-    let (next, overflow) = offset.overflowing_add(size);
-    if overflow || next > self.len() {
-        return None;
-    }
-    let data = &self.map[offset..next];
-    let next = u64_align!(next);
-    Some((unsafe { ... }, next))
-}
-```
+这里的“没有空洞”指没有漏掉需要处理的 storage slot 范围，不是要求每个链上 slot 都有一个文件。很多 slot 没有账户写入，本来就不会产生 AppendVec。
 
-`get_account` 的关键逻辑是：
+这个优化有一个前提：此前的 incremental 必须已经被正确处理。如果某个 CloseAccount tombstone 在旧 incremental 中漏掉，后续 snapshot 的 shrink 重组不会可靠地补充这次逻辑删除。
 
-```rust
-let (meta, next): (&StoredMeta, _) = self.get_type(offset)?;
-let (account_meta, next): (&AccountMeta, _) = self.get_type(next)?;
-let (hash, next): (&Hash, _) = self.get_type(next)?;
-let (data, next) = self.get_slice(next, meta.data_len as usize)?;
-let stored_size = next - offset;
-```
-
-从这个过程可以看出，真正的解析规则是：
-
-1. 先从当前 `offset` 取出 `StoredMeta`；
-2. 再按 8 字节对齐后的偏移读取 `AccountMeta`；
-3. 再读取 `Hash`；
-4. 再用 `meta.data_len` 读取账户数据；
-5. 最终得到一个 `StoredAccountMeta`。
-
-这说明：snapshot 中的每个账户并不是一个“独立对象”，而是一个“连续消息块”，其中字段之间通过前后偏移 + 对齐来恢复。
+此外，不能在保留旧数据库状态的情况下直接用一个新的 full snapshot 跨过未处理的 incremental，因为 full 会排除 tombstone。新的 full 更适合作为重新建立基线的起点。
 
 ---
 
-## 4. 账户字段的含义：从 snapshot 到 SQLite `account` 表
-
-在 `src/bin/solana-snapshot-etl/sqlite.rs` 中，本项目会把每个账户写进 SQLite 的 `account` 表：
-
-```sql
-CREATE TABLE account  (
-    pubkey BLOB(32) NOT NULL PRIMARY KEY,
-    data_len INTEGER(8) NOT NULL,
-    owner BLOB(32) NOT NULL,
-    lamports INTEGER(8) NOT NULL,
-    executable INTEGER(1) NOT NULL,
-    rent_epoch INTEGER(8) NOT NULL
-);
-```
-
-插入代码是：
-
-```rust
-self.db.prepare_cached(
-    "INSERT OR REPLACE INTO account (pubkey, data_len, owner, lamports, executable, rent_epoch)
-     VALUES (?, ?, ?, ?, ?, ?);",
-)?;
-```
-
-对应的来源如下：
-
-- `pubkey`：来自 `account.meta.pubkey`；也就是 `StoredMeta.pubkey`；
-- `data_len`：来自 `account.meta.data_len`；
-- `owner`：来自 `account.account_meta.owner`；
-- `lamports`：来自 `account.account_meta.lamports`；
-- `executable`：来自 `account.account_meta.executable`；
-- `rent_epoch`：来自 `account.account_meta.rent_epoch`；
-
-这张表是所有账户的“总索引表”。本质上它不是抽象概念，而是把账户基础元数据直接从 `StoredMeta + AccountMeta` 拍平成数据库字段。
-
----
-
-## 5. 交易需要的 Token 账户：从二进制数据中 unpack 出结构体
-
-Solana 里有两类 token 账户：
-
-- SPL Token（`spl_token::id()`）
-- Token-2022（`TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`）
-
-`insert_account` 会判断 owner：
-
-```rust
-if account.account_meta.owner == spl_token::id() {
-    self.insert_token(account)?;
-} else if account.account_meta.owner == *token_2022_program_id() {
-    self.insert_token_2022(account)?;
-}
-```
-
-然后根据账户数据长度判断具体是哪种结构：
-
-- `spl_token::state::Account::LEN`
-- `spl_token::state::Mint::LEN`
-- `spl_token::state::Multisig::LEN`
-
-并调用：
-
-```rust
-spl_token::state::Account::unpack(account.data)
-```
-
-这一步是关键：账户数据 bytes 并不是 SQL 字段，而是符合 SPL Token 定义的二进制结构体，代码以 `unpack` 的方式把 bytes 还原成 Rust 结构体。之后再写入 SQLite。
-
----
-
-## 6. `token_account` 表字段含义
-
-创建表：
-
-```sql
-CREATE TABLE token_account (
-    pubkey BLOB(32) NOT NULL PRIMARY KEY,
-    mint BLOB(32) NOT NULL,
-    owner BLOB(32) NOT NULL,
-    amount INTEGER(8) NOT NULL,
-    delegate BLOB(32),
-    state INTEGER(1) NOT NULL,
-    is_native INTEGER(8),
-    delegated_amount INTEGER(8) NOT NULL,
-    close_authority BLOB(32)
-);
-```
-
-对应的 `spl_token::state::Account` 字段映射：
-
-- `pubkey`：账户 pubkey，来自 `account.meta.pubkey`；
-- `mint`：`token_account.mint`，对应 token mint 地址；
-- `owner`：`token_account.owner`，对应 token account 的 owner；
-- `amount`：`token_account.amount`，当前余额；
-- `delegate`：`token_account.delegate`，可选受托地址；
-- `state`：`token_account.state`，账户状态，例如 Initialized/Uninitialized 等；
-- `is_native`：`token_account.is_native`；
-- `delegated_amount`：`token_account.delegated_amount`；
-- `close_authority`：`token_account.close_authority`；
-
-从“二进制 bytes”到 SQLite 的这一步，本质上是：
-
-```text
-account.data (SPL Token Account binary) -> Account::unpack(...) -> token_account struct -> SQLite row
-```
-
-这里字段没有从文件直接硬编码“偏移”，而是依赖 SPL Token 定义中的固定布局；`unpack` 会按其规范从 bytes 中还原出结构。
-
----
-
-## 7. `token_mint` 表字段含义
-
-创建表：
-
-```sql
-CREATE TABLE token_mint (
-    pubkey BLOB(32) NOT NULL PRIMARY KEY,
-    mint_authority BLOB(32) NULL,
-    supply INTEGER(8) NOT NULL,
-    decimals INTEGER(2) NOT NULL,
-    is_initialized BOOL NOT NULL,
-    freeze_authority BLOB(32) NULL
-);
-```
-
-`mint` 结构来自 `spl_token::state::Mint`：
-
-- `pubkey`：mint 账户的 pubkey；
-- `mint_authority`：mint 权限地址；
-- `supply`：当前总供应量；
-- `decimals`：精度；
-- `is_initialized`：初始化状态；
-- `freeze_authority`：冻结权限地址。
-
-同样通过：
-
-```rust
-spl_token::state::Mint::unpack(account.data)
-```
-
-恢复出结构体后写入 SQLite。
-
----
-
-## 8. `token_multisig` 表字段含义
-
-创建表：
-
-```sql
-CREATE TABLE token_multisig (
-    pubkey BLOB(32) NOT NULL,
-    signer BLOB(32) NOT NULL,
-    m INTEGER(2) NOT NULL,
-    n INTEGER(2) NOT NULL,
-    PRIMARY KEY (pubkey, signer)
-);
-```
-
-这个表不是一个单行记录，而是多签账户会展开成多个签名者行。
-
-代码是：
-
-```rust
-for signer in &token_multisig.signers[..token_multisig.n as usize] {
-    token_multisig_insert.insert(params![
-        account.meta.pubkey.as_ref(),
-        signer.as_ref(),
-        token_multisig.m,
-        token_multisig.n
-    ])?;
-}
-```
-
-也就是：
-
-- `pubkey`：多签账户地址；
-- `signer`：每个 signer 的公钥；
-- `m`：门槛值；
-- `n`：总签名人数。
-
-这里是把一个多签 binary 结构展开成“签名者维度”的行记录。
-
----
-
-## 9. `token_metadata` 表字段含义
-
-创建表：
-
-```sql
-CREATE TABLE token_metadata (
-    pubkey BLOB(32) NOT NULL,
-    mint BLOB(32) NOT NULL,
-    name TEXT(32) NOT NULL,
-    symbol TEXT(10) NOT NULL,
-    uri TEXT(200) NOT NULL,
-    seller_fee_basis_points INTEGER(4) NOT NULL,
-    primary_sale_happened INTEGER(1) NOT NULL,
-    is_mutable INTEGER(1) NOT NULL,
-    edition_nonce INTEGER(2) NULL,
-    token_standard INTEGER(1) NULL,
-    collection_verified INTEGER(1) NULL,
-    collection_key BLOB(32) NULL
-);
-```
-
-这一层不是 SPL Token 结构，而是 Metaplex Metadata 程序账户。
-
-代码中先读出这个账户的 “类型标识”：
-
-```rust
-let account_key = match mpl_metadata::AccountKey::deserialize(&mut data_peek) {
-    Ok(v) => v,
-    Err(_) => return Ok(()),
-};
-```
-
-然后检查：
-
-```rust
-match account_key {
-    mpl_metadata::AccountKey::MetadataV1 => {
-        let meta_v1 = mpl_metadata::Metadata::deserialize(&mut data_peek)?;
-        let meta_v1_1 = mpl_metadata::MetadataExt::deserialize(&mut data_peek).ok();
-        let meta_v1_2 = meta_v1_1
-            .as_ref()
-            .and_then(|_| mpl_metadata::MetadataExtV1_2::deserialize(&mut data_peek).ok());
-        ...
-    }
-}
-```
-
-这里体现的是另一种解析方式：
-
-- 不是按 `AccountMeta`/`StoredMeta` 结构去找字段；
-- 而是按 Metaplex Metadata 的 Borsh 定义，把 bytes 逐段 deserialize 成多个结构体；
-- `Metadata` 负责基础字段；
-- `MetadataExt` 和 `MetadataExtV1_2` 负责可选扩展字段；
-- collection 信息也会额外 unpack 出来。
-
-字段对应关系：
-
-- `pubkey`：metadata account 地址；
-- `mint`：NFT / token mint 地址；
-- `name`：`meta_v1.data.name`；
-- `symbol`：`meta_v1.data.symbol`；
-- `uri`：`meta_v1.data.uri`；
-- `seller_fee_basis_points`：销售手续费；
-- `primary_sale_happened`：是否已完成首次销售；
-- `is_mutable`：是否可变；
-- `edition_nonce`：edition nonce（可选）；
-- `token_standard`：Metaplex `TokenStandard` 枚举值（可选）：`0=NonFungible`、`1=FungibleAsset`、`2=Fungible`、`3=NonFungibleEdition`、`4=ProgrammableNonFungible`、`5=ProgrammableNonFungibleEdition`；
-- `collection_verified`：collection 是否校验有效；
-- `collection_key`：collection 的 key（可选）。
-
-这一步是通过 Borsh 反序列化直接恢复结构体，不再依赖 `AppendVec` 中的通用账户元数据。
-
----
-
-## 10. 完整链路总结：从二进制到 SQLite
-
-一条账户数据从 snapshot 进入数据库，整体过程可概括为：
-
-```text
-snapshot file
-  -> snapshot manifest
-  -> DeserializableVersionedBank / AccountsDbFields
-  -> AppendVec
-  -> StoredMeta + AccountMeta + Hash + account data
-  -> StoredAccountMeta
-  -> account.owner 决定分支
-     -> SPL Token or Token-2022: unpack() -> token_account / token_mint / token_multisig
-     -> MPL Metadata: Borsh deserialize() -> token_metadata
-  -> SQLite 表
-```
-
-其中最关键的底层事实是：
-
-1. account 的真实布局在 `AppendVec` 中，由 `StoredMeta`、`AccountMeta`、`Hash` 和 `data` 连续存储；
-2. 访问时通过 `offset` + `size_of` + 8 字节对齐来恢复字段；
-3. 解析后，字段映射到 SQLite 表；
-4. 特定程序账户（token、metadata）再进一步通过 `unpack` 或 `deserialize` 解析其业务结构。
-
----
-
-## 11. 一个具体例子：Token Account 的解析路径
-
-例如，某个账户的 `owner` 是 SPL Token Program：
-
-```rust
-account.account_meta.owner == spl_token::id()
-```
-
-那么它会被送进：
-
-```rust
-spl_token::state::Account::unpack(account.data)
-```
-
-如果 unpack 成功，就得到类似这样的结构：
-
-```rust
-struct Account {
-    mint: Pubkey,
-    owner: Pubkey,
-    amount: u64,
-    delegate: COption<Pubkey>,
-    state: AccountState,
-    is_native: COption<u64>,
-    delegated_amount: u64,
-    close_authority: COption<Pubkey>,
-}
-```
-
-再按字段映射写入：
-
-```sql
-INSERT INTO token_account (
-    pubkey, mint, owner, amount, delegate, state,
-    is_native, delegated_amount, close_authority
-) VALUES (...)
-```
-
-这个过程不是“读某个固定 byte 偏移”，而是用 SPL Token 自己定义的结构体布局，严格从 bytes 中恢复出各字段，然后写表。
-
----
-
-## 12. 结论
-
-这个项目的 snapshot 解析并不是黑盒式“直接遍历文件”，而是建立了一条非常清晰的链路：
-
-- 先从 snapshot manifest 确认 bank / slot / epoch；
-- 再从 `AccountsDbFields` 里面定位 append vec；
-- 再由 `StoredMeta`、`AccountMeta`、Hash 和 account data 的固定布局恢复每个账户；
-- 再按 owner 程序分流，调用 `unpack` 或 Borsh `deserialize` 恢复业务字段；
-- 最后落库到 SQLite 中。
-
-这个设计的优点在于：
-
-- 能直接读取 Solana 原生内存布局；
-- 适配各种 account 程序；
-- 跟 Solana 运行时的索引与存储格式保持一致；
-- 可以通过偏移 + 类型 + 对齐规则高性能解析大规模 snapshot。
-
-如果需要进一步深入，可以继续阅读：
-
-- `src/append_vec.rs`：AppendVec / StoredMeta / AccountMeta 的底层布局；
-- `src/solana.rs`：snapshot manifest 的 bincode 结构；
-- `src/bin/solana-snapshot-etl/sqlite.rs`：字段落库和程序账户解析逻辑。
-
----
-
-## 13. Agave 结构与 ETL 结构不一致，但为何二进制兼容
-
-这一节回答一个经常出现的问题：
-
-- Agave 里的 snapshot 反序列化结构体，字段名和 ETL 里的结构体字段名并不完全一致；
-- 甚至有些字段在 Agave 已经标注为 unused、或换了语义名称；
-- 但 ETL 仍然可以正确读取 snapshot。
-
-核心原因是：这个链路依赖的是“序列化线序和字段编码”，而不是 Rust 字段名本身。
-
-### 13.1 manifest 层兼容：靠 serde + bincode 的线序匹配
-
-ETL 在 `src/solana.rs` 里定义了 `DeserializableVersionedBank`、`AccountsDbFields<T>`、`SerializableAccountStorageEntry`，用于读取 manifest。代码注释已明确这些定义是 vendored 自 Solana 历史实现。
-
-Agave 在 `agave/runtime/src/serde_snapshot.rs` 里也有对应的 `DeserializableVersionedBank`，但你会看到类似下面的差异：
-
-- 字段名不同，例如 `collector_id` vs `leader_id`；
-- 某些字段被替换为 `_unused_*` 占位；
-- 某些字段类型由“完整业务结构”变为“仅用于占位反序列化的类型”。
-
-这些差异不必然破坏兼容，原因有三点：
-
-1. bincode 对 struct 的编码按字段声明顺序写入，不写字段名。
-2. serde 反序列化时，只要读取端的字段序列与写入端线序可对应，字段名可以不同。
-3. 读取端可用语义等价或可反序列化占位类型承接字节流，然后只消费自己关心的字段。
-
-因此，ETL 与 Agave 在“代码层字段命名/语义抽象”不同，不等于“线协议不兼容”。
-
-### 13.2 AccountsDbFields 的前向兼容设计
-
-`AccountsDbFields<T>` 在 ETL 中定义为 tuple struct，并对末尾两个字段加了 `#[serde(deserialize_with = "default_on_eof")]`。
-
-这表示当 snapshot 流中不存在这些尾部字段时（例如旧版本数据），反序列化会在 EOF 时回退默认值，而不是直接失败。这样能覆盖“结构尾部增量扩展”的兼容场景。
-
-换言之，这里使用的是“尾部可选字段”的兼容策略：
-
-- 新 reader 读旧 snapshot：可以通过默认值兜底；
-- 旧 reader 读新 snapshot：依赖 `allow_trailing_bytes()` 忽略额外尾随数据（见下一节）。
-
-### 13.3 bincode 配置如何影响兼容
-
-ETL 的 `deserialize_from` 使用了：
-
-- `with_fixint_encoding()`：固定整数编码宽度，避免 varint 策略差异导致线格式不一致；
-- `allow_trailing_bytes()`：允许后续还有未消费字节，为“先读 bank，再读 accounts_db_fields，再继续读流”提供空间，也降低了新增尾部数据的脆弱性；
-- `with_limit(MAX_STREAM_SIZE)`：限制最大读取量，属于安全边界，不改变线格式。
-
-这里真正与兼容强相关的是 fixed-int 和 trailing-bytes。它们让 reader 对“版本演进中的小改动”更稳健。
-
-### 13.4 AppendVec 层兼容：靠稳定内存布局，不靠业务字段名
-
-账户数据并不是靠 manifest 里的 Rust 结构体字段名来恢复，而是靠 AppendVec 的稳定物理布局：
-
-- `StoredMeta` 和 `AccountMeta` 都是 `#[repr(C)]`；
-- 注释明确要求布局在全网稳定；
-- 读取按固定顺序进行：StoredMeta -> AccountMeta -> Hash -> data；
-- 每段按 8 字节对齐推进 offset。
-
-你也能在 Agave 新代码中看到同样的约束：
-
-- `agave/accounts-db/src/append_vec/meta.rs` 中的 `StoredMeta`、`AccountMeta` 仍是 `#[repr(C)]`；
-- 注释同样强调 “layout must be stable and consistent across the entire cluster”。
-
-这意味着 ETL 即使不复用 Agave 最新的同名 Rust 类型，也可以通过相同的字节布局规则读取同一份 append vec 文件。
-
-### 13.5 一个直观对照：哪里不同，哪里必须相同
-
-先看一个“源码定义对照表”（同一层含义，不要求逐字段命名一致）：
-
-| 对照项 | Agave 侧定义 | ETL 侧定义 | 是否要求同名 | 兼容关键点 |
-|---|---|---|---|---|
-| Bank 反序列化结构 | `agave/runtime/src/serde_snapshot.rs` 的 `DeserializableVersionedBank` | `src/solana.rs` 的 `DeserializableVersionedBank` | 否 | 字段线序与编码要可对应，字段名不参与 bincode 线格式 |
-| Accounts DB manifest 结构 | Agave snapshot serde 中的 Accounts DB fields（同序列化块） | `src/solana.rs` 的 `AccountsDbFields<T>` | 否 | tuple 字段顺序一致；尾部字段可通过 `default_on_eof` 兜底 |
-| AppendVec 条目索引项 | Agave 侧 storage entry 序列化信息（id + current_len） | `src/solana.rs` 的 `SerializableAccountStorageEntry` | 否 | `id` 与 `accounts_current_len` 的二进制解释一致 |
-| 账户元信息布局 | `agave/accounts-db/src/append_vec/meta.rs` 的 `StoredMeta` | `src/append_vec.rs` 的 `StoredMeta` | 否 | `#[repr(C)]` + 字段宽度/顺序一致 |
-| 账户账户头布局 | `agave/accounts-db/src/append_vec/meta.rs` 的 `AccountMeta` | `src/append_vec.rs` 的 `AccountMeta` | 否 | `#[repr(C)]` + 字段宽度/顺序一致 |
-| 账户记录拼接顺序 | Agave append-vec 持久化格式 | `src/append_vec.rs` 的读取顺序 `StoredMeta -> AccountMeta -> Hash -> data` | 不适用 | 记录段顺序、长度解释、8 字节对齐推进规则一致 |
-
-再看一个“差异类型对照表”（哪些差异安全，哪些差异危险）：
-
-| 差异类型 | 例子 | 是否通常兼容 | 原因 |
-|---|---|---|---|
-| 字段改名 | `collector_id` / `leader_id`、`_unused_*` | 是 | bincode 不写字段名，只依赖线序与类型编码 |
-| 占位字段语义变化 | 业务字段变 `_unused_*` 承接 | 是 | 只要占位类型可正确消费对应字节即可 |
-| 结构尾部新增字段 | 新版本在末尾追加字段 | 常常是 | 读取端可用 `allow_trailing_bytes()` 或 `default_on_eof` 缓冲 |
-| 中间插入或删除字段 | 在 struct 中间调整字段 | 否 | 会导致后续字段线序整体偏移 |
-| 整数编码策略变化 | fixed-int 改 varint | 否 | 相同值的字节表示改变，reader 解码错位 |
-| AppendVec 对齐或布局变化 | 不再按 8 字节对齐、Hash 位置变更 | 否 | 偏移推进规则失效，后续字段全部读错 |
-
-总结成一句话：
-
-- 源码抽象层可以不同：字段名、可见性、模块位置、unused 命名；
-- 二进制协议层必须稳定：字段线序、编码方式、字节宽度、记录布局顺序、对齐规则。
-
-ETL 与 Agave 的兼容，本质上建立在后者保持一致。
-
-### 13.6 何时会真正不兼容
-
-下面这些变更会实质破坏兼容，或需要 ETL 同步升级：
-
-- manifest 中间字段插入/删除导致线序位移；
-- 整数编码策略变更（fixed-int 与 varint 不一致）；
-- AppendVec 记录顺序变化（例如 Hash 位置变化）；
-- 关键字段类型宽度变化（u64 变 u32 等）；
-- 对齐规则变化（不再按 8 字节推进）。
-
-所以“结构体长得不一样”本身不可怕；真正可怕的是“二进制协议层约定”发生破坏性变更。
+## 7. 完整链路总结
+
+~~~text
+snapshot archive
+  -> snapshot manifest / AccountsDbFields
+  -> accounts/<slot>.<append_vec_id>
+  -> AppendVec 二进制记录
+  -> StoredMeta + AccountMeta + hash + data
+  -> owner 分流
+     -> SPL Token / Token-2022 unpack
+     -> Metaplex Borsh deserialize
+  -> SQLite（可选）或 ClickHouse raw_account / raw_token_account / raw_token_mint / raw_token_metadata
+~~~
+
+版本和删除语义则是：
+
+~~~text
+业务版本：updated_slot
+物理位置：append_vec_id、account.offset（仅审计，不排序）
+删除版本：updated_slot 更高的 is_deleted=1 tombstone
+~~~
+
+最终结论：
+
+1. snapshot 是官方整理后的 canonical 状态，不是 AppendVec 日志；
+2. 同一 pubkey 的逻辑新旧关系由 slot 决定；
+3. 同一 slot 的多个物理文件或多个记录不能用物理顺序解释，canonical archive 中也不应出现；
+4. `write_version`、AppendVec ID 和 offset 都不能作为链上版本；
+5. full 用来建立完整基线，incremental 用来传播 full 之后的账户变化和删除；
+6. SPL Token 删除必须用保留原 token 身份字段的 tombstone 表达；
+7. ClickHouse 的 token 表只需要 `updated_slot + is_deleted` 表达最终状态。

@@ -151,6 +151,16 @@ solana-snapshot-etl snapshot-139240745-*.tar.zst --clickhouse
 Rows are parsed and written directly to ClickHouse with HTTP `RowBinary`. Inserts are streamed and
 committed per table at a 250,000-row or 64 MiB threshold; no SQLite database is created.
 
+If a snapshot was already imported but the CloseAccount tombstone pass failed, run only that pass:
+
+```shell
+solana-snapshot-etl snapshot-139240745-*.tar.zst --clickhouse-close-tombstones
+```
+
+This scans the snapshot's canonical empty accounts and updates matching existing
+`raw_token_account` rows with `is_deleted = 1`; it does not re-insert raw or parsed account
+rows.
+
 #### CSV
 
 The CSV target writes records to stdout. Redirect stdout to save into a file.

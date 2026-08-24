@@ -29,10 +29,10 @@ CREATE TABLE solana.raw_token_account
     state             Enum8('uninitialized' = 0, 'initialized' = 1, 'frozen' = 2)
                                           COMMENT '账户状态：uninitialized 未初始化（无效数据），initialized 正常可用，frozen 已被冻结；Enum8 本身已是紧凑编码，无需再套 LowCardinality',
     close_authority   Nullable(String)    COMMENT '有权限关闭此账户并收回 rent 押金的地址，没有设置则为空；常与 owner 相同，不适合字典编码',
-    is_deleted        Bool DEFAULT false  COMMENT '是否已通过 CloseAccount 关闭；关闭记录保留原 mint/owner 以覆盖旧版本，当前持仓查询必须过滤 false',
-    updated_slot      UInt64              COMMENT '本条快照数据采集时对应的 slot 高度，用于版本去重'
+    is_deleted        UInt8 DEFAULT 0   COMMENT '是否已通过 CloseAccount 关闭；UInt8 中 0 表示存在、1 表示删除；关闭记录保留原 mint/owner 以覆盖旧版本，当前持仓查询必须过滤 0',
+    updated_slot      UInt64            COMMENT '账户在 AccountsDb 中发生此版本写入的链上 slot（AppendVec 所属 slot）'
 )
-ENGINE = ReplacingMergeTree(updated_slot)
+ENGINE = ReplacingMergeTree(updated_slot, is_deleted)
 ORDER BY pubkey
 COMMENT 'L1: SPL Token 账户余额快照表，一行对应一个 token account 的最新状态；pubkey 是稳定版本键，支持用 CloseAccount tombstone 覆盖旧持仓';
 
@@ -62,7 +62,12 @@ ALTER TABLE solana.raw_token_account MATERIALIZE PROJECTION proj_by_mint_owner;
 -- 因此对强一致当前态查询必须使用 FINAL，并排除 CloseAccount 写入的 tombstone。
 SELECT *
 FROM solana.raw_token_account FINAL
-WHERE is_deleted = false;
+WHERE is_deleted = 0;
+
+-- updated_slot 是唯一的业务版本字段。官方 canonical snapshot 不会保留同一
+-- pubkey 在同一 slot 的多个有效版本，因此不需要用 AppendVec 的物理位置推断顺序。
+-- is_deleted 作为 ReplacingMergeTree 的第二个参数，UInt8=1 表示删除版本；引擎会在
+-- 版本比较和后台合并时按删除标记处理，查询时仍建议显式使用 FINAL 并过滤 is_deleted=0。
 
 -- 迁移说明：旧版表使用 ORDER BY (mint, owner, pubkey)，不能原地改为以
 -- pubkey 去重，也无法从已经丢失的历史 CloseAccount 反推出 tombstone。
@@ -73,6 +78,8 @@ WHERE is_deleted = false;
 -- 然后从一个新的全量 snapshot 重建，并连续消费该全量 snapshot 之后的
 -- incremental snapshots。验证无误后再删除 _v1_backup；不要把新的全量
 -- snapshot 直接追加到旧表。
+-- 当前版本移除了 append_vec_id/account_offset/final_version。旧表的字段布局和引擎定义
+-- 不兼容，应新建表并从全量 snapshot 重新导入。
 
 
 -- ========================================

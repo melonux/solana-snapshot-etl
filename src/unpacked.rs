@@ -170,10 +170,11 @@ impl UnpackedSnapshotExtractor {
         };
 
         Ok(
-            AppendVec::new_from_file(path, known_vec.accounts_current_len).map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!(
+            AppendVec::new_from_file(path, known_vec.accounts_current_len, slot, id).map_err(
+                |e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
                         "failed to open/parse appendvec {} (slot={}, id={}, expected_len={}): {}",
                         path.display(),
                         slot,
@@ -181,8 +182,9 @@ impl UnpackedSnapshotExtractor {
                         known_vec.accounts_current_len,
                         e
                     ),
-                )
-            })?,
+                    )
+                },
+            )?,
         )
     }
 }

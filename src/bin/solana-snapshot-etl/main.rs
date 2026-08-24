@@ -1,4 +1,4 @@
-use crate::clickhouse::ClickhouseIndexer;
+use crate::clickhouse::{ClickhouseIndexer, CloseTombstoneStats};
 use crate::csv::CsvDumper;
 use crate::geyser::GeyserDumper;
 use crate::geyser_plugin::load_plugin;
@@ -43,7 +43,14 @@ mod sqlite;
     ArgGroup::new("action")
         .required(true)
         .multiple(false)
-        .args(&["csv", "geyser", "sqlite-out", "clickhouse", "programs-out"]),
+        .args(&[
+            "csv",
+            "geyser",
+            "sqlite-out",
+            "clickhouse",
+            "clickhouse-close-tombstones",
+            "programs-out",
+        ]),
 ))]
 struct Args {
     #[clap(help = "Snapshot source (unpacked snapshot, archive file, or HTTP link)")]
@@ -77,6 +84,12 @@ struct Args {
         help = "Write to ClickHouse configured by CLICKHOUSE_URL"
     )]
     clickhouse: bool,
+    #[clap(
+        long,
+        action,
+        help = "Scan canonical empty accounts and mark deleted token accounts in ClickHouse without re-importing rows"
+    )]
+    clickhouse_close_tombstones: bool,
     #[clap(long, help = "SQLite3 cache size in MB")]
     sqlite_cache_size: Option<i64>,
     #[clap(long, action, help = "Index token program data")]
@@ -100,6 +113,12 @@ fn main() {
 fn _main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     if let Some(directory) = &args.incremental_snapshot_dir {
+        if args.clickhouse_close_tombstones {
+            return Err(
+                "--clickhouse-close-tombstones requires a single snapshot source, not snapshot watch mode"
+                    .into(),
+            );
+        }
         let last_processed_slot = args
             .last_processed_slot
             .ok_or("--last-processed-slot is required when --incremental-snapshot-dir is used")?;
@@ -162,6 +181,25 @@ fn process_single_snapshot(
         drop(dumper);
         info!("[geyser] Skipped {} append vec files", skipped_append_vecs);
         println!("Done!");
+    }
+    if args.clickhouse_close_tombstones {
+        dotenvy::dotenv().ok();
+        let clickhouse_url = std::env::var("CLICKHOUSE_URL")
+            .map_err(|_| "CLICKHOUSE_URL must be set in the environment or .env file")?;
+        let snapshot_slot = loader.snapshot_slot();
+        let append_vec_count = loader.append_vec_count_hint();
+        info!(
+            "Scanning snapshot slot {} for canonical empty accounts",
+            snapshot_slot
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let stats = runtime.block_on(
+            ClickhouseIndexer::new(clickhouse_url, snapshot_slot, append_vec_count)?
+                .mark_close_tombstones(loader.iter()),
+        )?;
+        log_close_tombstone_stats(&stats);
     }
     if args.clickhouse {
         dotenvy::dotenv().ok();
@@ -532,8 +570,31 @@ fn log_clickhouse_index_stats(stats: &crate::clickhouse::IndexStats) {
         stats.token_2022_unpack_failed
     );
     info!(
-        "[clickhouse] Zero-lamport token-account close candidates: {}",
+        "[clickhouse] Canonical empty-account token tombstone candidates: {}",
         stats.token_account_close_candidates
+    );
+    info!(
+        "[clickhouse] Token accounts marked deleted: {}",
+        stats.token_accounts_marked_deleted
+    );
+}
+
+fn log_close_tombstone_stats(stats: &CloseTombstoneStats) {
+    info!(
+        "[clickhouse] Scanned {} append vec files for tombstones",
+        stats.append_vecs_total
+    );
+    info!(
+        "[clickhouse] Skipped {} append vec files while scanning tombstones",
+        stats.skipped_append_vecs
+    );
+    info!(
+        "[clickhouse] Canonical empty accounts found: {}",
+        stats.canonical_empty_accounts
+    );
+    info!(
+        "[clickhouse] Token accounts marked deleted: {}",
+        stats.token_accounts_marked_deleted
     );
 }
 

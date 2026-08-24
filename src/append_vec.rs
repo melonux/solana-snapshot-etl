@@ -126,6 +126,16 @@ impl<'a> StoredAccountMeta<'a> {
 /// restrictions are placed on reading. That is, one may read items from one thread while another
 /// is appending new items.
 pub struct AppendVec {
+    /// Slot whose AccountsDb storage entry this AppendVec belongs to.
+    ///
+    /// This is carried separately from the snapshot boundary slot.  The
+    /// filename/manifest identifies the storage slot, which is the slot at
+    /// which the account write was recorded.
+    slot: u64,
+
+    /// AccountsDb storage-file ID from the AppendVec filename.
+    id: u64,
+
     /// A file-backed block of memory that is used to store the data for each appended item.
     map: Mmap,
 
@@ -178,7 +188,12 @@ impl AppendVec {
         self.file_size
     }
 
-    pub fn new_from_file<P: AsRef<Path>>(path: P, current_len: usize) -> io::Result<Self> {
+    pub fn new_from_file<P: AsRef<Path>>(
+        path: P,
+        current_len: usize,
+        slot: u64,
+        id: u64,
+    ) -> io::Result<Self> {
         let data = OpenOptions::new()
             .read(true)
             .write(false)
@@ -198,6 +213,8 @@ impl AppendVec {
         };
 
         let new = AppendVec {
+            slot,
+            id,
             map,
             current_len,
             file_size,
@@ -206,14 +223,29 @@ impl AppendVec {
         Ok(new)
     }
 
-    pub fn new_from_reader<R: Read>(reader: &mut R, current_len: usize) -> io::Result<Self> {
+    pub fn new_from_reader<R: Read>(
+        reader: &mut R,
+        current_len: usize,
+        slot: u64,
+        id: u64,
+    ) -> io::Result<Self> {
         let mut map = MmapMut::map_anon(current_len)?;
         io::copy(&mut reader.take(current_len as u64), &mut map.as_mut())?;
         Ok(AppendVec {
+            slot,
+            id,
             map: map.make_read_only()?,
             current_len,
             file_size: current_len as u64,
         })
+    }
+
+    pub fn slot(&self) -> u64 {
+        self.slot
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Get a reference to the data at `offset` of `size` bytes if that slice
