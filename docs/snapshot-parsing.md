@@ -1,6 +1,6 @@
 # Solana Snapshot 解析过程详解
 
-本文说明本项目如何解析 Solana snapshot，以及为什么当前 ETL 使用 `updated_slot` 作为账户版本、使用 tombstone 表达 SPL Token 账户删除。项目仍支持 SQLite 输出；SQLite 和 ClickHouse 共用前面的 AppendVec 与程序账户解析流程，本文重点补充当前 ClickHouse 增量入库语义。
+本文说明本项目如何解析 Solana snapshot，以及为什么当前 ETL 使用 `updated_slot` 作为账户版本、使用 tombstone 表达 SPL Token 账户删除。当前输出目标为 ClickHouse，本文重点补充 ClickHouse 增量入库语义。
 
 这里需要先区分两件事：
 
@@ -13,7 +13,6 @@
 
 - `src/append_vec.rs`：本项目解析 AppendVec 二进制布局；
 - `src/archived.rs`、`src/unpacked.rs`：读取 tar archive 或已解压 snapshot；
-- `src/bin/solana-snapshot-etl/sqlite.rs`：可选的 SQLite 输出；
 - `src/bin/solana-snapshot-etl/clickhouse.rs`：解析账户并写入 ClickHouse；
 - `agave/runtime/src/accounts_background_service.rs`：官方 full/incremental snapshot 生成前的 flush、clean、shrink 流程；
 - `agave/snapshots/src/archive.rs`：官方归档时过滤 obsolete 账户和 tombstone 的流程；
@@ -319,7 +318,7 @@ snapshot archive
   -> owner 分流
      -> SPL Token / Token-2022 unpack
      -> Metaplex Borsh deserialize
-  -> SQLite（可选）或 ClickHouse raw_account / raw_token_account / raw_token_mint / raw_token_metadata
+  -> ClickHouse raw_account / raw_token_account / raw_token_mint / raw_token_metadata
 ~~~
 
 版本和删除语义则是：

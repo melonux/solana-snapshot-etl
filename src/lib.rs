@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::io::Read;
 use std::path::Path;
@@ -12,9 +11,6 @@ pub mod solana;
 pub mod archived;
 pub mod incremental;
 pub mod unpacked;
-
-#[cfg(feature = "parallel")]
-pub mod parallel;
 
 use crate::append_vec::{AppendVec, StoredAccountMeta};
 use crate::solana::{
@@ -82,6 +78,34 @@ pub fn append_vec_iter(append_vec: Rc<AppendVec>) -> impl Iterator<Item = Stored
         .map(move |offset| StoredAccountMetaHandle::new(Rc::clone(&append_vec), offset))
 }
 
+/// Iterate over the accounts in an AppendVec without the intermediate offset
+/// scan used by [`append_vec_iter`].  The original handle-based API is kept
+/// for compatibility, but it parses every account once while collecting
+/// offsets and then parses it a second time when the handle is accessed.  ETL
+/// consumers only need the account during the callback/loop body, so yielding
+/// the borrowed metadata directly avoids that duplicate work and allocation.
+pub fn append_vec_accounts(append_vec: &AppendVec) -> impl Iterator<Item = StoredAccountMeta<'_>> {
+    AppendVecAccounts {
+        append_vec,
+        offset: 0,
+    }
+}
+
+struct AppendVecAccounts<'a> {
+    append_vec: &'a AppendVec,
+    offset: usize,
+}
+
+impl<'a> Iterator for AppendVecAccounts<'a> {
+    type Item = StoredAccountMeta<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (account, next_offset) = self.append_vec.get_account(self.offset)?;
+        self.offset = next_offset;
+        Some(account)
+    }
+}
+
 pub struct StoredAccountMetaHandle {
     append_vec: Rc<AppendVec>,
     offset: usize,
@@ -104,30 +128,4 @@ pub trait ReadProgressTracking {
         rd: Box<dyn Read>,
         file_len: u64,
     ) -> Box<dyn Read>;
-}
-
-struct NullReadProgressTracking {}
-
-impl ReadProgressTracking for NullReadProgressTracking {
-    fn new_read_progress_tracker(&self, _: &Path, rd: Box<dyn Read>, _: u64) -> Box<dyn Read> {
-        rd
-    }
-}
-
-struct RefCellRead<T: Read> {
-    rd: RefCell<T>,
-}
-
-impl<T: Read> Read for RefCellRead<T> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.rd
-            .try_borrow_mut()
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "attempted to read archive concurrently",
-                )
-            })
-            .and_then(|mut rd| rd.read(buf))
-    }
 }

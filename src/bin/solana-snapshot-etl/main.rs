@@ -1,35 +1,23 @@
 use crate::clickhouse::{ClickhouseIndexer, CloseTombstoneStats, SnapshotKind};
-use crate::csv::CsvDumper;
-use crate::geyser::GeyserDumper;
-use crate::geyser_plugin::load_plugin;
-use crate::programs::ProgramDumper;
-use crate::sqlite::SqliteIndexer;
 use clap::{ArgGroup, Parser};
 use indicatif::{ProgressBar, ProgressBarIter, ProgressStyle};
 use log::{error, info, warn};
-use reqwest::blocking::Response;
 use solana_snapshot_etl::archived::ArchiveSnapshotExtractor;
 use solana_snapshot_etl::incremental::{
     discover as discover_incremental_snapshots, discover_full as discover_full_snapshots,
     eligible_candidates, eligible_full_candidates, FullSnapshot, IncrementalSnapshot,
 };
-use solana_snapshot_etl::parallel::AppendVecConsumer;
 use solana_snapshot_etl::unpacked::UnpackedSnapshotExtractor;
 use solana_snapshot_etl::{AppendVecIterator, ReadProgressTracking, SnapshotExtractor};
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
-use std::io::{stdout, IoSliceMut, Read, Write};
+use std::fs::File;
+use std::io::{IoSliceMut, Read};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
 mod clickhouse;
-mod csv;
-mod geyser;
-mod geyser_plugin;
 mod mpl_metadata;
-mod programs;
-mod sqlite;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -43,16 +31,12 @@ mod sqlite;
         .required(true)
         .multiple(false)
         .args(&[
-            "csv",
-            "geyser",
-            "sqlite-out",
             "clickhouse",
             "clickhouse-close-tombstones",
-            "programs-out",
         ]),
 ))]
 struct Args {
-    #[clap(help = "Snapshot source (unpacked snapshot, archive file, or HTTP link)")]
+    #[clap(help = "Snapshot source (unpacked snapshot directory or local archive file)")]
     source: Option<String>,
     #[clap(
         long,
@@ -73,10 +57,6 @@ struct Args {
         help = "Delay before re-scanning a snapshot directory when no usable archive exists"
     )]
     incremental_poll_interval_secs: u64,
-    #[clap(long, action, help = "Write CSV to stdout")]
-    csv: bool,
-    #[clap(long, help = "Export to new SQLite3 DB at this path")]
-    sqlite_out: Option<String>,
     #[clap(
         long,
         action,
@@ -85,18 +65,17 @@ struct Args {
     clickhouse: bool,
     #[clap(
         long,
+        default_value_t = default_clickhouse_workers(),
+        value_name = "N",
+        help = "Number of concurrent ClickHouse import workers"
+    )]
+    clickhouse_workers: usize,
+    #[clap(
+        long,
         action,
         help = "Scan canonical empty accounts and mark deleted token accounts in ClickHouse without re-importing rows"
     )]
     clickhouse_close_tombstones: bool,
-    #[clap(long, help = "SQLite3 cache size in MB")]
-    sqlite_cache_size: Option<i64>,
-    #[clap(long, action, help = "Index token program data")]
-    tokens: bool,
-    #[clap(long, help = "Load Geyser plugin from given config file")]
-    geyser: Option<String>,
-    #[clap(long, help = "Write programs tar stream")]
-    programs_out: Option<String>,
 }
 
 fn main() {
@@ -109,8 +88,20 @@ fn main() {
     }
 }
 
+fn default_clickhouse_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().min(4))
+        .unwrap_or(2)
+}
+
 fn _main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    if args.clickhouse_workers == 0 {
+        return Err("--clickhouse-workers must be greater than zero".into());
+    }
+    if args.clickhouse_workers > 32 {
+        return Err("--clickhouse-workers must not exceed 32".into());
+    }
     if let Some(directory) = &args.incremental_snapshot_dir {
         if args.clickhouse_close_tombstones {
             return Err(
@@ -142,45 +133,6 @@ fn process_single_snapshot(
     args: &Args,
     loader: &mut SupportedLoader,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if args.csv {
-        info!("Dumping to CSV");
-        let mut writer = CsvDumper::new();
-        let mut skipped_append_vecs = 0u64;
-        for (append_vec_idx, append_vec) in loader.iter().enumerate() {
-            match append_vec {
-                Ok(append_vec) => writer.dump_append_vec(append_vec),
-                Err(err) => {
-                    skipped_append_vecs += 1;
-                    warn!("[csv] Skipping append vec #{}: {}", append_vec_idx, err);
-                }
-            }
-        }
-        drop(writer);
-        info!("[csv] Skipped {} append vec files", skipped_append_vecs);
-        println!("Done!");
-    }
-    if let Some(geyser_config_path) = &args.geyser {
-        info!("Dumping to Geyser plugin: {}", &geyser_config_path);
-        let plugin = unsafe { load_plugin(&geyser_config_path)? };
-        assert!(
-            plugin.account_data_notifications_enabled(),
-            "Geyser plugin does not accept account data notifications"
-        );
-        let mut dumper = GeyserDumper::new(plugin);
-        let mut skipped_append_vecs = 0u64;
-        for (append_vec_idx, append_vec) in loader.iter().enumerate() {
-            match append_vec {
-                Ok(append_vec) => dumper.on_append_vec(append_vec)?,
-                Err(err) => {
-                    skipped_append_vecs += 1;
-                    warn!("[geyser] Skipping append vec #{}: {}", append_vec_idx, err);
-                }
-            }
-        }
-        drop(dumper);
-        info!("[geyser] Skipped {} append vec files", skipped_append_vecs);
-        println!("Done!");
-    }
     if args.clickhouse_close_tombstones {
         dotenvy::dotenv().ok();
         let clickhouse_url = std::env::var("CLICKHOUSE_URL")
@@ -215,99 +167,12 @@ fn process_single_snapshot(
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let stats = runtime.block_on(
-            ClickhouseIndexer::new(clickhouse_url, snapshot_slot, append_vec_count)?
-                .insert_all(loader.iter(), snapshot_kind),
-        )?;
+        let stats =
+            runtime.block_on(
+                ClickhouseIndexer::new(clickhouse_url, snapshot_slot, append_vec_count)?
+                    .insert_all(loader.iter(), snapshot_kind, args.clickhouse_workers),
+            )?;
         log_clickhouse_index_stats(&stats);
-    }
-    if let Some(sqlite_out_path) = &args.sqlite_out {
-        info!("Dumping to SQLite3: {}", &sqlite_out_path);
-        let db_path = PathBuf::from(sqlite_out_path);
-        if db_path.exists() {
-            return Err("Refusing to overwrite database that already exists".into());
-        }
-
-        let mut indexer = SqliteIndexer::new(db_path)?;
-        if let Some(cache_size) = args.sqlite_cache_size {
-            indexer.set_cache_size(cache_size)?;
-        }
-        let stats = indexer.insert_all(loader.iter())?;
-
-        info!("Done!");
-        info!("Dumped {} accounts", stats.accounts_total);
-        info!("Dumped {} token accounts", stats.token_accounts_total);
-        info!("Skipped {} append vec files", stats.skipped_append_vecs);
-        info!("Processed {} append vec files", stats.append_vecs_total);
-        info!(
-            "Non-empty append vec files producing 0 accounts: {}",
-            stats.nonempty_zero_account_append_vecs
-        );
-        info!(
-            "SPL-Token owner accounts seen: {}",
-            stats.spl_token_owner_accounts_seen
-        );
-        info!(
-            "SPL-Token accounts parsed successfully: {}",
-            stats.spl_token_accounts_parsed
-        );
-        info!(
-            "SPL-Token accounts with unexpected size: {}",
-            stats.spl_token_unexpected_size
-        );
-        info!(
-            "SPL-Token accounts with unpack failure: {}",
-            stats.spl_token_unpack_failed
-        );
-        info!(
-            "Token-2022 owner accounts seen (currently not decoded): {}",
-            stats.token_2022_owner_accounts_seen
-        );
-        info!(
-            "Token-2022 accounts parsed successfully: {}",
-            stats.token_2022_accounts_parsed
-        );
-        info!(
-            "Token-2022 accounts with unexpected size: {}",
-            stats.token_2022_unexpected_size
-        );
-        info!(
-            "Token-2022 accounts with unpack failure: {}",
-            stats.token_2022_unpack_failed
-        );
-    }
-    if let Some(programs) = &args.programs_out {
-        info!("Dumping program accounts to {}", &programs);
-        let writer: Box<dyn Write> = if programs == "-" {
-            Box::new(stdout())
-        } else {
-            Box::new(
-                OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(programs)?,
-            )
-        };
-        let mut dumper = ProgramDumper::new(writer);
-        let mut skipped_append_vecs = 0u64;
-        for (append_vec_idx, append_vec) in loader.iter().enumerate() {
-            match append_vec {
-                Ok(append_vec) => dumper.on_append_vec(append_vec)?,
-                Err(err) => {
-                    skipped_append_vecs += 1;
-                    warn!(
-                        "[programs] Skipping append vec #{}: {}",
-                        append_vec_idx, err
-                    );
-                }
-            }
-        }
-        drop(dumper);
-        info!(
-            "[programs] Skipped {} append vec files",
-            skipped_append_vecs
-        );
-        info!("Done!");
     }
     Ok(())
 }
@@ -337,6 +202,7 @@ enum IncrementalOutput {
     Clickhouse {
         clickhouse_url: String,
         runtime: tokio::runtime::Runtime,
+        workers: usize,
     },
 }
 
@@ -412,6 +278,7 @@ impl IncrementalOutput {
         Ok(Self::Clickhouse {
             clickhouse_url,
             runtime,
+            workers: args.clickhouse_workers,
         })
     }
 
@@ -424,6 +291,7 @@ impl IncrementalOutput {
             Self::Clickhouse {
                 clickhouse_url,
                 runtime,
+                workers,
             } => {
                 let snapshot_slot = loader.snapshot_slot();
                 let append_vec_count = loader.append_vec_count_hint();
@@ -437,7 +305,7 @@ impl IncrementalOutput {
                         snapshot_slot,
                         append_vec_count,
                     )?
-                    .insert_all(loader.iter(), snapshot_kind),
+                    .insert_all(loader.iter(), snapshot_kind, *workers),
                 )?;
                 log_clickhouse_index_stats(&stats);
             }
@@ -675,7 +543,6 @@ impl Read for LoadProgressTracker {
 pub enum SupportedLoader {
     Unpacked(UnpackedSnapshotExtractor),
     ArchiveFile(ArchiveSnapshotExtractor<File>),
-    ArchiveDownload(ArchiveSnapshotExtractor<Response>),
 }
 
 impl SupportedLoader {
@@ -683,18 +550,7 @@ impl SupportedLoader {
         source: &str,
         progress_tracking: Box<dyn ReadProgressTracking>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        if source.starts_with("http://") || source.starts_with("https://") {
-            Self::new_download(source)
-        } else {
-            Self::new_file(source.as_ref(), progress_tracking).map_err(Into::into)
-        }
-    }
-
-    fn new_download(url: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let resp = reqwest::blocking::get(url)?;
-        let loader = ArchiveSnapshotExtractor::from_reader(resp)?;
-        info!("Streaming snapshot from HTTP");
-        Ok(Self::ArchiveDownload(loader))
+        Self::new_file(Path::new(source), progress_tracking).map_err(Into::into)
     }
 
     fn new_file(
@@ -741,7 +597,6 @@ impl SnapshotExtractor for SupportedLoader {
         match self {
             SupportedLoader::Unpacked(loader) => Box::new(loader.iter()),
             SupportedLoader::ArchiveFile(loader) => Box::new(loader.iter()),
-            SupportedLoader::ArchiveDownload(loader) => Box::new(loader.iter()),
         }
     }
 
@@ -749,7 +604,6 @@ impl SnapshotExtractor for SupportedLoader {
         match self {
             SupportedLoader::Unpacked(loader) => loader.snapshot_slot(),
             SupportedLoader::ArchiveFile(loader) => loader.snapshot_slot(),
-            SupportedLoader::ArchiveDownload(loader) => loader.snapshot_slot(),
         }
     }
 
@@ -757,7 +611,6 @@ impl SnapshotExtractor for SupportedLoader {
         match self {
             SupportedLoader::Unpacked(loader) => loader.append_vec_count_hint(),
             SupportedLoader::ArchiveFile(loader) => loader.append_vec_count_hint(),
-            SupportedLoader::ArchiveDownload(loader) => loader.append_vec_count_hint(),
         }
     }
 }

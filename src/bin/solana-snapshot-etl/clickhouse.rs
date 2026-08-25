@@ -8,12 +8,12 @@ use serde::{Deserialize, Serialize};
 use solana_sdk::program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
 use solana_snapshot_etl::append_vec::{AppendVec, StoredAccountMeta};
-use solana_snapshot_etl::{append_vec_iter, AppendVecIterator};
+use solana_snapshot_etl::{append_vec_accounts, AppendVecIterator};
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 use url::Url;
 
@@ -266,6 +266,21 @@ impl ClickhouseIndexer {
     }
 
     pub(crate) async fn insert_all(
+        self,
+        iterator: AppendVecIterator<'_>,
+        snapshot_kind: SnapshotKind,
+        workers: usize,
+    ) -> Result<IndexStats> {
+        if workers > 1 {
+            return self
+                .insert_all_parallel(iterator, snapshot_kind, workers)
+                .await;
+        }
+
+        self.insert_all_sequential(iterator, snapshot_kind).await
+    }
+
+    async fn insert_all_sequential(
         mut self,
         iterator: AppendVecIterator<'_>,
         snapshot_kind: SnapshotKind,
@@ -335,6 +350,9 @@ impl ClickhouseIndexer {
             0
         };
         self.progress.append_vecs.finish_with_message("done");
+        self.progress.accounts.sync();
+        self.progress.tokens.sync();
+        self.progress.metadata.sync();
         let _ = &self.multi_progress;
 
         Ok(IndexStats {
@@ -351,6 +369,164 @@ impl ClickhouseIndexer {
             token_2022_accounts_parsed,
             token_2022_unexpected_size,
             token_2022_unpack_failed,
+            token_account_close_candidates,
+            token_accounts_marked_deleted,
+        })
+    }
+
+    /// Decode AppendVecs and write ClickHouse rows concurrently.  Archive
+    /// decompression itself is necessarily ordered (one tar.zst stream), but
+    /// each completed AppendVec is independent.  The old implementation held
+    /// the only ClickHouse inserter while parsing every account, leaving the
+    /// other CPUs idle.  A bounded queue overlaps stream decompression,
+    /// account parsing/base58 encoding, and multiple ClickHouse HTTP inserts.
+    async fn insert_all_parallel(
+        self,
+        iterator: AppendVecIterator<'_>,
+        snapshot_kind: SnapshotKind,
+        workers: usize,
+    ) -> Result<IndexStats> {
+        let workers = workers.max(2);
+        let collect_close_tombstones = snapshot_kind.collect_close_tombstones();
+        // Keep at most one queued AppendVec per worker.  AppendVecs are
+        // memory-mapped buffers and can be large, so an unbounded or oversized
+        // queue would trade the CPU win for avoidable memory pressure.
+        let (tx, rx) = crossbeam::channel::bounded::<AppendVec>(workers);
+        let mut handles = Vec::with_capacity(workers);
+
+        for _ in 0..workers {
+            let rx = rx.clone();
+            let client = self.client.clone();
+            let snapshot_slot = self.snapshot_slot;
+            let progress = Arc::clone(&self.progress);
+            handles.push(thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|err| err.to_string())?;
+                runtime.block_on(async move {
+                    let mut sink = ClickhouseSink::new(&client);
+                    let mut worker = Worker {
+                        sink: &mut sink,
+                        snapshot_slot,
+                        progress,
+                        collect_close_tombstones,
+                        spl_token_owner_accounts_seen: 0,
+                        spl_token_accounts_parsed: 0,
+                        spl_token_unexpected_size: 0,
+                        spl_token_unpack_failed: 0,
+                        token_2022_owner_accounts_seen: 0,
+                        token_2022_accounts_parsed: 0,
+                        token_2022_unexpected_size: 0,
+                        token_2022_unpack_failed: 0,
+                        closed_token_accounts: HashMap::new(),
+                    };
+                    let mut append_vecs_total = 0;
+                    let mut nonempty_zero_account_append_vecs = 0;
+                    while let Ok(append_vec) = rx.recv() {
+                        append_vecs_total += 1;
+                        match worker.on_append_vec_count(append_vec).await {
+                            Ok(0) => nonempty_zero_account_append_vecs += 1,
+                            Ok(_) => {}
+                            Err(err) => {
+                                // Drain the queue before returning so the
+                                // producer cannot deadlock if a worker fails.
+                                while rx.recv().is_ok() {}
+                                return Err(err.to_string());
+                            }
+                        }
+                        worker.progress.inc_append_vec();
+                    }
+
+                    let spl_token_owner_accounts_seen = worker.spl_token_owner_accounts_seen;
+                    let spl_token_accounts_parsed = worker.spl_token_accounts_parsed;
+                    let spl_token_unexpected_size = worker.spl_token_unexpected_size;
+                    let spl_token_unpack_failed = worker.spl_token_unpack_failed;
+                    let token_2022_owner_accounts_seen = worker.token_2022_owner_accounts_seen;
+                    let token_2022_accounts_parsed = worker.token_2022_accounts_parsed;
+                    let token_2022_unexpected_size = worker.token_2022_unexpected_size;
+                    let token_2022_unpack_failed = worker.token_2022_unpack_failed;
+                    let closed_token_accounts = std::mem::take(&mut worker.closed_token_accounts);
+                    drop(worker);
+                    sink.end().await.map_err(|err| err.to_string())?;
+
+                    Ok(ParallelWorkerStats {
+                        append_vecs_total,
+                        nonempty_zero_account_append_vecs,
+                        spl_token_owner_accounts_seen,
+                        spl_token_accounts_parsed,
+                        spl_token_unexpected_size,
+                        spl_token_unpack_failed,
+                        token_2022_owner_accounts_seen,
+                        token_2022_accounts_parsed,
+                        token_2022_unexpected_size,
+                        token_2022_unpack_failed,
+                        closed_token_accounts,
+                    })
+                })
+            }));
+        }
+        drop(rx);
+
+        let mut skipped_append_vecs = 0;
+        for (append_vec_idx, append_vec) in iterator.enumerate() {
+            match append_vec {
+                Ok(append_vec) => tx
+                    .send(append_vec)
+                    .map_err(|_| "parallel ClickHouse worker exited unexpectedly")?,
+                Err(err) => {
+                    skipped_append_vecs += 1;
+                    warn!(
+                        "[clickhouse] Skipping append vec #{}: {}",
+                        append_vec_idx, err
+                    );
+                }
+            }
+        }
+        drop(tx);
+
+        let mut totals = ParallelWorkerStats::default();
+        for handle in handles {
+            let stats = handle
+                .join()
+                .map_err(|_| "parallel ClickHouse worker panicked")?
+                .map_err(|err| format!("parallel ClickHouse worker failed: {err}"))?;
+            totals.merge(stats);
+        }
+
+        let token_account_close_candidates = if collect_close_tombstones {
+            totals.closed_token_accounts.len() as u64
+        } else {
+            0
+        };
+        let token_accounts_marked_deleted = if collect_close_tombstones {
+            write_close_token_account_tombstones(&self.client, &totals.closed_token_accounts)
+                .await?
+        } else {
+            info!(
+                "[clickhouse] Full snapshot: skipped tombstone candidate scan (archive excludes tombstones)"
+            );
+            0
+        };
+        self.progress.append_vecs.finish_with_message("done");
+        self.progress.accounts.sync();
+        self.progress.tokens.sync();
+        self.progress.metadata.sync();
+
+        Ok(IndexStats {
+            accounts_total: self.progress.accounts.get(),
+            token_accounts_total: self.progress.tokens.get(),
+            skipped_append_vecs,
+            append_vecs_total: totals.append_vecs_total,
+            nonempty_zero_account_append_vecs: totals.nonempty_zero_account_append_vecs,
+            spl_token_owner_accounts_seen: totals.spl_token_owner_accounts_seen,
+            spl_token_accounts_parsed: totals.spl_token_accounts_parsed,
+            spl_token_unexpected_size: totals.spl_token_unexpected_size,
+            spl_token_unpack_failed: totals.spl_token_unpack_failed,
+            token_2022_owner_accounts_seen: totals.token_2022_owner_accounts_seen,
+            token_2022_accounts_parsed: totals.token_2022_accounts_parsed,
+            token_2022_unexpected_size: totals.token_2022_unexpected_size,
+            token_2022_unpack_failed: totals.token_2022_unpack_failed,
             token_account_close_candidates,
             token_accounts_marked_deleted,
         })
@@ -373,11 +549,7 @@ impl ClickhouseIndexer {
             match append_vec {
                 Ok(append_vec) => {
                     append_vecs_total += 1;
-                    let append_vec = Rc::new(append_vec);
-                    for account in append_vec_iter(Rc::clone(&append_vec)) {
-                        let Some(account) = account.access() else {
-                            continue;
-                        };
+                    for account in append_vec_accounts(&append_vec) {
                         if is_canonical_empty_account(
                             account.meta.data_len,
                             account.account_meta.lamports,
@@ -407,6 +579,9 @@ impl ClickhouseIndexer {
         let token_accounts_marked_deleted =
             write_close_token_account_tombstones(&self.client, &closed_token_accounts).await?;
         self.progress.append_vecs.finish_with_message("done");
+        self.progress.accounts.sync();
+        self.progress.tokens.sync();
+        self.progress.metadata.sync();
         let _ = &self.multi_progress;
 
         Ok(CloseTombstoneStats {
@@ -597,15 +772,54 @@ struct Worker<'a> {
     closed_token_accounts: HashMap<String, AccountVersion>,
 }
 
+#[derive(Default)]
+struct ParallelWorkerStats {
+    append_vecs_total: u64,
+    nonempty_zero_account_append_vecs: u64,
+    spl_token_owner_accounts_seen: u64,
+    spl_token_accounts_parsed: u64,
+    spl_token_unexpected_size: u64,
+    spl_token_unpack_failed: u64,
+    token_2022_owner_accounts_seen: u64,
+    token_2022_accounts_parsed: u64,
+    token_2022_unexpected_size: u64,
+    token_2022_unpack_failed: u64,
+    closed_token_accounts: HashMap<String, AccountVersion>,
+}
+
+impl ParallelWorkerStats {
+    fn merge(&mut self, other: Self) {
+        self.append_vecs_total += other.append_vecs_total;
+        self.nonempty_zero_account_append_vecs += other.nonempty_zero_account_append_vecs;
+        self.spl_token_owner_accounts_seen += other.spl_token_owner_accounts_seen;
+        self.spl_token_accounts_parsed += other.spl_token_accounts_parsed;
+        self.spl_token_unexpected_size += other.spl_token_unexpected_size;
+        self.spl_token_unpack_failed += other.spl_token_unpack_failed;
+        self.token_2022_owner_accounts_seen += other.token_2022_owner_accounts_seen;
+        self.token_2022_accounts_parsed += other.token_2022_accounts_parsed;
+        self.token_2022_unexpected_size += other.token_2022_unexpected_size;
+        self.token_2022_unpack_failed += other.token_2022_unpack_failed;
+        for (pubkey, version) in other.closed_token_accounts {
+            self.closed_token_accounts
+                .entry(pubkey)
+                .and_modify(|current| {
+                    if version > *current {
+                        *current = version;
+                    }
+                })
+                .or_insert(version);
+        }
+    }
+}
+
 impl<'a> Worker<'a> {
     async fn on_append_vec_count(&mut self, append_vec: AppendVec) -> Result<u64> {
         let append_vec_len = append_vec.len();
         let account_slot = append_vec.slot();
-        let append_vec = Rc::new(append_vec);
+        let append_vec = append_vec;
         let mut parsed_accounts = 0;
 
-        for account in append_vec_iter(Rc::clone(&append_vec)) {
-            let account = account.access().ok_or("invalid account access")?;
+        for account in append_vec_accounts(&append_vec) {
             self.insert_account(&account, account_slot).await?;
             parsed_accounts += 1;
         }
@@ -1004,12 +1218,22 @@ impl ProgressCounter {
     }
 
     fn inc(&self) {
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.progress_bar.inc(1);
+        let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        // Updating an indicatif progress bar takes a mutex and may redraw the
+        // terminal.  Doing that for every account can become a measurable part
+        // of a 100M+ row import, so keep the exact atomic counter but redraw in
+        // small chunks.  The final value remains available through `get()`.
+        if count % 4_096 == 0 {
+            self.progress_bar.inc(4_096);
+        }
     }
 
     fn get(&self) -> u64 {
         self.count.load(Ordering::Relaxed)
+    }
+
+    fn sync(&self) {
+        self.progress_bar.set_position(self.get());
     }
 }
 
