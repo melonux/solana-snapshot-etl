@@ -804,12 +804,16 @@ impl<'a> Worker<'a> {
             return Ok(());
         }
 
-        let metadata = mpl_metadata::Metadata::deserialize(&mut data).map_err(|err| {
-            format!(
-                "Invalid token-metadata v1 metadata account {}: {}",
-                account.meta.pubkey, err
-            )
-        })?;
+        let metadata = match mpl_metadata::Metadata::deserialize(&mut data) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                warn!(
+                    "Skipping invalid token-metadata v1 metadata account {}: {}",
+                    account.meta.pubkey, err
+                );
+                return Ok(());
+            }
+        };
         let metadata_ext = mpl_metadata::MetadataExt::deserialize(&mut data).ok();
         let metadata_ext_v1_2 = metadata_ext
             .as_ref()

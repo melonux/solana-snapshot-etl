@@ -564,12 +564,16 @@ INSERT OR REPLACE INTO token_multisig (pubkey, signer, m, n)
         };
         match account_key {
             mpl_metadata::AccountKey::MetadataV1 => {
-                let meta_v1 = mpl_metadata::Metadata::deserialize(&mut data_peek).map_err(|e| {
-                    format!(
-                        "Invalid token-metadata v1 metadata acc {}: {}",
-                        account.meta.pubkey, e
-                    )
-                })?;
+                let meta_v1 = match mpl_metadata::Metadata::deserialize(&mut data_peek) {
+                    Ok(meta_v1) => meta_v1,
+                    Err(err) => {
+                        warn!(
+                            "Skipping invalid token-metadata v1 metadata account {}: {}",
+                            account.meta.pubkey, err
+                        );
+                        return Ok(());
+                    }
+                };
 
                 let meta_v1_1 = mpl_metadata::MetadataExt::deserialize(&mut data_peek).ok();
                 let meta_v1_2 = meta_v1_1

@@ -11,8 +11,7 @@ use reqwest::blocking::Response;
 use solana_snapshot_etl::archived::ArchiveSnapshotExtractor;
 use solana_snapshot_etl::incremental::{
     discover as discover_incremental_snapshots, discover_full as discover_full_snapshots,
-    eligible_candidates, eligible_full_candidates, remove_processed, FullSnapshot,
-    IncrementalSnapshot,
+    eligible_candidates, eligible_full_candidates, FullSnapshot, IncrementalSnapshot,
 };
 use solana_snapshot_etl::parallel::AppendVecConsumer;
 use solana_snapshot_etl::unpacked::UnpackedSnapshotExtractor;
@@ -537,17 +536,6 @@ fn run_incremental_snapshots(
 
         last_processed_slot = candidate.slot();
         info!("Advanced last processed slot to {last_processed_slot}");
-        match remove_processed(directory, last_processed_slot) {
-            Ok(removed) => {
-                for path in removed {
-                    info!("Removed processed snapshot {}", path.display());
-                }
-            }
-            Err(err) => warn!(
-                "Failed to remove all processed incremental snapshots through slot {}: {}",
-                last_processed_slot, err
-            ),
-        }
         invalid_archives.retain(|path| path.exists());
     }
 }
