@@ -1,5 +1,6 @@
 use crate::clickhouse::{ClickhouseIndexer, CloseTombstoneStats, SnapshotKind};
 use clap::{ArgGroup, Parser};
+use env_logger::{Builder, Env, Target};
 use indicatif::{ProgressBar, ProgressBarIter, ProgressStyle};
 use log::{error, info, warn};
 use solana_snapshot_etl::archived::ArchiveSnapshotExtractor;
@@ -10,8 +11,8 @@ use solana_snapshot_etl::incremental::{
 use solana_snapshot_etl::unpacked::UnpackedSnapshotExtractor;
 use solana_snapshot_etl::{AppendVecIterator, ReadProgressTracking, SnapshotExtractor};
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{IoSliceMut, Read};
+use std::fs::{File, OpenOptions};
+use std::io::{IoSliceMut, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -76,31 +77,90 @@ struct Args {
         help = "Scan canonical empty accounts and mark deleted token accounts in ClickHouse without re-importing rows"
     )]
     clickhouse_close_tombstones: bool,
+    #[clap(
+        long,
+        value_name = "FILE",
+        help = "Write ETL logs to FILE (truncate it at startup); leave the terminal available for progress bars"
+    )]
+    log_file: Option<PathBuf>,
 }
 
 fn main() {
-    env_logger::init_from_env(
-        env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
-    );
-    if let Err(e) = _main() {
+    let args = Args::parse();
+    init_logging(args.log_file.as_deref());
+    if let Err(e) = _main(args) {
         error!("{}", e);
         std::process::exit(1);
     }
 }
 
+fn init_logging(log_file: Option<&Path>) {
+    let env = Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info");
+    let Some(path) = log_file else {
+        env_logger::init_from_env(env);
+        return;
+    };
+
+    match OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+    {
+        Ok(file) => {
+            let mut builder = Builder::from_env(env);
+            builder.target(Target::Pipe(Box::new(file)));
+            // A watch process can be restarted while an older invocation is
+            // still draining the same snapshot. Include process/thread
+            // identity so their archive and worker messages cannot be
+            // mistaken for one producer filling one queue.
+            builder.format(|buf, record| {
+                writeln!(
+                    buf,
+                    "[{} pid={} tid={:?} {} {}] {}",
+                    buf.timestamp(),
+                    std::process::id(),
+                    std::thread::current().id(),
+                    record.level(),
+                    record.target(),
+                    record.args()
+                )
+            });
+            // env_logger 0.9 routes custom pipes through its test-target
+            // writer; enabling this keeps the file target active in a normal
+            // process as well.
+            builder.is_test(true);
+            if let Err(err) = builder.try_init() {
+                eprintln!("failed to initialize file logger {}: {err}", path.display());
+            } else {
+                eprintln!("logging to {}", path.display());
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "failed to open log file {}: {err}; logging to stderr",
+                path.display()
+            );
+            env_logger::init_from_env(env);
+        }
+    }
+}
+
 fn default_clickhouse_workers() -> usize {
     std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get().min(4))
+        // ClickHouse shares this host with the parser. Two independent HTTP
+        // insert streams keep parsing and uploads overlapped without creating
+        // more MergeTree parts than the local background merger can sustain.
+        .map(|parallelism| parallelism.get().min(2))
         .unwrap_or(2)
 }
 
-fn _main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+fn _main(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.clickhouse_workers == 0 {
         return Err("--clickhouse-workers must be greater than zero".into());
     }
-    if args.clickhouse_workers > 32 {
-        return Err("--clickhouse-workers must not exceed 32".into());
+    if args.clickhouse_workers > 4 {
+        return Err("--clickhouse-workers must not exceed 4 on a shared ClickHouse host".into());
     }
     if let Some(directory) = &args.incremental_snapshot_dir {
         if args.clickhouse_close_tombstones {
@@ -392,14 +452,19 @@ fn run_incremental_snapshots(
         };
         if let Err(err) = output.process(&mut loader, snapshot_kind) {
             error!(
-                "Failed to process {} snapshot {}: {}. The file was retained and slot {} remains current",
+                "Failed to process {} snapshot {}: {}. Stopping watcher; the file was retained and slot {} remains current",
                 candidate.kind(),
                 candidate.path().display(),
                 err,
                 last_processed_slot
             );
-            thread::sleep(poll_interval);
-            continue;
+            return Err(std::io::Error::other(format!(
+                "failed to process {} snapshot {} at slot {}: {err}; automatic retry is disabled",
+                candidate.kind(),
+                candidate.path().display(),
+                candidate.slot(),
+            ))
+            .into());
         }
 
         last_processed_slot = candidate.slot();
@@ -463,7 +528,7 @@ fn log_clickhouse_index_stats(stats: &crate::clickhouse::IndexStats) {
         stats.token_account_close_candidates
     );
     info!(
-        "[clickhouse] Token accounts marked deleted: {}",
+        "[clickhouse] Token-account tombstone versions written: {}",
         stats.token_accounts_marked_deleted
     );
 }
@@ -482,7 +547,7 @@ fn log_close_tombstone_stats(stats: &CloseTombstoneStats) {
         stats.canonical_empty_accounts
     );
     info!(
-        "[clickhouse] Token accounts marked deleted: {}",
+        "[clickhouse] Token-account tombstone versions written: {}",
         stats.token_accounts_marked_deleted
     );
 }

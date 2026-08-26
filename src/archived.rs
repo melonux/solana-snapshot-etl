@@ -8,8 +8,65 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Component, Path};
 use std::pin::Pin;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tar::{Archive, Entries, Entry};
+
+// A single storage file can be many GiB. While it is decompressed, archive
+// progress cannot advance because no complete AppendVec is available yet.
+// Log each file explicitly so a long interval with a static progress bar is
+// distinguishable from a stuck importer.
+const APPEND_VEC_READ_HEARTBEAT: Duration = Duration::from_secs(5);
+
+struct AppendVecReadProgress<'a, R> {
+    reader: &'a mut R,
+    slot: u64,
+    id: u64,
+    expected_len: u64,
+    started: Instant,
+    last_log: Instant,
+    bytes_read: u64,
+}
+
+impl<'a, R: Read> AppendVecReadProgress<'a, R> {
+    fn new(reader: &'a mut R, slot: u64, id: u64, expected_len: u64) -> Self {
+        let now = Instant::now();
+        Self {
+            reader,
+            slot,
+            id,
+            expected_len,
+            started: now,
+            last_log: now,
+            bytes_read: 0,
+        }
+    }
+
+    fn log_progress(&mut self) {
+        let elapsed = self.started.elapsed();
+        if self.last_log.elapsed() < APPEND_VEC_READ_HEARTBEAT {
+            return;
+        }
+        self.last_log = Instant::now();
+        let rate_mib = self.bytes_read as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
+        info!(
+            "Reading AppendVec slot={} id={} progress={}/{} MiB rate={:.1} MiB/s",
+            self.slot,
+            self.id,
+            self.bytes_read / (1024 * 1024),
+            self.expected_len / (1024 * 1024),
+            rate_mib,
+        );
+    }
+}
+
+impl<R: Read> Read for AppendVecReadProgress<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.reader.read(buffer)?;
+        self.bytes_read += read as u64;
+        self.log_progress();
+        Ok(read)
+    }
+}
 
 /// Extracts account data from a .tar.zst stream.
 pub struct ArchiveSnapshotExtractor<Source>
@@ -111,25 +168,38 @@ where
     }
 
     fn unboxed_iter(&mut self) -> impl Iterator<Item = Result<AppendVec>> + '_ {
-        self.entries
-            .take()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| {
-                let mut entry = match entry {
-                    Ok(x) => x,
-                    Err(e) => return Some(Err(e.into())),
-                };
-                let path = match entry.path() {
-                    Ok(x) => x,
-                    Err(e) => return Some(Err(e.into())),
-                };
-                let (slot, id) = path.file_name().and_then(parse_append_vec_name)?;
-                if !should_process_append_vec_slot(self.minimum_append_vec_slot, slot) {
-                    return None;
-                }
-                Some(self.process_entry(&mut entry, slot, id))
-            })
+        let mut entries = self.entries.take().into_iter().flatten();
+        std::iter::from_fn(move || loop {
+            // `tar::Entries::next()` must consume any unread bytes from the
+            // previous entry before it can read the next header. With a
+            // non-seekable zstd stream this may decompress a large unused
+            // AppendVec tail, so time this step separately from valid-data
+            // copying in `process_entry`.
+            let advance_started = Instant::now();
+            let mut entry = match entries.next()? {
+                Ok(x) => x,
+                Err(e) => return Some(Err(e.into())),
+            };
+            let path = match entry.path() {
+                Ok(x) => x,
+                Err(e) => return Some(Err(e.into())),
+            };
+            let advance_elapsed = advance_started.elapsed();
+            if advance_elapsed >= Duration::from_secs(5) {
+                info!(
+                    "Advanced tar stream to {:?} in {:?} (may include skipped entry padding)",
+                    path, advance_elapsed
+                );
+            }
+            let (slot, id) = match path.file_name().and_then(parse_append_vec_name) {
+                Some(value) => value,
+                None => continue,
+            };
+            if !should_process_append_vec_slot(self.minimum_append_vec_slot, slot) {
+                continue;
+            }
+            return Some(self.process_entry(&mut entry, slot, id));
+        })
     }
 
     /// Skip AppendVec files from slots that have already been applied by the
@@ -157,12 +227,39 @@ where
             None => return Err(SnapshotError::UnexpectedAppendVec),
             Some(v) => v,
         };
-        Ok(AppendVec::new_from_reader(
-            entry,
+        let entry_name = entry.path()?.to_string_lossy().into_owned();
+        let expected_len = known_vec.accounts_current_len as u64;
+        let archive_len = entry.size();
+        let unused_tail = archive_len.saturating_sub(expected_len);
+        let started = Instant::now();
+        info!(
+            "[archive] Reading file={entry_name} slot={slot} id={id} archive_len={} bytes ({:.2} MiB) valid_len={} bytes ({:.2} MiB) unused_tail={} bytes ({:.2} MiB)",
+            archive_len,
+            archive_len as f64 / (1024.0 * 1024.0),
+            expected_len,
+            expected_len as f64 / (1024.0 * 1024.0),
+            unused_tail,
+            unused_tail as f64 / (1024.0 * 1024.0),
+        );
+        let mut progress_reader = AppendVecReadProgress::new(entry, slot, id, expected_len);
+        let append_vec = AppendVec::new_from_reader(
+            &mut progress_reader,
             known_vec.accounts_current_len,
             slot,
             id,
-        )?)
+        )?;
+        let elapsed = started.elapsed();
+        info!(
+            "[archive] Decompressed file={entry_name} slot={slot} id={id} valid_len={} bytes ({:.2} MiB) archive_len={} bytes ({:.2} MiB) unused_tail={} bytes ({:.2} MiB) elapsed={:?}",
+            append_vec.len(),
+            append_vec.len() as f64 / (1024.0 * 1024.0),
+            archive_len,
+            archive_len as f64 / (1024.0 * 1024.0),
+            unused_tail,
+            unused_tail as f64 / (1024.0 * 1024.0),
+            elapsed
+        );
+        Ok(append_vec)
     }
 
     fn is_snapshot_manifest_file(path: &Path) -> bool {

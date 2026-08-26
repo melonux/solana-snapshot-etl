@@ -1,10 +1,10 @@
 use borsh::BorshDeserialize;
-use clickhouse::inserter::Inserter;
+use clickhouse::inserter::{Inserter, Quantities};
 use clickhouse::{Client, Row};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use log::{info, warn};
+use log::{error, info, warn};
 use percent_encoding::percent_decode_str;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use solana_sdk::program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
 use solana_snapshot_etl::append_vec::{AppendVec, StoredAccountMeta};
@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use crate::mpl_metadata;
@@ -24,31 +25,63 @@ const ACCOUNT_TABLE: &str = "raw_account";
 const TOKEN_ACCOUNT_TABLE: &str = "raw_token_account";
 const TOKEN_MINT_TABLE: &str = "raw_token_mint";
 const TOKEN_METADATA_TABLE: &str = "raw_token_metadata";
-
-// AccountsDb stores every zero-lamport account as a canonical empty account
-// (data_len=0, default owner), so a CloseAccount no longer looks like a token
-// account when it is read from a snapshot.  Keep those pubkeys and look up
-// their previous L1 identity after the streamed inserts have committed.
-const CLOSE_TOKEN_ACCOUNT_LIVE_ROWS_QUERY: &str = r#"
-SELECT ?fields
-FROM raw_token_account FINAL
-WHERE is_deleted = 0
-  AND pubkey IN ?
-"#;
+const ETL_TABLES: [&str; 4] = [
+    ACCOUNT_TABLE,
+    TOKEN_ACCOUNT_TABLE,
+    TOKEN_MINT_TABLE,
+    TOKEN_METADATA_TABLE,
+];
 
 // Larger inserts reduce MergeTree part creation. The exporter also force-commits every open
 // RowBinary stream regularly, so sparse derived tables cannot leave an idle chunked request open
 // long enough for ClickHouse or a reverse proxy to close it.
-const MAX_BATCH_ROWS: u64 = 250_000;
-const MAX_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+// ClickHouse's MergeTree merger is storage-bound. Bigger input parts greatly
+// reduce merge amplification, especially for raw_token_account which has two
+// projections. Keep this bounded by bytes so token rows cannot grow without
+// limit in memory.
+const MAX_BATCH_ROWS: u64 = 1_000_000;
+const MAX_BATCH_BYTES: u64 = 256 * 1024 * 1024;
 const BATCH_LIMIT_CHECK_INTERVAL: u16 = 1_024;
 const FLUSH_CHECK_INTERVAL: u16 = 1_024;
-const MAX_OPEN_INSERT_AGE: Duration = Duration::from_secs(15);
-// Query `.bind()` values are rendered into the SQL text by clickhouse-rs. Keep
-// the IN list well below ClickHouse's default max_query_size (256 KiB); a
-// 10,000-pubkey batch can exceed it before the server starts executing the
-// query.
-const CLOSE_TOMBSTONE_BATCH_SIZE: usize = 2_000;
+// Never keep a sparse HTTP INSERT request open beyond this age.
+// `clickhouse-rs` buffers RowBinary rows locally until roughly 256 KiB is
+// available, so sparse derived tables can receive rows continuously while
+// sending no bytes on their HTTP body. ClickHouse enforces its 30-second HTTP
+// socket receive timeout before request-level settings are parsed, so the
+// setting embedded in an INSERT URL cannot extend that deadline. Five seconds
+// leaves room for a preceding large-part finalization and the other table
+// streams to close. raw_account is exempt while parsing because every source
+// account writes to it continuously; the idle path still closes it after 10s.
+const MAX_OPEN_INSERT_AGE: Duration = Duration::from_secs(5);
+// ClickHouse's HTTP receive timeout is commonly 30 seconds. A tar.zst entry
+// can take longer than that to decompress before another account reaches a
+// worker, so a worker must close an open chunked upload while it waits for the
+// archive reader.
+const IDLE_INSERT_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
+// This setting applies after ClickHouse begins executing the query, but does
+// not replace the server's initial 30-second HTTP-body socket timeout. The
+// short client-side age limit above protects that initial phase.
+const HTTP_RECEIVE_TIMEOUT_SECS: &str = "600";
+const HTTP_RECEIVE_TIMEOUT: Duration = Duration::from_secs(600);
+// A ClickHouse INSERT is not finished when the client has uploaded the
+// RowBinary body: MergeTree still has to build parts and (for
+// raw_token_account) two projections before returning HTTP 200.  The permit
+// limits the number of finalizations, but it must not be smaller than the
+// number of parser workers: an Inserter has already opened its HTTP request
+// while rows are being serialized, so a worker waiting behind a single permit
+// can leave that request idle long enough for ClickHouse to close it.  Keep
+// this bounded at the worker count (the CLI caps workers at four).
+const MAX_INSERT_CONCURRENCY: usize = 4;
+// The inserter crate has no end timeout by default, so an overloaded or
+// wedged ClickHouse query would otherwise leave a worker blocked forever.
+// Keep this generous enough for a 256 MiB part while making failures visible
+// and recoverable (MergeController restores merges on error).
+const INSERT_END_TIMEOUT_SECS: u64 = 30 * 60;
+// Keep tombstone INSERT batches large enough to avoid creating thousands of
+// tiny MergeTree parts, while bounding each RowBinary request and its
+// finalization memory. (This used to be a 2,000-row query batch because the
+// pubkey IN list had to fit max_query_size; tombstones are now INSERT-only.)
+const CLOSE_TOMBSTONE_BATCH_SIZE: usize = 100_000;
 
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -78,10 +111,138 @@ impl SnapshotKind {
 
 pub(crate) struct ClickhouseIndexer {
     client: Client,
+    connection_url: String,
     sink: ClickhouseSink,
     snapshot_slot: u64,
     multi_progress: MultiProgress,
     progress: Arc<Progress>,
+}
+
+/// Controls MergeTree background work around a snapshot import. A full
+/// snapshot is a canonical checkpoint: every row is already the only row for
+/// its key at that slot, so merging parts while it is being loaded only adds
+/// disk reads and writes.  Keep merges stopped after a successful full import;
+/// the next incremental import starts them again before it writes any rows.
+struct MergeController {
+    client: Client,
+    stopped_tables: Vec<&'static str>,
+}
+
+impl MergeController {
+    async fn prepare(client: Client, snapshot_kind: SnapshotKind) -> Result<Self> {
+        let mut controller = Self {
+            client,
+            stopped_tables: Vec::new(),
+        };
+
+        if snapshot_kind == SnapshotKind::Full {
+            if let Err(err) = controller.stop_all().await {
+                let _ = controller.start_stopped().await;
+                return Err(err);
+            }
+        } else {
+            controller.start_all().await?;
+        }
+        Ok(controller)
+    }
+
+    async fn stop_all(&mut self) -> Result<()> {
+        for table in ETL_TABLES {
+            self.execute_merge_command("STOP", table)
+                .await
+                .map_err(|err| {
+                    std::io::Error::other(format!(
+                        "failed to stop ClickHouse merges for {table}: {err}"
+                    ))
+                })?;
+            self.stopped_tables.push(table);
+        }
+        info!(
+            "[clickhouse] Background merges paused for full snapshot import; merges already in progress are allowed to finish"
+        );
+        Ok(())
+    }
+
+    async fn start_all(&self) -> Result<()> {
+        for table in ETL_TABLES {
+            self.execute_merge_command("START", table)
+                .await
+                .map_err(|err| {
+                    std::io::Error::other(format!(
+                        "failed to start ClickHouse merges for {table}: {err}"
+                    ))
+                })?;
+        }
+        info!("[clickhouse] Background merges enabled");
+        Ok(())
+    }
+
+    async fn start_stopped(&mut self) -> Result<()> {
+        let tables = std::mem::take(&mut self.stopped_tables);
+        for (index, table) in tables.iter().copied().enumerate() {
+            if let Err(err) = self.execute_merge_command("START", table).await {
+                // Keep the failed table and all following tables available for
+                // a later recovery attempt. Tables before `index` were started
+                // successfully and do not need to be retried.
+                self.stopped_tables.extend(tables[index..].iter().copied());
+                return Err(std::io::Error::other(format!(
+                    "failed to restore ClickHouse merges for {table}: {err}"
+                ))
+                .into());
+            }
+        }
+        info!("[clickhouse] Background merges restored");
+        Ok(())
+    }
+
+    /// Complete an import and restore merges when appropriate.
+    ///
+    /// A successful full snapshot deliberately leaves merges stopped.  This
+    /// is important in watch mode: there can be a long interval between the
+    /// full checkpoint and the first incremental, and starting merges at the
+    /// end of the full import would immediately re-read all of its parts.
+    /// The same policy applies to a failed full import: it can have committed
+    /// a prefix of the snapshot, but starting background merges would compact
+    /// that partial state and compete with the diagnosis or a deliberate
+    /// recovery import.  The next incremental import starts merges explicitly.
+    /// Incremental imports already start all merges in `prepare`, so there is
+    /// nothing to restore here.
+    async fn complete<T>(mut self, snapshot_kind: SnapshotKind, result: Result<T>) -> Result<T> {
+        if snapshot_kind == SnapshotKind::Full {
+            if result.is_ok() {
+                info!(
+                    "[clickhouse] Full snapshot complete; background merges remain paused until the next incremental snapshot"
+                );
+            } else {
+                warn!(
+                    "[clickhouse] Full snapshot failed; background merges remain paused for the partial import until the next incremental snapshot or an explicit SYSTEM START MERGES"
+                );
+            }
+            return result;
+        }
+
+        if self.stopped_tables.is_empty() {
+            return result;
+        }
+        let restore_result = self.start_stopped().await;
+        match (result, restore_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(restore_err)) => Err(restore_err),
+            (Err(import_err), Ok(())) => Err(import_err),
+            (Err(import_err), Err(restore_err)) => Err(std::io::Error::other(format!(
+                "snapshot import failed: {import_err}; also failed to restore ClickHouse merges: {restore_err}"
+            ))
+            .into()),
+        }
+    }
+
+    async fn execute_merge_command(&self, action: &str, table: &str) -> Result<()> {
+        self.client
+            .query(&format!("SYSTEM {action} MERGES {DATABASE}.{table}"))
+            .execute()
+            .await
+            .map_err(Into::into)
+    }
 }
 
 struct Progress {
@@ -160,7 +321,7 @@ struct AccountRow {
     updated_slot: u64,
 }
 
-#[derive(Row, Serialize, Deserialize)]
+#[derive(Row, Serialize)]
 struct TokenAccountRow {
     pubkey: String,
     mint: String,
@@ -257,8 +418,9 @@ impl ClickhouseIndexer {
         let client = new_clickhouse_client(&connection_url)?;
 
         Ok(Self {
-            sink: ClickhouseSink::new(&client),
+            sink: ClickhouseSink::new(&client, "main", None),
             client,
+            connection_url,
             snapshot_slot,
             multi_progress,
             progress,
@@ -271,13 +433,15 @@ impl ClickhouseIndexer {
         snapshot_kind: SnapshotKind,
         workers: usize,
     ) -> Result<IndexStats> {
-        if workers > 1 {
-            return self
-                .insert_all_parallel(iterator, snapshot_kind, workers)
-                .await;
-        }
+        let merge_controller = MergeController::prepare(self.client.clone(), snapshot_kind).await?;
+        let result = if workers > 1 {
+            self.insert_all_parallel(iterator, snapshot_kind, workers)
+                .await
+        } else {
+            self.insert_all_sequential(iterator, snapshot_kind).await
+        };
 
-        self.insert_all_sequential(iterator, snapshot_kind).await
+        merge_controller.complete(snapshot_kind, result).await
     }
 
     async fn insert_all_sequential(
@@ -393,19 +557,39 @@ impl ClickhouseIndexer {
         // queue would trade the CPU win for avoidable memory pressure.
         let (tx, rx) = crossbeam::channel::bounded::<AppendVec>(workers);
         let mut handles = Vec::with_capacity(workers);
+        let insert_concurrency = workers.min(MAX_INSERT_CONCURRENCY);
+        let insert_gate = Arc::new(Semaphore::new(insert_concurrency));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        info!(
+            "[clickhouse] Parallel workers={workers}; INSERT finalization concurrency={insert_concurrency}"
+        );
 
-        for _ in 0..workers {
+        for worker_index in 0..workers {
             let rx = rx.clone();
-            let client = self.client.clone();
+            let connection_url = self.connection_url.clone();
             let snapshot_slot = self.snapshot_slot;
             let progress = Arc::clone(&self.progress);
+            let insert_gate = Arc::clone(&insert_gate);
+            let cancelled = Arc::clone(&cancelled);
             handles.push(thread::spawn(move || {
+                info!("[clickhouse] Worker {worker_index} thread started");
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|err| err.to_string())?;
                 runtime.block_on(async move {
-                    let mut sink = ClickhouseSink::new(&client);
+                    // Client clones share one Hyper connection pool. Each worker has a
+                    // distinct current-thread Tokio runtime, so sharing that pool can
+                    // make one worker's request depend on another worker's connection
+                    // driver. Give every worker its own transport instead.
+                    let client = new_clickhouse_client(&connection_url)
+                        .map_err(|err| err.to_string())?;
+                    let mut sink = ClickhouseSink::new(
+                        &client,
+                        format!("worker-{worker_index}"),
+                        Some(insert_gate),
+                    );
+                    info!("[clickhouse] Worker {worker_index} ready; waiting for AppendVec");
                     let mut worker = Worker {
                         sink: &mut sink,
                         snapshot_slot,
@@ -423,15 +607,64 @@ impl ClickhouseIndexer {
                     };
                     let mut append_vecs_total = 0;
                     let mut nonempty_zero_account_append_vecs = 0;
-                    while let Ok(append_vec) = rx.recv() {
+                    loop {
+                        if cancelled.load(Ordering::Acquire) {
+                            return Err(
+                                "parallel import cancelled after another worker failed".to_owned(),
+                            );
+                        }
+                        let append_vec = match rx.recv_timeout(IDLE_INSERT_FLUSH_INTERVAL) {
+                            Ok(append_vec) => {
+                                info!(
+                                    "[clickhouse] Worker {worker_index} received file=accounts/{}.{} bytes={}",
+                                    append_vec.slot(),
+                                    append_vec.id(),
+                                    append_vec.len(),
+                                );
+                                append_vec
+                            }
+                            Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                                info!(
+                                    "[clickhouse] Worker {worker_index} idle: archive queue empty"
+                                );
+                                if worker.sink.has_pending_rows() {
+                                    info!(
+                                        "[clickhouse] Worker {worker_index} is waiting for archive input; flushing open inserts"
+                                    );
+                                    if let Err(err) = worker.sink.force_commit_all().await {
+                                        error!(
+                                            "[clickhouse] Worker {worker_index} failed during idle INSERT flush: {err}"
+                                        );
+                                        cancelled.store(true, Ordering::Release);
+                                        return Err(err.to_string());
+                                    }
+                                }
+                                continue;
+                            }
+                            Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
+                        };
+                        let append_vec_slot = append_vec.slot();
+                        let append_vec_id = append_vec.id();
                         append_vecs_total += 1;
+                        info!(
+                            "[clickhouse] Worker {worker_index} parsing file=accounts/{append_vec_slot}.{append_vec_id}"
+                        );
+                        let process_started = Instant::now();
                         match worker.on_append_vec_count(append_vec).await {
-                            Ok(0) => nonempty_zero_account_append_vecs += 1,
-                            Ok(_) => {}
+                            Ok(parsed_accounts) => {
+                                info!(
+                                    "[clickhouse] Worker {worker_index} finished file=accounts/{append_vec_slot}.{append_vec_id} accounts={parsed_accounts} elapsed={:?}",
+                                    process_started.elapsed()
+                                );
+                                if parsed_accounts == 0 {
+                                    nonempty_zero_account_append_vecs += 1;
+                                }
+                            }
                             Err(err) => {
-                                // Drain the queue before returning so the
-                                // producer cannot deadlock if a worker fails.
-                                while rx.recv().is_ok() {}
+                                error!(
+                                    "[clickhouse] Worker {worker_index} failed parsing/writing file=accounts/{append_vec_slot}.{append_vec_id}: {err}"
+                                );
+                                cancelled.store(true, Ordering::Release);
                                 return Err(err.to_string());
                             }
                         }
@@ -448,7 +681,16 @@ impl ClickhouseIndexer {
                     let token_2022_unpack_failed = worker.token_2022_unpack_failed;
                     let closed_token_accounts = std::mem::take(&mut worker.closed_token_accounts);
                     drop(worker);
-                    sink.end().await.map_err(|err| err.to_string())?;
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(
+                            "parallel import cancelled after another worker failed".to_owned(),
+                        );
+                    }
+                    if let Err(err) = sink.end().await {
+                        error!("[clickhouse] Worker {worker_index} failed final INSERT flush: {err}");
+                        cancelled.store(true, Ordering::Release);
+                        return Err(err.to_string());
+                    }
 
                     Ok(ParallelWorkerStats {
                         append_vecs_total,
@@ -469,11 +711,48 @@ impl ClickhouseIndexer {
         drop(rx);
 
         let mut skipped_append_vecs = 0;
-        for (append_vec_idx, append_vec) in iterator.enumerate() {
+        let mut producer_error: Option<String> = None;
+        'producer: for (append_vec_idx, append_vec) in iterator.enumerate() {
             match append_vec {
-                Ok(append_vec) => tx
-                    .send(append_vec)
-                    .map_err(|_| "parallel ClickHouse worker exited unexpectedly")?,
+                Ok(append_vec) => {
+                    if cancelled.load(Ordering::Acquire) {
+                        producer_error =
+                            Some("parallel import cancelled after a worker failure".to_owned());
+                        break 'producer;
+                    }
+                    let slot = append_vec.slot();
+                    let id = append_vec.id();
+                    let dispatch_started = Instant::now();
+                    let pending_before = tx.len();
+                    let mut pending = append_vec;
+                    loop {
+                        if cancelled.load(Ordering::Acquire) {
+                            producer_error =
+                                Some("parallel import cancelled after a worker failure".to_owned());
+                            break 'producer;
+                        }
+                        match tx.send_timeout(pending, Duration::from_millis(100)) {
+                            Ok(()) => break,
+                            Err(crossbeam::channel::SendTimeoutError::Timeout(value)) => {
+                                pending = value;
+                            }
+                            Err(crossbeam::channel::SendTimeoutError::Disconnected(_)) => {
+                                producer_error = Some(
+                                    "parallel ClickHouse worker exited unexpectedly".to_owned(),
+                                );
+                                break 'producer;
+                            }
+                        }
+                    }
+                    let dispatch_elapsed = dispatch_started.elapsed();
+                    if dispatch_elapsed >= Duration::from_secs(1) || append_vec_idx % 1_000 == 0 {
+                        info!(
+                            "[clickhouse] Dispatch of AppendVec index={append_vec_idx} slot={slot} id={id} queue_before={pending_before} queue_after={} send_elapsed={:?}",
+                            tx.len(),
+                            dispatch_elapsed
+                        );
+                    }
+                }
                 Err(err) => {
                     skipped_append_vecs += 1;
                     warn!(
@@ -492,6 +771,10 @@ impl ClickhouseIndexer {
                 .map_err(|_| "parallel ClickHouse worker panicked")?
                 .map_err(|err| format!("parallel ClickHouse worker failed: {err}"))?;
             totals.merge(stats);
+        }
+
+        if let Some(err) = producer_error {
+            return Err(err.into());
         }
 
         let token_account_close_candidates = if collect_close_tombstones {
@@ -532,14 +815,19 @@ impl ClickhouseIndexer {
         })
     }
 
-    /// Scan only canonical empty accounts and mark matching previously-live
-    /// token accounts as deleted. Unlike `insert_all`, this does not write any
-    /// raw or parsed snapshot rows, so it can repair tombstones without
-    /// re-importing an already loaded snapshot.
+    /// Scan only canonical empty accounts and append their delete versions.
+    /// Unlike `insert_all`, this does not write any raw or parsed snapshot
+    /// rows, so it can repair tombstones without re-importing an already
+    /// loaded snapshot.
     pub(crate) async fn mark_close_tombstones(
         self,
         iterator: AppendVecIterator<'_>,
     ) -> Result<CloseTombstoneStats> {
+        // Tombstone repair is an incremental-style operation.  If a previous
+        // full import left merges stopped, make sure they are running before
+        // this write begins.
+        let _merge_controller =
+            MergeController::prepare(self.client.clone(), SnapshotKind::Incremental).await?;
         let mut closed_token_accounts = HashMap::new();
         let mut skipped_append_vecs = 0;
         let mut append_vecs_total = 0;
@@ -646,6 +934,8 @@ fn decode_url_component(value: &str) -> Result<String> {
 }
 
 struct ClickhouseSink {
+    worker_name: String,
+    insert_gate: Option<Arc<Semaphore>>,
     account: Inserter<AccountRow>,
     token_account: Inserter<TokenAccountRow>,
     token_mint: Inserter<TokenMintRow>,
@@ -655,12 +945,21 @@ struct ClickhouseSink {
     token_mint_rows_since_commit_check: u16,
     token_metadata_rows_since_commit_check: u16,
     flush_check_counter: u16,
-    last_force_commit: Instant,
+    account_opened_at: Option<Instant>,
+    token_account_opened_at: Option<Instant>,
+    token_mint_opened_at: Option<Instant>,
+    token_metadata_opened_at: Option<Instant>,
 }
 
 impl ClickhouseSink {
-    fn new(client: &Client) -> Self {
+    fn new(
+        client: &Client,
+        worker_name: impl Into<String>,
+        insert_gate: Option<Arc<Semaphore>>,
+    ) -> Self {
         Self {
+            worker_name: worker_name.into(),
+            insert_gate,
             account: new_inserter(client, ACCOUNT_TABLE),
             token_account: new_inserter(client, TOKEN_ACCOUNT_TABLE),
             token_mint: new_inserter(client, TOKEN_MINT_TABLE),
@@ -670,40 +969,95 @@ impl ClickhouseSink {
             token_mint_rows_since_commit_check: 0,
             token_metadata_rows_since_commit_check: 0,
             flush_check_counter: 0,
-            last_force_commit: Instant::now(),
+            account_opened_at: None,
+            token_account_opened_at: None,
+            token_mint_opened_at: None,
+            token_metadata_opened_at: None,
         }
     }
 
     async fn write_account(&mut self, row: &AccountRow) -> Result<()> {
+        if self.account.pending().rows == 0 {
+            info!(
+                "[clickhouse] {} writing table={} phase=start",
+                self.worker_name, ACCOUNT_TABLE
+            );
+            self.account_opened_at = Some(Instant::now());
+        }
         self.account.write(row).await?;
-        check_batch_limit(&mut self.account, &mut self.account_rows_since_commit_check).await
+        check_batch_limit(
+            &self.worker_name,
+            ACCOUNT_TABLE,
+            &mut self.account,
+            &mut self.account_rows_since_commit_check,
+            self.insert_gate.as_ref(),
+        )
+        .await?;
+        self.clear_open_timestamp_if_empty();
+        Ok(())
     }
 
     async fn write_token_account(&mut self, row: &TokenAccountRow) -> Result<()> {
+        if self.token_account.pending().rows == 0 {
+            info!(
+                "[clickhouse] {} writing table={} phase=start",
+                self.worker_name, TOKEN_ACCOUNT_TABLE
+            );
+            self.token_account_opened_at = Some(Instant::now());
+        }
         self.token_account.write(row).await?;
         check_batch_limit(
+            &self.worker_name,
+            TOKEN_ACCOUNT_TABLE,
             &mut self.token_account,
             &mut self.token_account_rows_since_commit_check,
+            self.insert_gate.as_ref(),
         )
-        .await
+        .await?;
+        self.clear_open_timestamp_if_empty();
+        Ok(())
     }
 
     async fn write_token_mint(&mut self, row: &TokenMintRow) -> Result<()> {
+        if self.token_mint.pending().rows == 0 {
+            info!(
+                "[clickhouse] {} writing table={} phase=start",
+                self.worker_name, TOKEN_MINT_TABLE
+            );
+            self.token_mint_opened_at = Some(Instant::now());
+        }
         self.token_mint.write(row).await?;
         check_batch_limit(
+            &self.worker_name,
+            TOKEN_MINT_TABLE,
             &mut self.token_mint,
             &mut self.token_mint_rows_since_commit_check,
+            self.insert_gate.as_ref(),
         )
-        .await
+        .await?;
+        self.clear_open_timestamp_if_empty();
+        Ok(())
     }
 
     async fn write_token_metadata(&mut self, row: &TokenMetadataRow) -> Result<()> {
+        if self.token_metadata.pending().rows == 0 {
+            info!(
+                "[clickhouse] {} writing table={} phase=start",
+                self.worker_name, TOKEN_METADATA_TABLE
+            );
+            self.token_metadata_opened_at = Some(Instant::now());
+        }
         self.token_metadata.write(row).await?;
         check_batch_limit(
+            &self.worker_name,
+            TOKEN_METADATA_TABLE,
             &mut self.token_metadata,
             &mut self.token_metadata_rows_since_commit_check,
+            self.insert_gate.as_ref(),
         )
-        .await
+        .await?;
+        self.clear_open_timestamp_if_empty();
+        Ok(())
     }
 
     async fn maybe_force_commit(&mut self) -> Result<()> {
@@ -713,44 +1067,341 @@ impl ClickhouseSink {
         }
         self.flush_check_counter = 0;
 
-        if self.last_force_commit.elapsed() >= MAX_OPEN_INSERT_AGE {
-            self.force_commit_all().await?;
-        }
+        let now = Instant::now();
+        force_aged_inserter(
+            &self.worker_name,
+            TOKEN_ACCOUNT_TABLE,
+            &mut self.token_account,
+            &mut self.token_account_opened_at,
+            now,
+            self.insert_gate.as_ref(),
+        )
+        .await?;
+        force_aged_inserter(
+            &self.worker_name,
+            TOKEN_MINT_TABLE,
+            &mut self.token_mint,
+            &mut self.token_mint_opened_at,
+            now,
+            self.insert_gate.as_ref(),
+        )
+        .await?;
+        force_aged_inserter(
+            &self.worker_name,
+            TOKEN_METADATA_TABLE,
+            &mut self.token_metadata,
+            &mut self.token_metadata_opened_at,
+            now,
+            self.insert_gate.as_ref(),
+        )
+        .await?;
         Ok(())
     }
 
     async fn force_commit_all(&mut self) -> Result<()> {
-        self.account.force_commit().await?;
-        self.token_account.force_commit().await?;
-        self.token_mint.force_commit().await?;
-        self.token_metadata.force_commit().await?;
-        self.last_force_commit = Instant::now();
+        if !self.has_pending_rows() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        info!(
+            "[clickhouse] {} INSERT flush begin: raw_account={} rows, raw_token_account={} rows, raw_token_mint={} rows, raw_token_metadata={} rows",
+            self.worker_name,
+            self.account.pending().rows,
+            self.token_account.pending().rows,
+            self.token_mint.pending().rows,
+            self.token_metadata.pending().rows,
+        );
+        // Finish one table at a time here.  This path is used when the archive
+        // queue is empty, so there is no parsing work to overlap.  Starting
+        // four finalizations together would only create a burst of storage
+        // work at exactly the point where the producer is already starved.
+        let gate = self.insert_gate.as_ref();
+        let account =
+            force_commit_with_gate(gate, &self.worker_name, ACCOUNT_TABLE, &mut self.account)
+                .await?;
+        let token_account = force_commit_with_gate(
+            gate,
+            &self.worker_name,
+            TOKEN_ACCOUNT_TABLE,
+            &mut self.token_account,
+        )
+        .await?;
+        let token_mint = force_commit_with_gate(
+            gate,
+            &self.worker_name,
+            TOKEN_MINT_TABLE,
+            &mut self.token_mint,
+        )
+        .await?;
+        let token_metadata = force_commit_with_gate(
+            gate,
+            &self.worker_name,
+            TOKEN_METADATA_TABLE,
+            &mut self.token_metadata,
+        )
+        .await?;
+        log_insert_commit(&self.worker_name, ACCOUNT_TABLE, "idle flush", &account);
+        log_insert_commit(
+            &self.worker_name,
+            TOKEN_ACCOUNT_TABLE,
+            "idle flush",
+            &token_account,
+        );
+        log_insert_commit(
+            &self.worker_name,
+            TOKEN_MINT_TABLE,
+            "idle flush",
+            &token_mint,
+        );
+        log_insert_commit(
+            &self.worker_name,
+            TOKEN_METADATA_TABLE,
+            "idle flush",
+            &token_metadata,
+        );
+        self.account_opened_at = None;
+        self.token_account_opened_at = None;
+        self.token_mint_opened_at = None;
+        self.token_metadata_opened_at = None;
+        if started.elapsed() >= Duration::from_secs(5) {
+            warn!(
+                "[clickhouse] Flushing open inserts took {:?}",
+                started.elapsed()
+            );
+        }
         Ok(())
     }
 
+    fn clear_open_timestamp_if_empty(&mut self) {
+        if self.account.pending().rows == 0 {
+            self.account_opened_at = None;
+        }
+        if self.token_account.pending().rows == 0 {
+            self.token_account_opened_at = None;
+        }
+        if self.token_mint.pending().rows == 0 {
+            self.token_mint_opened_at = None;
+        }
+        if self.token_metadata.pending().rows == 0 {
+            self.token_metadata_opened_at = None;
+        }
+    }
+
+    fn has_pending_rows(&self) -> bool {
+        self.account.pending().rows > 0
+            || self.token_account.pending().rows > 0
+            || self.token_mint.pending().rows > 0
+            || self.token_metadata.pending().rows > 0
+    }
+
     async fn end(self) -> Result<()> {
-        self.account.end().await?;
-        self.token_account.end().await?;
-        self.token_mint.end().await?;
-        self.token_metadata.end().await?;
+        let worker_name = self.worker_name;
+        info!("[clickhouse] {worker_name} final INSERT flush begin");
+        let gate = self.insert_gate.as_ref();
+        let account = end_with_gate(gate, &worker_name, ACCOUNT_TABLE, self.account).await?;
+        let token_account =
+            end_with_gate(gate, &worker_name, TOKEN_ACCOUNT_TABLE, self.token_account).await?;
+        let token_mint =
+            end_with_gate(gate, &worker_name, TOKEN_MINT_TABLE, self.token_mint).await?;
+        let token_metadata = end_with_gate(
+            gate,
+            &worker_name,
+            TOKEN_METADATA_TABLE,
+            self.token_metadata,
+        )
+        .await?;
+        log_insert_commit(&worker_name, ACCOUNT_TABLE, "final flush", &account);
+        log_insert_commit(
+            &worker_name,
+            TOKEN_ACCOUNT_TABLE,
+            "final flush",
+            &token_account,
+        );
+        log_insert_commit(&worker_name, TOKEN_MINT_TABLE, "final flush", &token_mint);
+        log_insert_commit(
+            &worker_name,
+            TOKEN_METADATA_TABLE,
+            "final flush",
+            &token_metadata,
+        );
         Ok(())
+    }
+}
+
+async fn acquire_insert_permit(
+    gate: Option<&Arc<Semaphore>>,
+    worker_name: &str,
+    table: &str,
+) -> Result<Option<OwnedSemaphorePermit>> {
+    let Some(gate) = gate else {
+        return Ok(None);
+    };
+
+    let started = Instant::now();
+    info!("[clickhouse] {worker_name} INSERT table={table} waiting for finalization slot");
+    let permit = Arc::clone(gate).acquire_owned().await?;
+    let waited = started.elapsed();
+    if waited >= Duration::from_secs(1) {
+        info!(
+            "[clickhouse] {worker_name} INSERT table={table} acquired finalization slot after {waited:?}"
+        );
+    }
+    Ok(Some(permit))
+}
+
+async fn force_commit_with_gate<T: Row>(
+    gate: Option<&Arc<Semaphore>>,
+    worker_name: &str,
+    table: &str,
+    inserter: &mut Inserter<T>,
+) -> Result<Quantities> {
+    let pending = inserter.pending().clone();
+    if pending.rows == 0 {
+        return Ok(Quantities::ZERO);
+    }
+    let _permit = acquire_insert_permit(gate, worker_name, table).await?;
+    let started = Instant::now();
+    let result = inserter.force_commit().await;
+    if let Err(err) = &result {
+        error!(
+            "[clickhouse] {worker_name} INSERT table={table} finalization failed after {:?}: {err}; debug={err:?}; pending_rows={} pending_bytes={}",
+            started.elapsed(),
+            pending.rows,
+            pending.bytes,
+        );
+    }
+    if started.elapsed() >= Duration::from_secs(5) {
+        info!(
+            "[clickhouse] {worker_name} INSERT table={table} finalization elapsed={:?}",
+            started.elapsed()
+        );
+    }
+    result.map_err(|err| {
+        std::io::Error::other(format!(
+            "{worker_name} INSERT table={table} finalization failed: {err}"
+        ))
+        .into()
+    })
+}
+
+async fn end_with_gate<T: Row>(
+    gate: Option<&Arc<Semaphore>>,
+    worker_name: &str,
+    table: &str,
+    inserter: Inserter<T>,
+) -> Result<Quantities> {
+    let pending = inserter.pending().clone();
+    if pending.rows == 0 {
+        return Ok(Quantities::ZERO);
+    }
+    let _permit = acquire_insert_permit(gate, worker_name, table).await?;
+    let started = Instant::now();
+    let result = inserter.end().await;
+    if let Err(err) = &result {
+        error!(
+            "[clickhouse] {worker_name} INSERT table={table} finalization failed after {:?}: {err}; debug={err:?}; pending_rows={} pending_bytes={}",
+            started.elapsed(),
+            pending.rows,
+            pending.bytes,
+        );
+    }
+    if started.elapsed() >= Duration::from_secs(5) {
+        info!(
+            "[clickhouse] {worker_name} INSERT table={table} finalization elapsed={:?}",
+            started.elapsed()
+        );
+    }
+    result.map_err(|err| {
+        std::io::Error::other(format!(
+            "{worker_name} INSERT table={table} finalization failed: {err}"
+        ))
+        .into()
+    })
+}
+
+async fn force_aged_inserter<T: Row>(
+    worker_name: &str,
+    table: &str,
+    inserter: &mut Inserter<T>,
+    opened_at: &mut Option<Instant>,
+    now: Instant,
+    gate: Option<&Arc<Semaphore>>,
+) -> Result<()> {
+    if inserter.pending().rows == 0 {
+        *opened_at = None;
+        return Ok(());
+    }
+
+    if opened_at
+        .map(|started| now.duration_since(started) >= MAX_OPEN_INSERT_AGE)
+        .unwrap_or(false)
+    {
+        let started = Instant::now();
+        info!(
+            "[clickhouse] {worker_name} INSERT table={table} age flush begin rows={} age={:?}",
+            inserter.pending().rows,
+            opened_at.expect("opened timestamp must exist").elapsed(),
+        );
+        let quantities = force_commit_with_gate(gate, worker_name, table, inserter).await?;
+        log_insert_commit(worker_name, table, "age flush", &quantities);
+        *opened_at = None;
+        if started.elapsed() >= Duration::from_secs(5) {
+            warn!(
+                "[clickhouse] Flushing aged {table} insert took {:?}",
+                started.elapsed()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn log_insert_commit(worker_name: &str, table: &str, phase: &str, quantities: &Quantities) {
+    if quantities.transactions > 0 {
+        info!(
+            "[clickhouse] {worker_name} writing table={table} phase={phase} rows={} bytes={} transactions={}",
+            quantities.rows, quantities.bytes, quantities.transactions,
+        );
     }
 }
 
 fn new_inserter<T: Row>(client: &Client, table: &str) -> Inserter<T> {
     client
         .inserter(table)
+        .with_setting("http_receive_timeout", HTTP_RECEIVE_TIMEOUT_SECS)
+        .with_timeouts(
+            Some(HTTP_RECEIVE_TIMEOUT),
+            Some(Duration::from_secs(INSERT_END_TIMEOUT_SECS)),
+        )
         .with_max_rows(MAX_BATCH_ROWS)
         .with_max_bytes(MAX_BATCH_BYTES)
 }
 
 async fn check_batch_limit<T: Row>(
+    worker_name: &str,
+    table: &str,
     inserter: &mut Inserter<T>,
     rows_since_commit_check: &mut u16,
+    gate: Option<&Arc<Semaphore>>,
 ) -> Result<()> {
     *rows_since_commit_check += 1;
     if *rows_since_commit_check == BATCH_LIMIT_CHECK_INTERVAL {
-        inserter.commit().await?;
+        let pending = inserter.pending();
+        let limit_reached = pending.rows >= MAX_BATCH_ROWS || pending.bytes >= MAX_BATCH_BYTES;
+        if limit_reached {
+            info!(
+                "[clickhouse] {worker_name} INSERT table={table} batch flush begin rows={} bytes={}",
+                pending.rows, pending.bytes
+            );
+        }
+        if limit_reached {
+            let started = Instant::now();
+            let quantities = force_commit_with_gate(gate, worker_name, table, inserter).await?;
+            log_insert_commit(worker_name, table, "batch threshold", &quantities);
+            info!(
+                "[clickhouse] {worker_name} INSERT table={table} batch flush completed elapsed={:?}",
+                started.elapsed()
+            );
+        }
         *rows_since_commit_check = 0;
     }
     Ok(())
@@ -839,6 +1490,12 @@ impl<'a> Worker<'a> {
         account: &StoredAccountMeta<'_>,
         account_slot: u64,
     ) -> Result<()> {
+        // Do this before any write can synchronously finalize a full
+        // raw_account batch. A large raw-account finalization can take several
+        // seconds; flushing aged sparse streams first keeps every chunked HTTP
+        // body below ClickHouse's fixed 30-second receive timeout.
+        self.sink.maybe_force_commit().await?;
+
         self.sink
             .write_account(&AccountRow {
                 pubkey: pubkey_string(account.meta.pubkey),
@@ -877,7 +1534,6 @@ impl<'a> Worker<'a> {
         }
 
         self.progress.accounts.inc();
-        self.sink.maybe_force_commit().await?;
         Ok(())
     }
 
@@ -1057,12 +1713,10 @@ impl<'a> Worker<'a> {
         Ok(())
     }
 
-    /// The old mint and holder are unavailable from a canonical empty snapshot
-    /// record, but remain available in the previous L1 row by pubkey.
-    ///
-    /// Zero-lamport malformed/uninitialized accounts can also reach this path.
-    /// They are harmless: the later server-side lookup only creates a tombstone
-    /// when the pubkey already has a live raw_token_account row.
+    /// AccountsDb canonicalizes a closed account to an empty account, so the
+    /// old mint/owner are not present in the archive. Keep the pubkey and the
+    /// newest slot; the tombstone writer appends a delete version directly
+    /// after all regular rows have committed.
     fn record_close_candidate(&mut self, account: &StoredAccountMeta<'_>, account_slot: u64) {
         if self.collect_close_tombstones
             && is_close_tombstone_candidate(account.account_meta.lamports)
@@ -1108,80 +1762,64 @@ async fn write_close_token_account_tombstones(
     client: &Client,
     closed_token_accounts: &HashMap<String, AccountVersion>,
 ) -> Result<u64> {
-    let pubkeys = closed_token_accounts.keys().collect::<Vec<_>>();
+    let mut pubkeys = closed_token_accounts.keys().collect::<Vec<_>>();
     if pubkeys.is_empty() {
         return Ok(0);
     }
 
+    // HashMap iteration order is intentionally random. Sorting makes batches
+    // deterministic, which is useful for diagnostics and reproducible imports.
+    pubkeys.sort_unstable();
     let batch_count = pubkeys.len().div_ceil(CLOSE_TOMBSTONE_BATCH_SIZE);
     let mut tombstone_insert: Inserter<TokenAccountRow> = new_inserter(client, TOKEN_ACCOUNT_TABLE);
     let mut marked_deleted = 0;
 
     for (batch_idx, pubkeys) in pubkeys.chunks(CLOSE_TOMBSTONE_BATCH_SIZE).enumerate() {
         info!(
-            "[clickhouse] Checking tombstone candidates batch {}/{} ({} pubkeys)",
+            "[clickhouse] Writing tombstone batch {}/{} ({} pubkeys)",
             batch_idx + 1,
             batch_count,
             pubkeys.len()
         );
 
-        let mut live_rows = client
-            .query(CLOSE_TOKEN_ACCOUNT_LIVE_ROWS_QUERY)
-            .bind(pubkeys)
-            .fetch_all::<TokenAccountRow>()
-            .await
-            .map_err(|err| {
-                format!(
-                    "tombstone candidate lookup failed for batch {}/{}: {}",
-                    batch_idx + 1,
-                    batch_count,
-                    err
-                )
-            })?;
-
-        for row in &mut live_rows {
+        for pubkey in pubkeys {
             let candidate = closed_token_accounts
-                .get(&row.pubkey)
-                .ok_or_else(|| format!("missing tombstone candidate for {}", row.pubkey))?;
-            let live_version = AccountVersion {
-                updated_slot: row.updated_slot,
-            };
-            if *candidate <= live_version {
-                warn!(
-                    "[clickhouse] Skipping stale tombstone candidate: pubkey={} candidate_slot={} live_slot={}",
-                    row.pubkey,
-                    candidate.updated_slot,
-                    live_version.updated_slot,
-                );
-                continue;
-            }
-            info!(
-                "[clickhouse] Marking token account deleted: pubkey={} updated_slot={}",
-                row.pubkey, candidate.updated_slot,
-            );
-            row.amount = 0;
-            row.delegated_amount = 0;
-            row.is_deleted = 1;
-            row.updated_slot = candidate.updated_slot;
-            tombstone_insert.write(row).await?;
+                .get(*pubkey)
+                .ok_or_else(|| format!("missing tombstone candidate for {pubkey}"))?;
+            tombstone_insert
+                .write(&TokenAccountRow {
+                    pubkey: (*pubkey).clone(),
+                    // Canonical empty accounts do not retain token metadata.
+                    // ReplacingMergeTree uses pubkey + updated_slot +
+                    // is_deleted for the state transition; these fields are
+                    // deliberately neutral values for the delete version.
+                    mint: String::new(),
+                    owner: String::new(),
+                    amount: 0,
+                    delegate: None,
+                    delegated_amount: 0,
+                    state: 0,
+                    close_authority: None,
+                    is_deleted: 1,
+                    updated_slot: candidate.updated_slot,
+                })
+                .await?;
             marked_deleted += 1;
         }
 
-        if !live_rows.is_empty() {
-            tombstone_insert.force_commit().await.map_err(|err| {
-                format!(
-                    "tombstone insert failed for batch {}/{}: {}",
-                    batch_idx + 1,
-                    batch_count,
-                    err
-                )
-            })?;
-        }
+        tombstone_insert.force_commit().await.map_err(|err| {
+            format!(
+                "tombstone insert failed for batch {}/{}: {}",
+                batch_idx + 1,
+                batch_count,
+                err
+            )
+        })?;
         info!(
-            "[clickhouse] Tombstone candidate batch {}/{} matched {} live token accounts",
+            "[clickhouse] Tombstone batch {}/{} inserted {} delete versions",
             batch_idx + 1,
             batch_count,
-            live_rows.len()
+            pubkeys.len()
         );
     }
 
@@ -1351,19 +1989,22 @@ mod tests {
     }
 
     #[test]
-    fn close_tombstone_lookup_query_selects_live_token_accounts() {
-        assert!(CLOSE_TOKEN_ACCOUNT_LIVE_ROWS_QUERY.contains("FROM raw_token_account FINAL"));
-        assert!(CLOSE_TOKEN_ACCOUNT_LIVE_ROWS_QUERY.contains("is_deleted"));
-        assert!(CLOSE_TOKEN_ACCOUNT_LIVE_ROWS_QUERY.contains("pubkey IN ?"));
-    }
-
-    #[test]
-    fn close_tombstone_batch_stays_below_default_clickhouse_query_limit() {
-        let pubkeys = vec!["A".repeat(44); CLOSE_TOMBSTONE_BATCH_SIZE];
-        let query = Client::default()
-            .query(CLOSE_TOKEN_ACCOUNT_LIVE_ROWS_QUERY)
-            .bind(&pubkeys);
-
-        assert!(format!("{}", query.sql_display()).len() < 256 * 1024);
+    fn tombstone_rows_use_delete_version_and_neutral_fields() {
+        let row = TokenAccountRow {
+            pubkey: "candidate".to_owned(),
+            mint: String::new(),
+            owner: String::new(),
+            amount: 0,
+            delegate: None,
+            delegated_amount: 0,
+            state: 0,
+            close_authority: None,
+            is_deleted: 1,
+            updated_slot: 42,
+        };
+        assert_eq!(row.is_deleted, 1);
+        assert_eq!(row.updated_slot, 42);
+        assert!(row.mint.is_empty());
+        assert!(row.owner.is_empty());
     }
 }

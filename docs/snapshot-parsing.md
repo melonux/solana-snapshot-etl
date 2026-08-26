@@ -219,14 +219,15 @@ executable = false
 
 因此 CloseAccount 归档记录中已经没有原来的 mint、token owner、close authority 等信息。仅靠这个空账户无法重新 unpack 出 SPL Token Account。
 
-它只能作为删除候选：
+它只能作为删除候选。导入器记录 empty account 的 pubkey 和 AppendVec 所属 slot，随后直接
+写入一条更高 `updated_slot`、`is_deleted=1` 的 tombstone。由于 empty account 已经没有旧的
+mint、owner、close authority 等字段，删除版本使用空字符串/空值等中性字段；
+`ReplacingMergeTree(updated_slot, is_deleted)` 只依赖 pubkey、版本和删除标记决定最终状态。
 
-1. 记录 empty account 的 pubkey 和 AppendVec 所属 slot；
-2. 查询 ClickHouse 中该 pubkey 当前未删除的 token 行；
-3. 复制原行的 mint、owner 等业务字段；
-4. 写入一条更高 `updated_slot`、`is_deleted=1` 的 tombstone。
-
-如果数据库中没有该 pubkey 的 live token 行，则忽略候选，因为普通账户也可能是 canonical empty account。
+canonical empty account 也可能只是普通账户，因此这种无查询的快速路径会为少量非 token
+pubkey 产生 tombstone 物理行。这些行在 `FINAL ... WHERE is_deleted = 0` 查询中不可见，且未来
+更高 slot 的 live token 行仍可覆盖它们；代价是额外的存储和 merge 工作，换取避免对数亿行
+`raw_token_account` 执行高内存 `FINAL` 回查。
 
 ### 5.2 Full 和 incremental 对 tombstone 的区别
 
@@ -296,11 +297,10 @@ append_vec.slot() > last_processed_slot
 不会包含需要传播的 tombstone。项目因此按 snapshot 类型选择入库路径：
 
 - **full**：直接把 AppendVec 中的 canonical 账户写入 `raw_account` 和各个解析表；不建立
-  关闭账户候选集合，也不在所有写入完成后执行 `raw_token_account FINAL` 回查和 tombstone
-  写入。这避免了一次额外的 HashMap 扫描和 ClickHouse `IN` 查询批次，适合重建 full 基线；
-- **incremental**：保留候选收集、按 pubkey 回查 live token 行、复制业务字段并写入
-  `is_deleted=1` tombstone 的完整流程，因为这些 tombstone 是增量包传播 full 基线删除状态所
-  必需的。
+  关闭账户候选集合，也不执行 tombstone pass，适合重建 full 基线；
+- **incremental**：收集 canonical empty 账户，按 pubkey 去重后直接写入中性字段的
+  `is_deleted=1` tombstone。这样增量包仍能传播 full 基线中的删除状态，但不会触发全表
+  `FINAL` 回查。
 
 这只是入库流程优化，不改变表引擎或版本语义：`raw_token_account` 仍使用
 `ReplacingMergeTree(updated_slot, is_deleted)`，后续增量仍可覆盖 full 写入的行。对于已经有
@@ -336,5 +336,5 @@ snapshot archive
 3. 同一 slot 的多个物理文件或多个记录不能用物理顺序解释，canonical archive 中也不应出现；
 4. `write_version`、AppendVec ID 和 offset 都不能作为链上版本；
 5. full 用来建立完整基线，incremental 用来传播 full 之后的账户变化和删除；
-6. SPL Token 删除必须用保留原 token 身份字段的 tombstone 表达；
+6. SPL Token 删除必须用 `updated_slot + is_deleted` tombstone 表达，删除版本的身份字段可以为空；
 7. ClickHouse 的 token 表只需要 `updated_slot + is_deleted` 表达最终状态。

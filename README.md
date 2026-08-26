@@ -102,11 +102,15 @@ the full snapshot first, then applies the incremental.
 While processing either archive type, it skips `accounts/<slot>.<id>` entries at slots already
 processed. Thus a full snapshot only contributes the account changes after the current slot. Full
 archives use a fast ClickHouse path: Agave excludes tombstones from full archives, so the importer
-does not perform the extra close-candidate lookup for them. Incremental archives retain that
-tombstone path because it is needed to delete token accounts from the full base. After a
+does not perform any extra close-candidate pass for them. Incremental archives retain the
+tombstone path because it is needed to delete token accounts from the full base. Canonical empty
+accounts are appended directly as `is_deleted = 1` versions; the importer does not issue a
+`raw_token_account FINAL` lookup. After a
 successful write, the current slot advances, all recognized full and incremental archives ending
 at or below it are deleted, and the directory is scanned again. If no usable archive is available,
-it waits five seconds by default; change this with `--incremental-poll-interval-secs`.
+it waits five seconds by default; change this with `--incremental-poll-interval-secs`. If an archive
+fails during ClickHouse processing, the watcher reports the error and exits non-zero instead of
+retrying the same file (which could otherwise duplicate a partial import).
 
 ### ClickHouse
 
@@ -124,14 +128,53 @@ Run the importer with `--clickhouse`:
 solana-snapshot-etl snapshot-139240745-*.tar.zst --clickhouse
 ```
 
-Rows are parsed and written directly to ClickHouse with HTTP `RowBinary`. Inserts are streamed and
-committed per table at a 250,000-row or 64 MiB threshold.
+By default logs are written to stderr. Pass `--log-file` to write timestamped ETL logs to a file;
+the file is truncated when the process starts, and the terminal remains available for progress bars:
 
-ClickHouse imports use four workers by default. The tar.zst stream is read in order, but completed
+```shell
+./run.sh --log-file /tmp/solana-snapshot-etl.log
+```
+
+Archive diagnostics include each AppendVec path, physical archive size, valid size, and unused
+tail in exact bytes and MiB. ClickHouse diagnostics identify the worker, file being processed, and each INSERT batch's
+table, row count, and byte count. File logs also include the process ID and thread ID, which helps
+identify messages if more than one invocation is running. The per-AppendVec messages are intentionally verbose, so use
+the file logger while diagnosing and disable or revert them for a normal high-throughput run.
+
+Rows are parsed and written directly to ClickHouse with HTTP `RowBinary`. Inserts are streamed and
+committed per table at a 1,000,000-row or 256 MiB threshold. Every open HTTP request is also
+committed within 15 seconds, even if rows are still arriving: sparse RowBinary rows can remain in
+the client's 256 KiB buffer and otherwise leave ClickHouse with no body bytes for its default
+30-second socket timeout. An idle worker flushes immediately as well. Each upload also requests
+ClickHouse's `http_receive_timeout=600`, but the 15-second client-side limit keeps the importer
+safe even if the server profile does not honor that per-query override.
+
+Workers parse and upload concurrently. The expensive server-side INSERT finalization (MergeTree
+part/projection creation after the RowBinary body is closed) is bounded by the worker count (at most
+four). This avoids leaving already-uploaded HTTP requests idle behind a single finalization slot,
+which can make ClickHouse close the request before it is finalized. When an input worker is idle,
+its four table requests are finalized sequentially to avoid an unnecessary burst. The log records
+when a worker waits for and acquires a finalization slot, plus the finalization time; the client-side
+end timeout is 30 minutes so a pathological ClickHouse query fails visibly instead of leaving a
+worker blocked forever. If a worker encounters an INSERT error, the producer is cancelled
+immediately; it no longer silently drains the remaining AppendVec queue.
+
+ClickHouse imports use two workers by default (the bundled `run.sh` currently opts into four; set
+`CLICKHOUSE_WORKERS=2` to use the safer shared-host default). The tar.zst stream is read in order, but completed
 AppendVecs are dispatched to independent parsers and ClickHouse inserters so decompression, base58
 encoding, and server-side inserts overlap. Tune this for the ClickHouse host with
-`--clickhouse-workers N` (or `CLICKHOUSE_WORKERS` when using `run.sh`). Set it to `1` for the
-single-threaded path when diagnosing a problematic server.
+`--clickhouse-workers N` (or `CLICKHOUSE_WORKERS` when using `run.sh`). On a host that also runs
+ClickHouse, start with `2` and do not exceed `4`; more streams can cause MergeTree part merges to
+consume all disk I/O. Set it to `1` for the single-threaded path when diagnosing a problematic
+server.
+
+For a full snapshot, the importer runs `SYSTEM STOP MERGES` on the four ETL tables before loading
+(newly scheduled merges stop; a merge already in progress is allowed to finish). The successful full
+import intentionally leaves those merges stopped, so ClickHouse does not scan and rewrite the newly
+loaded parts while waiting for the next snapshot. When an incremental snapshot starts, the importer
+runs `SYSTEM START MERGES` before writing it. A failed full import also leaves merges stopped: this
+prevents ClickHouse from compacting partial parts while the failure is being diagnosed. Start an
+incremental snapshot, or issue `SYSTEM START MERGES` explicitly, when that work should resume.
 
 If a snapshot was already imported but the CloseAccount tombstone pass failed, run only that pass:
 
@@ -139,6 +182,7 @@ If a snapshot was already imported but the CloseAccount tombstone pass failed, r
 solana-snapshot-etl snapshot-139240745-*.tar.zst --clickhouse-close-tombstones
 ```
 
-This scans the snapshot's canonical empty accounts and updates matching existing
-`raw_token_account` rows with `is_deleted = 1`; it does not re-insert raw or parsed account
-rows.
+This scans the snapshot's canonical empty accounts and appends `raw_token_account` rows with
+`is_deleted = 1`; it does not re-insert raw or parsed account rows. Since a canonical empty
+account does not contain the previous mint/owner, those fields are neutral empty values in the
+tombstone row.

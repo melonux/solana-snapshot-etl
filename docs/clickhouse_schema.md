@@ -29,7 +29,7 @@ CREATE TABLE solana.raw_token_account
     state             Enum8('uninitialized' = 0, 'initialized' = 1, 'frozen' = 2)
                                           COMMENT '账户状态：uninitialized 未初始化（无效数据），initialized 正常可用，frozen 已被冻结；Enum8 本身已是紧凑编码，无需再套 LowCardinality',
     close_authority   Nullable(String)    COMMENT '有权限关闭此账户并收回 rent 押金的地址，没有设置则为空；常与 owner 相同，不适合字典编码',
-    is_deleted        UInt8 DEFAULT 0   COMMENT '是否已通过 CloseAccount 关闭；UInt8 中 0 表示存在、1 表示删除；关闭记录保留原 mint/owner 以覆盖旧版本，当前持仓查询必须过滤 0',
+    is_deleted        UInt8 DEFAULT 0   COMMENT '是否已通过 CloseAccount 关闭；UInt8 中 0 表示存在、1 表示删除；删除版本的 mint/owner 可为空，当前持仓查询必须过滤 0',
     updated_slot      UInt64            COMMENT '账户在 AccountsDb 中发生此版本写入的链上 slot（AppendVec 所属 slot）'
 )
 ENGINE = ReplacingMergeTree(updated_slot, is_deleted)

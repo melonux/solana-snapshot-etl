@@ -168,6 +168,17 @@ impl UnpackedSnapshotExtractor {
             }
             Some(v) => v,
         };
+        let archive_len = path.metadata()?.len();
+        let valid_len = known_vec.accounts_current_len as u64;
+        info!(
+            "[unpacked] Opening file={} slot={} id={} file_len={} MiB valid_len={} MiB unused_tail={} MiB",
+            path.display(),
+            slot,
+            id,
+            archive_len / (1024 * 1024),
+            valid_len / (1024 * 1024),
+            archive_len.saturating_sub(valid_len) / (1024 * 1024),
+        );
 
         Ok(
             AppendVec::new_from_file(path, known_vec.accounts_current_len, slot, id).map_err(
