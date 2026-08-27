@@ -55,9 +55,16 @@ struct Args {
     bootstrap: bool,
     #[clap(
         long,
+        default_value_t = DEFAULT_RESUME_SLOT_REWIND,
+        value_name = "SLOTS",
+        help = "Rewind this many slots from raw_account.max(updated_slot) when resuming (default: 1000)"
+    )]
+    resume_slot_rewind: u64,
+    #[clap(
+        long,
         default_value_t = 5,
         value_name = "SECONDS",
-        help = "Delay before re-scanning a snapshot directory when no usable archive exists"
+        help = "Delay before re-scanning after the first snapshot when no usable archive exists"
     )]
     incremental_poll_interval_secs: u64,
     #[clap(
@@ -455,13 +462,15 @@ fn run_incremental_snapshots(
         0
     } else {
         let max_updated_slot = output.max_raw_account_updated_slot()?;
-        let resume_slot = resume_slot_from_max_updated_slot(max_updated_slot);
+        let resume_slot =
+            resume_slot_from_max_updated_slot(max_updated_slot, args.resume_slot_rewind);
         debug!(
             "Read raw_account maximum updated_slot={max_updated_slot}; rewound {} slots to resume slot {resume_slot}",
-            RESUME_SLOT_REWIND
+            args.resume_slot_rewind
         );
         resume_slot
     };
+    let mut has_processed_snapshot = false;
     let mut invalid_archives = HashSet::<PathBuf>::new();
     let poll_interval = Duration::from_secs(args.incremental_poll_interval_secs);
 
@@ -470,7 +479,7 @@ fn run_incremental_snapshots(
         directory.display(),
         resume_slot,
         if bootstrap_pending {
-            " (bootstrap: waiting for a full snapshot)"
+            " (bootstrap: requiring a full snapshot)"
         } else {
             ""
         }
@@ -479,6 +488,12 @@ fn run_incremental_snapshots(
     loop {
         let incrementals = discover_incremental_snapshots(directory)?;
         let fulls = discover_full_snapshots(directory)?;
+        let has_archives = !incrementals.is_empty() || !fulls.is_empty();
+        let next_incremental_base = incrementals
+            .iter()
+            .filter(|snapshot| snapshot.slot() > resume_slot)
+            .map(|snapshot| snapshot.base_slot())
+            .min();
         let candidates =
             watched_snapshot_candidates(incrementals, fulls, resume_slot, bootstrap_pending);
         let mut selected: Option<(WatchedSnapshot, SupportedLoader)> = None;
@@ -519,6 +534,32 @@ fn run_incremental_snapshots(
         }
 
         let Some((candidate, mut loader)) = selected else {
+            if !bootstrap_pending {
+                if let Some(base_slot) = next_incremental_base {
+                    if base_slot > resume_slot {
+                        return Err(std::io::Error::other(format!(
+                            "no suitable snapshot for resume slot {resume_slot}: slot gap detected; the next incremental starts at base slot {base_slot} and no bridging full snapshot is available; stopping watcher"
+                        ))
+                        .into());
+                    }
+                }
+            }
+            if !has_processed_snapshot {
+                let reason = if bootstrap_pending {
+                    "bootstrap requires a usable full snapshot"
+                } else {
+                    "no suitable snapshot can advance the resume slot"
+                };
+                let inventory = if has_archives {
+                    "recognized snapshot files were found, but none is usable"
+                } else {
+                    "the snapshot directory contains no recognized archives"
+                };
+                return Err(std::io::Error::other(format!(
+                    "{reason}; {inventory}; stopping watcher"
+                ))
+                .into());
+            }
             thread::sleep(poll_interval);
             continue;
         };
@@ -563,6 +604,7 @@ fn run_incremental_snapshots(
             candidate.slot(),
         );
         resume_slot = candidate.slot();
+        has_processed_snapshot = true;
         if bootstrap_pending {
             bootstrap_pending = false;
             debug!("Full bootstrap complete; incremental snapshots are now eligible");
@@ -572,10 +614,10 @@ fn run_incremental_snapshots(
     }
 }
 
-const RESUME_SLOT_REWIND: u64 = 1_000;
+const DEFAULT_RESUME_SLOT_REWIND: u64 = 1_000;
 
-fn resume_slot_from_max_updated_slot(max_updated_slot: u64) -> u64 {
-    max_updated_slot.saturating_sub(RESUME_SLOT_REWIND)
+fn resume_slot_from_max_updated_slot(max_updated_slot: u64, rewind: u64) -> u64 {
+    max_updated_slot.saturating_sub(rewind)
 }
 
 fn watched_snapshot_candidates(
@@ -825,9 +867,10 @@ mod tests {
 
     #[test]
     fn rewinds_database_watermark_without_underflow() {
-        assert_eq!(resume_slot_from_max_updated_slot(5_000), 4_000);
-        assert_eq!(resume_slot_from_max_updated_slot(1_000), 0);
-        assert_eq!(resume_slot_from_max_updated_slot(999), 0);
+        assert_eq!(resume_slot_from_max_updated_slot(5_000, 1_000), 4_000);
+        assert_eq!(resume_slot_from_max_updated_slot(1_000, 1_000), 0);
+        assert_eq!(resume_slot_from_max_updated_slot(999, 1_000), 0);
+        assert_eq!(resume_slot_from_max_updated_slot(5_000, 2_000), 3_000);
     }
 
     #[test]

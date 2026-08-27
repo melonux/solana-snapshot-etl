@@ -121,6 +121,19 @@ ENGINE = ReplacingMergeTree(updated_slot)
 ORDER BY mint
 COMMENT 'L1: Metaplex Token Metadata 账户快照表，记录每个 token 的名称/图标等展示信息，并非所有 token 都存在对应记录';
 
+
+-- ========================================
+-- 4. hot_token: 外部查询的热点 token 集合
+-- ========================================
+-- import_hot_token 只写入 mint 列；rank、request_count 等 CSV 统计列不会入库。
+CREATE TABLE solana.hot_token
+(
+    mint String COMMENT '热点 token 地址（base58）'
+)
+ENGINE = MergeTree
+ORDER BY mint
+COMMENT '外部查询的热点 token mint 集合，用于筛选 raw_* 表中的子集';
+
 -- 已有表只增加 schema 时可执行：
 -- ALTER TABLE solana.raw_token_metadata
 --     ADD COLUMN IF NOT EXISTS token_standard Nullable(UInt8) AFTER is_mutable;

@@ -22,5 +22,4 @@ exec target/release/solana-snapshot-etl \
   --clickhouse \
   --clickhouse-workers "$clickhouse_workers" \
   --log-file ./solana-snapshot-etl.log \
-  --bootstrap \
   "$@"

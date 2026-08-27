@@ -80,8 +80,9 @@ solana-snapshot-etl ./unpacked_snapshot/
 
 To continuously apply full and incremental snapshots, provide the directory. By default, the
 watcher reads `max(updated_slot)` from `solana.raw_account`, rewinds 1,000 slots (never below
-zero), and resumes from that slot. The producer should publish completed archives with an atomic
-rename. This mode currently writes to ClickHouse only.
+zero), and resumes from that slot. Change the rewind with `--resume-slot-rewind <SLOTS>`. The
+producer should publish completed archives with an atomic rename. This mode currently writes to
+ClickHouse only.
 
 ```shell
 solana-snapshot-etl \
@@ -89,7 +90,7 @@ solana-snapshot-etl \
   --clickhouse
 ```
 
-For a new database, add `--bootstrap`. It starts at slot 0 and waits for a full snapshot; no
+For a new database, add `--bootstrap`. It starts at slot 0 and requires a usable full snapshot; no
 incremental snapshot is applied until that full snapshot has been imported.
 
 ```shell
@@ -117,10 +118,13 @@ tombstones from full archives, so the importer does not perform any extra close-
 them. Incremental archives retain the tombstone path because it is needed to delete token accounts
 from the full base. Canonical empty accounts are appended directly as `is_deleted = 1` versions;
 the importer does not issue a `raw_token_account FINAL` lookup. After a successful write, the
-resume slot advances and the directory is scanned again. If no usable archive is available, it
-waits five seconds by default; change this with `--incremental-poll-interval-secs`. If an archive
-fails during ClickHouse processing, the watcher reports the error and exits non-zero instead of
-retrying the same file (which could otherwise duplicate a partial import).
+resume slot advances and the directory is scanned again. At startup, if no suitable archive can
+advance the initial resume slot (including a slot gap with no bridging full snapshot), the watcher
+reports the problem and exits. Once at least one archive has completed, it waits five seconds by
+default when the next archive is not yet available; change this with
+`--incremental-poll-interval-secs`. If an archive fails during ClickHouse processing, the watcher
+reports the error and exits non-zero instead of retrying the same file (which could otherwise
+duplicate a partial import).
 
 ### ClickHouse
 
