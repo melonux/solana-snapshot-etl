@@ -19,8 +19,8 @@ fi
 
 exec target/release/solana-snapshot-etl \
   --incremental-snapshot-dir /data-static/solana/snapshot \
-  --last-processed-slot 0 \
   --clickhouse \
   --clickhouse-workers "$clickhouse_workers" \
   --log-file ./solana-snapshot-etl.log \
+  --bootstrap \
   "$@"

@@ -56,7 +56,7 @@ USAGE:
 
     # or continuously consume incremental archives
     solana-snapshot-etl [OPTIONS] <LOAD_FLAGS> \
-      --incremental-snapshot-dir <DIR> --last-processed-slot <SLOT>
+      --incremental-snapshot-dir <DIR>
 ```
 
 ### Sources
@@ -78,14 +78,24 @@ solana-snapshot-etl ./unpacked_snapshot/
 
 #### Snapshot watch directory
 
-To continuously apply full and incremental snapshots to an already indexed slot, provide the
-directory and the highest slot already processed. The producer should publish completed archives
-with an atomic rename. This mode currently writes to ClickHouse only.
+To continuously apply full and incremental snapshots, provide the directory. By default, the
+watcher reads `max(updated_slot)` from `solana.raw_account`, rewinds 1,000 slots (never below
+zero), and resumes from that slot. The producer should publish completed archives with an atomic
+rename. This mode currently writes to ClickHouse only.
 
 ```shell
 solana-snapshot-etl \
   --incremental-snapshot-dir /path/to/incremental-snapshots \
-  --last-processed-slot 441050694 \
+  --clickhouse
+```
+
+For a new database, add `--bootstrap`. It starts at slot 0 and waits for a full snapshot; no
+incremental snapshot is applied until that full snapshot has been imported.
+
+```shell
+solana-snapshot-etl \
+  --incremental-snapshot-dir /path/to/incremental-snapshots \
+  --bootstrap \
   --clickhouse
 ```
 
@@ -93,22 +103,22 @@ The importer recognizes both full files named
 `snapshot-<slot>-<accounts-hash>.tar.zst` and incremental files named
 `incremental-snapshot-<base-slot>-<slot>-<accounts-hash>.tar.zst`.
 
-In each round it first chooses an eligible incremental with the largest ending slot
-(`base-slot <= last-processed-slot < slot`). If no incremental can be applied, it uses the newest
-full snapshot beyond the current slot. This lets a full snapshot bridge a missing incremental base:
-with current slot `1000`, incremental `[1100, 2000]`, and full snapshot `1100`, the importer loads
-the full snapshot first, then applies the incremental.
+Outside bootstrap, each round first chooses an eligible incremental with the largest ending slot
+(`base-slot <= resume-slot < slot`). If no incremental can be applied, it uses the newest full
+snapshot beyond the current slot. This lets a full snapshot bridge a missing incremental base: with
+current slot `1000`, incremental `[1100, 2000]`, and full snapshot `1100`, the importer loads the
+full snapshot first, then applies the incremental. In bootstrap mode, only full snapshots are
+eligible until one completes successfully.
 
-While processing either archive type, it skips `accounts/<slot>.<id>` entries at slots already
-processed. Thus a full snapshot only contributes the account changes after the current slot. Full
-archives use a fast ClickHouse path: Agave excludes tombstones from full archives, so the importer
-does not perform any extra close-candidate pass for them. Incremental archives retain the
-tombstone path because it is needed to delete token accounts from the full base. Canonical empty
-accounts are appended directly as `is_deleted = 1` versions; the importer does not issue a
-`raw_token_account FINAL` lookup. After a
-successful write, the current slot advances, all recognized full and incremental archives ending
-at or below it are deleted, and the directory is scanned again. If no usable archive is available,
-it waits five seconds by default; change this with `--incremental-poll-interval-secs`. If an archive
+While processing either archive type, it skips `accounts/<slot>.<id>` entries at slots at or below
+the resume slot. Thus files at lower slots are ignored directly, while a full snapshot contributes
+only account changes after the resume slot. Full archives use a fast ClickHouse path: Agave excludes
+tombstones from full archives, so the importer does not perform any extra close-candidate pass for
+them. Incremental archives retain the tombstone path because it is needed to delete token accounts
+from the full base. Canonical empty accounts are appended directly as `is_deleted = 1` versions;
+the importer does not issue a `raw_token_account FINAL` lookup. After a successful write, the
+resume slot advances and the directory is scanned again. If no usable archive is available, it
+waits five seconds by default; change this with `--incremental-poll-interval-secs`. If an archive
 fails during ClickHouse processing, the watcher reports the error and exits non-zero instead of
 retrying the same file (which could otherwise duplicate a partial import).
 
@@ -135,9 +145,16 @@ the file is truncated when the process starts, and the terminal remains availabl
 ./run.sh --log-file /tmp/solana-snapshot-etl.log
 ```
 
-Archive diagnostics include each AppendVec path, physical archive size, valid size, and unused
-tail in exact bytes and MiB. ClickHouse diagnostics identify the worker, file being processed, and each INSERT batch's
-table, row count, and byte count. File logs also include the process ID and thread ID, which helps
+Detailed archive, worker, and ClickHouse diagnostics use the `debug` level. The default `info`
+level keeps those messages out of the log; enable them explicitly with `--log-level debug` (or use
+`--log-level trace` for the most verbose logger output). If `--log-level` is omitted, the existing
+`RUST_LOG` setting is honored. The console prints a processing and completed line for every
+full/incremental snapshot file.
+
+At `debug` level, archive diagnostics include each AppendVec path, physical archive size, valid
+size, and unused tail in exact bytes and MiB. ClickHouse diagnostics identify the worker, file
+being processed, and each INSERT batch's table, row count, and byte count. File logs also include
+the process ID and thread ID, which helps
 identify messages if more than one invocation is running. The per-AppendVec messages are intentionally verbose, so use
 the file logger while diagnosing and disable or revert them for a normal high-throughput run.
 
@@ -168,13 +185,8 @@ ClickHouse, start with `2` and do not exceed `4`; more streams can cause MergeTr
 consume all disk I/O. Set it to `1` for the single-threaded path when diagnosing a problematic
 server.
 
-For a full snapshot, the importer runs `SYSTEM STOP MERGES` on the four ETL tables before loading
-(newly scheduled merges stop; a merge already in progress is allowed to finish). The successful full
-import intentionally leaves those merges stopped, so ClickHouse does not scan and rewrite the newly
-loaded parts while waiting for the next snapshot. When an incremental snapshot starts, the importer
-runs `SYSTEM START MERGES` before writing it. A failed full import also leaves merges stopped: this
-prevents ClickHouse from compacting partial parts while the failure is being diagnosed. Start an
-incremental snapshot, or issue `SYSTEM START MERGES` explicitly, when that work should resume.
+The importer leaves ClickHouse MergeTree background merges enabled for both full and incremental
+snapshots; merge state does not change when switching between snapshot types.
 
 If a snapshot was already imported but the CloseAccount tombstone pass failed, run only that pass:
 

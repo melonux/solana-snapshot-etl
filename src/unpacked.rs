@@ -3,7 +3,7 @@ use crate::{
     DeserializableVersionedBank, ReadProgressTracking, Result, SerializableAccountStorageEntry,
     SnapshotError, SnapshotExtractor, SNAPSHOTS_DIR,
 };
-use log::{info, warn};
+use log::{debug, warn};
 use solana_runtime::snapshot_utils::SNAPSHOT_STATUS_CACHE_FILENAME;
 use std::fs::OpenOptions;
 use std::io::BufReader;
@@ -59,7 +59,7 @@ impl UnpackedSnapshotExtractor {
             return Err(SnapshotError::NoSnapshotManifest);
         }
 
-        info!("Opening snapshot manifest: {:?}", snapshot_file_path);
+        debug!("Opening snapshot manifest: {:?}", snapshot_file_path);
         let snapshot_file = OpenOptions::new().read(true).open(&snapshot_file_path)?;
         let snapshot_file_len = snapshot_file.metadata()?.len();
 
@@ -81,11 +81,11 @@ impl UnpackedSnapshotExtractor {
         let accounts_db_fields_post_time = Instant::now();
         drop(snapshot_file);
 
-        info!(
+        debug!(
             "Read bank fields in {:?}",
             versioned_bank_post_time - pre_unpack
         );
-        info!(
+        debug!(
             "Read accounts DB fields in {:?}",
             accounts_db_fields_post_time - versioned_bank_post_time
         );
@@ -124,7 +124,7 @@ impl UnpackedSnapshotExtractor {
             .collect::<Vec<_>>();
 
         let total_files = parsed_files.len();
-        info!("Found {} appendvec files to process", total_files);
+        debug!("Found {} appendvec files to process", total_files);
 
         Ok(parsed_files
             .into_iter()
@@ -133,7 +133,7 @@ impl UnpackedSnapshotExtractor {
                 let processed = idx + 1;
                 if total_files > 0 {
                     let percent = (processed as f64 * 100.0) / total_files as f64;
-                    info!(
+                    debug!(
                         "AppendVec progress: {}/{} ({:.2}%) file={}",
                         processed,
                         total_files,
@@ -170,7 +170,7 @@ impl UnpackedSnapshotExtractor {
         };
         let archive_len = path.metadata()?.len();
         let valid_len = known_vec.accounts_current_len as u64;
-        info!(
+        debug!(
             "[unpacked] Opening file={} slot={} id={} file_len={} MiB valid_len={} MiB unused_tail={} MiB",
             path.display(),
             slot,

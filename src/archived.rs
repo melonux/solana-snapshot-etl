@@ -3,7 +3,7 @@ use crate::{
     DeserializableVersionedBank, Result, SerializableAccountStorageEntry, SnapshotError,
     SnapshotExtractor,
 };
-use log::info;
+use log::debug;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Component, Path};
@@ -48,7 +48,7 @@ impl<'a, R: Read> AppendVecReadProgress<'a, R> {
         }
         self.last_log = Instant::now();
         let rate_mib = self.bytes_read as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
-        info!(
+        debug!(
             "Reading AppendVec slot={} id={} progress={}/{} MiB rate={:.1} MiB/s",
             self.slot,
             self.id,
@@ -135,7 +135,7 @@ where
         //let snapshot_file_len = snapshot_file.size();
         let snapshot_file_path = snapshot_file.path()?.as_ref().to_path_buf();
 
-        info!("Opening snapshot manifest: {:?}", &snapshot_file_path);
+        debug!("Opening snapshot manifest: {:?}", &snapshot_file_path);
         let mut snapshot_file = BufReader::new(snapshot_file);
 
         let pre_unpack = Instant::now();
@@ -149,11 +149,11 @@ where
         let accounts_db_fields_post_time = Instant::now();
         drop(snapshot_file);
 
-        info!(
+        debug!(
             "Read bank fields in {:?}",
             versioned_bank_post_time - pre_unpack
         );
-        info!(
+        debug!(
             "Read accounts DB fields in {:?}",
             accounts_db_fields_post_time - versioned_bank_post_time
         );
@@ -186,7 +186,7 @@ where
             };
             let advance_elapsed = advance_started.elapsed();
             if advance_elapsed >= Duration::from_secs(5) {
-                info!(
+                debug!(
                     "Advanced tar stream to {:?} in {:?} (may include skipped entry padding)",
                     path, advance_elapsed
                 );
@@ -232,7 +232,7 @@ where
         let archive_len = entry.size();
         let unused_tail = archive_len.saturating_sub(expected_len);
         let started = Instant::now();
-        info!(
+        debug!(
             "[archive] Reading file={entry_name} slot={slot} id={id} archive_len={} bytes ({:.2} MiB) valid_len={} bytes ({:.2} MiB) unused_tail={} bytes ({:.2} MiB)",
             archive_len,
             archive_len as f64 / (1024.0 * 1024.0),
@@ -249,7 +249,7 @@ where
             id,
         )?;
         let elapsed = started.elapsed();
-        info!(
+        debug!(
             "[archive] Decompressed file={entry_name} slot={slot} id={id} valid_len={} bytes ({:.2} MiB) archive_len={} bytes ({:.2} MiB) unused_tail={} bytes ({:.2} MiB) elapsed={:?}",
             append_vec.len(),
             append_vec.len() as f64 / (1024.0 * 1024.0),

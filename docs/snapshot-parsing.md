@@ -270,11 +270,16 @@ WHERE is_deleted = 0;
 
 ## 6. 增量 ETL 的截止 slot 和文件过滤
 
-项目可以维护一个 `last_processed_slot`，每次只处理：
+监听模式不再接收人工指定的截止 slot。默认启动时查询
+`solana.raw_account` 的 `max(updated_slot)`，回退 1000（最小为 0）作为恢复 slot；每次只处理：
 
 ~~~text
-append_vec.slot() > last_processed_slot
+append_vec.slot() > resume_slot
 ~~~
+
+传入 `--bootstrap` 时，恢复 slot 固定为 0，且必须先成功导入一个 full snapshot，之后才允许处理
+incremental snapshot。这样新库一定以完整基线开始；不传该参数时则使用数据库水位线回退后的结果，
+让最近 1000 个 slot 的数据可重复写入以覆盖可能的边界遗漏。
 
 这样做的依据不是“旧文件不会变化”，而是：
 

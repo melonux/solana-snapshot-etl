@@ -1,8 +1,10 @@
-use crate::clickhouse::{ClickhouseIndexer, CloseTombstoneStats, SnapshotKind};
+use crate::clickhouse::{
+    max_raw_account_updated_slot, ClickhouseIndexer, CloseTombstoneStats, SnapshotKind,
+};
 use clap::{ArgGroup, Parser};
 use env_logger::{Builder, Env, Target};
 use indicatif::{ProgressBar, ProgressBarIter, ProgressStyle};
-use log::{error, info, warn};
+use log::{debug, error, warn, LevelFilter};
 use solana_snapshot_etl::archived::ArchiveSnapshotExtractor;
 use solana_snapshot_etl::incremental::{
     discover as discover_incremental_snapshots, discover_full as discover_full_snapshots,
@@ -47,10 +49,10 @@ struct Args {
     incremental_snapshot_dir: Option<PathBuf>,
     #[clap(
         long,
-        value_name = "SLOT",
-        help = "Highest slot already processed before snapshot consumption starts"
+        action,
+        help = "Start from slot 0 and require a full snapshot before applying incremental snapshots"
     )]
-    last_processed_slot: Option<u64>,
+    bootstrap: bool,
     #[clap(
         long,
         default_value_t = 5,
@@ -83,21 +85,27 @@ struct Args {
         help = "Write ETL logs to FILE (truncate it at startup); leave the terminal available for progress bars"
     )]
     log_file: Option<PathBuf>,
+    #[clap(
+        long,
+        value_name = "LEVEL",
+        help = "Log level for diagnostics (error, warn, info, debug, trace, or off); overrides RUST_LOG"
+    )]
+    log_level: Option<LevelFilter>,
 }
 
 fn main() {
     let args = Args::parse();
-    init_logging(args.log_file.as_deref());
+    init_logging(args.log_file.as_deref(), args.log_level);
     if let Err(e) = _main(args) {
         error!("{}", e);
         std::process::exit(1);
     }
 }
 
-fn init_logging(log_file: Option<&Path>) {
-    let env = Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info");
+fn init_logging(log_file: Option<&Path>, log_level: Option<LevelFilter>) {
     let Some(path) = log_file else {
-        env_logger::init_from_env(env);
+        let mut builder = logging_builder(log_level);
+        builder.init();
         return;
     };
 
@@ -108,7 +116,7 @@ fn init_logging(log_file: Option<&Path>) {
         .open(path)
     {
         Ok(file) => {
-            let mut builder = Builder::from_env(env);
+            let mut builder = logging_builder(log_level);
             builder.target(Target::Pipe(Box::new(file)));
             // A watch process can be restarted while an older invocation is
             // still draining the same snapshot. Include process/thread
@@ -141,8 +149,19 @@ fn init_logging(log_file: Option<&Path>) {
                 "failed to open log file {}: {err}; logging to stderr",
                 path.display()
             );
-            env_logger::init_from_env(env);
+            logging_builder(log_level).init();
         }
+    }
+}
+
+fn logging_builder(log_level: Option<LevelFilter>) -> Builder {
+    match log_level {
+        Some(level) => {
+            let mut builder = Builder::new();
+            builder.filter_level(level);
+            builder
+        }
+        None => Builder::from_env(Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info")),
     }
 }
 
@@ -169,16 +188,13 @@ fn _main(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     .into(),
             );
         }
-        let last_processed_slot = args
-            .last_processed_slot
-            .ok_or("--last-processed-slot is required when --incremental-snapshot-dir is used")?;
         if args.incremental_poll_interval_secs == 0 {
             return Err("--incremental-poll-interval-secs must be greater than zero".into());
         }
-        return run_incremental_snapshots(&args, directory, last_processed_slot);
+        return run_incremental_snapshots(&args, directory);
     }
-    if args.last_processed_slot.is_some() {
-        return Err("--last-processed-slot requires --incremental-snapshot-dir".into());
+    if args.bootstrap {
+        return Err("--bootstrap requires --incremental-snapshot-dir".into());
     }
 
     let source = args
@@ -193,24 +209,37 @@ fn process_single_snapshot(
     args: &Args,
     loader: &mut SupportedLoader,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let source_path = Path::new(
+        args.source
+            .as_deref()
+            .ok_or("a snapshot source is required")?,
+    );
     if args.clickhouse_close_tombstones {
         dotenvy::dotenv().ok();
         let clickhouse_url = std::env::var("CLICKHOUSE_URL")
             .map_err(|_| "CLICKHOUSE_URL must be set in the environment or .env file")?;
         let snapshot_slot = loader.snapshot_slot();
         let append_vec_count = loader.append_vec_count_hint();
-        info!(
+        console_snapshot_status("processing", "tombstones", source_path, snapshot_slot);
+        debug!(
             "Scanning snapshot slot {} for canonical empty accounts",
             snapshot_slot
         );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let stats = runtime.block_on(
+        let stats = match runtime.block_on(
             ClickhouseIndexer::new(clickhouse_url, snapshot_slot, append_vec_count)?
                 .mark_close_tombstones(loader.iter()),
-        )?;
+        ) {
+            Ok(stats) => stats,
+            Err(err) => {
+                console_snapshot_status("failed", "tombstones", source_path, snapshot_slot);
+                return Err(err);
+            }
+        };
         log_close_tombstone_stats(&stats);
+        console_snapshot_status("completed", "tombstones", source_path, snapshot_slot);
     }
     if args.clickhouse {
         dotenvy::dotenv().ok();
@@ -219,7 +248,13 @@ fn process_single_snapshot(
         let snapshot_slot = loader.snapshot_slot();
         let append_vec_count = loader.append_vec_count_hint();
         let snapshot_kind = snapshot_kind_from_source(args.source.as_deref().unwrap_or_default());
-        info!(
+        console_snapshot_status(
+            "processing",
+            snapshot_kind.as_str(),
+            source_path,
+            snapshot_slot,
+        );
+        debug!(
             "Dumping {} snapshot slot {} to ClickHouse",
             snapshot_kind.as_str(),
             snapshot_slot
@@ -228,13 +263,40 @@ fn process_single_snapshot(
             .enable_all()
             .build()?;
         let stats =
-            runtime.block_on(
+            match runtime.block_on(
                 ClickhouseIndexer::new(clickhouse_url, snapshot_slot, append_vec_count)?
                     .insert_all(loader.iter(), snapshot_kind, args.clickhouse_workers),
-            )?;
+            ) {
+                Ok(stats) => stats,
+                Err(err) => {
+                    console_snapshot_status(
+                        "failed",
+                        snapshot_kind.as_str(),
+                        source_path,
+                        snapshot_slot,
+                    );
+                    return Err(err);
+                }
+            };
         log_clickhouse_index_stats(&stats);
+        console_snapshot_status(
+            "completed",
+            snapshot_kind.as_str(),
+            source_path,
+            snapshot_slot,
+        );
     }
     Ok(())
+}
+
+fn console_snapshot_status(event: &str, kind: &str, path: &Path, slot: u64) {
+    let mut output = std::io::stdout();
+    let _ = writeln!(
+        output,
+        "[snapshot] {event}: {kind} file={} slot={slot}",
+        path.display()
+    );
+    let _ = output.flush();
 }
 
 /// A single-source invocation has no `WatchedSnapshot` wrapper from which to
@@ -293,29 +355,26 @@ impl WatchedSnapshot {
         }
     }
 
-    fn new_loader(
-        &self,
-        last_processed_slot: u64,
-    ) -> Result<SupportedLoader, Box<dyn std::error::Error>> {
+    fn new_loader(&self, resume_slot: u64) -> Result<SupportedLoader, Box<dyn std::error::Error>> {
         match self {
             Self::Incremental(snapshot) => {
-                SupportedLoader::new_incremental_snapshot(snapshot.path(), last_processed_slot)
+                SupportedLoader::new_incremental_snapshot(snapshot.path(), resume_slot)
             }
             Self::Full(snapshot) => {
-                SupportedLoader::new_full_snapshot(snapshot.path(), last_processed_slot)
+                SupportedLoader::new_full_snapshot(snapshot.path(), resume_slot)
             }
         }
     }
 
     fn log_verification(&self) {
         match self {
-            Self::Incremental(snapshot) => info!(
+            Self::Incremental(snapshot) => debug!(
                 "Verifying incremental snapshot {} (base={}, slot={})",
                 snapshot.path().display(),
                 snapshot.base_slot(),
                 snapshot.slot()
             ),
-            Self::Full(snapshot) => info!(
+            Self::Full(snapshot) => debug!(
                 "Verifying full snapshot {} (slot={})",
                 snapshot.path().display(),
                 snapshot.slot()
@@ -342,6 +401,18 @@ impl IncrementalOutput {
         })
     }
 
+    fn max_raw_account_updated_slot(&self) -> Result<u64, Box<dyn std::error::Error>> {
+        match self {
+            Self::Clickhouse {
+                clickhouse_url,
+                runtime,
+                ..
+            } => runtime
+                .block_on(max_raw_account_updated_slot(clickhouse_url))
+                .map_err(Into::into),
+        }
+    }
+
     fn process(
         &mut self,
         loader: &mut SupportedLoader,
@@ -355,7 +426,7 @@ impl IncrementalOutput {
             } => {
                 let snapshot_slot = loader.snapshot_slot();
                 let append_vec_count = loader.append_vec_count_hint();
-                info!(
+                debug!(
                     "Dumping {} snapshot slot {snapshot_slot} to ClickHouse",
                     snapshot_kind.as_str()
                 );
@@ -377,33 +448,39 @@ impl IncrementalOutput {
 fn run_incremental_snapshots(
     args: &Args,
     directory: &Path,
-    mut last_processed_slot: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut output = IncrementalOutput::new(args)?;
+    let mut bootstrap_pending = args.bootstrap;
+    let mut resume_slot = if bootstrap_pending {
+        0
+    } else {
+        let max_updated_slot = output.max_raw_account_updated_slot()?;
+        let resume_slot = resume_slot_from_max_updated_slot(max_updated_slot);
+        debug!(
+            "Read raw_account maximum updated_slot={max_updated_slot}; rewound {} slots to resume slot {resume_slot}",
+            RESUME_SLOT_REWIND
+        );
+        resume_slot
+    };
     let mut invalid_archives = HashSet::<PathBuf>::new();
     let poll_interval = Duration::from_secs(args.incremental_poll_interval_secs);
 
-    info!(
-        "Watching snapshot directory {} from slot {}",
+    debug!(
+        "Watching snapshot directory {} from resume slot {}{}",
         directory.display(),
-        last_processed_slot
+        resume_slot,
+        if bootstrap_pending {
+            " (bootstrap: waiting for a full snapshot)"
+        } else {
+            ""
+        }
     );
 
     loop {
-        // Prefer an already-applicable incremental archive.  If there is a gap
-        // (for example, current=1000 and the next incremental is based at
-        // 1100), a newer full snapshot can bridge the state forward.
-        let candidates = eligible_candidates(
-            discover_incremental_snapshots(directory)?,
-            last_processed_slot,
-        )
-        .into_iter()
-        .map(WatchedSnapshot::Incremental)
-        .chain(
-            eligible_full_candidates(discover_full_snapshots(directory)?, last_processed_slot)
-                .into_iter()
-                .map(WatchedSnapshot::Full),
-        );
+        let incrementals = discover_incremental_snapshots(directory)?;
+        let fulls = discover_full_snapshots(directory)?;
+        let candidates =
+            watched_snapshot_candidates(incrementals, fulls, resume_slot, bootstrap_pending);
         let mut selected: Option<(WatchedSnapshot, SupportedLoader)> = None;
 
         for candidate in candidates {
@@ -412,7 +489,7 @@ fn run_incremental_snapshots(
             }
 
             candidate.log_verification();
-            let loader = match candidate.new_loader(last_processed_slot) {
+            let loader = match candidate.new_loader(resume_slot) {
                 Ok(loader) => loader,
                 Err(err) => {
                     warn!(
@@ -450,13 +527,25 @@ fn run_incremental_snapshots(
             WatchedSnapshot::Incremental(_) => SnapshotKind::Incremental,
             WatchedSnapshot::Full(_) => SnapshotKind::Full,
         };
+        console_snapshot_status(
+            "processing",
+            snapshot_kind.as_str(),
+            candidate.path(),
+            candidate.slot(),
+        );
         if let Err(err) = output.process(&mut loader, snapshot_kind) {
+            console_snapshot_status(
+                "failed",
+                snapshot_kind.as_str(),
+                candidate.path(),
+                candidate.slot(),
+            );
             error!(
                 "Failed to process {} snapshot {}: {}. Stopping watcher; the file was retained and slot {} remains current",
                 candidate.kind(),
                 candidate.path().display(),
                 err,
-                last_processed_slot
+                resume_slot
             );
             return Err(std::io::Error::other(format!(
                 "failed to process {} snapshot {} at slot {}: {err}; automatic retry is disabled",
@@ -467,86 +556,131 @@ fn run_incremental_snapshots(
             .into());
         }
 
-        last_processed_slot = candidate.slot();
-        info!("Advanced last processed slot to {last_processed_slot}");
+        console_snapshot_status(
+            "completed",
+            snapshot_kind.as_str(),
+            candidate.path(),
+            candidate.slot(),
+        );
+        resume_slot = candidate.slot();
+        if bootstrap_pending {
+            bootstrap_pending = false;
+            debug!("Full bootstrap complete; incremental snapshots are now eligible");
+        }
+        debug!("Advanced resume slot to {resume_slot}");
         invalid_archives.retain(|path| path.exists());
     }
 }
 
+const RESUME_SLOT_REWIND: u64 = 1_000;
+
+fn resume_slot_from_max_updated_slot(max_updated_slot: u64) -> u64 {
+    max_updated_slot.saturating_sub(RESUME_SLOT_REWIND)
+}
+
+fn watched_snapshot_candidates(
+    incrementals: Vec<IncrementalSnapshot>,
+    fulls: Vec<FullSnapshot>,
+    resume_slot: u64,
+    bootstrap_pending: bool,
+) -> Vec<WatchedSnapshot> {
+    if bootstrap_pending {
+        // A bootstrap must establish a canonical full-state baseline. Even an
+        // incremental whose base is zero cannot replace it.
+        return eligible_full_candidates(fulls, resume_slot)
+            .into_iter()
+            .map(WatchedSnapshot::Full)
+            .collect();
+    }
+
+    // Prefer an already-applicable incremental archive. If there is a gap
+    // (for example, current=1000 and the next incremental is based at 1100),
+    // a newer full snapshot can bridge state forward.
+    eligible_candidates(incrementals, resume_slot)
+        .into_iter()
+        .map(WatchedSnapshot::Incremental)
+        .chain(
+            eligible_full_candidates(fulls, resume_slot)
+                .into_iter()
+                .map(WatchedSnapshot::Full),
+        )
+        .collect()
+}
+
 fn log_clickhouse_index_stats(stats: &crate::clickhouse::IndexStats) {
-    info!("[clickhouse] Dumped {} accounts", stats.accounts_total);
-    info!(
+    debug!("[clickhouse] Dumped {} accounts", stats.accounts_total);
+    debug!(
         "[clickhouse] Dumped {} token accounts",
         stats.token_accounts_total
     );
-    info!(
+    debug!(
         "[clickhouse] Skipped {} append vec files",
         stats.skipped_append_vecs
     );
-    info!(
+    debug!(
         "[clickhouse] Processed {} append vec files",
         stats.append_vecs_total
     );
-    info!(
+    debug!(
         "[clickhouse] Non-empty append vec files producing 0 accounts: {}",
         stats.nonempty_zero_account_append_vecs
     );
-    info!(
+    debug!(
         "[clickhouse] SPL-Token owner accounts seen: {}",
         stats.spl_token_owner_accounts_seen
     );
-    info!(
+    debug!(
         "[clickhouse] SPL-Token accounts parsed successfully: {}",
         stats.spl_token_accounts_parsed
     );
-    info!(
+    debug!(
         "[clickhouse] SPL-Token accounts with unexpected size: {}",
         stats.spl_token_unexpected_size
     );
-    info!(
+    debug!(
         "[clickhouse] SPL-Token accounts with unpack failure: {}",
         stats.spl_token_unpack_failed
     );
-    info!(
+    debug!(
         "[clickhouse] Token-2022 owner accounts seen: {}",
         stats.token_2022_owner_accounts_seen
     );
-    info!(
+    debug!(
         "[clickhouse] Token-2022 accounts parsed successfully: {}",
         stats.token_2022_accounts_parsed
     );
-    info!(
+    debug!(
         "[clickhouse] Token-2022 accounts with unexpected size: {}",
         stats.token_2022_unexpected_size
     );
-    info!(
+    debug!(
         "[clickhouse] Token-2022 accounts with unpack failure: {}",
         stats.token_2022_unpack_failed
     );
-    info!(
+    debug!(
         "[clickhouse] Canonical empty-account token tombstone candidates: {}",
         stats.token_account_close_candidates
     );
-    info!(
+    debug!(
         "[clickhouse] Token-account tombstone versions written: {}",
         stats.token_accounts_marked_deleted
     );
 }
 
 fn log_close_tombstone_stats(stats: &CloseTombstoneStats) {
-    info!(
+    debug!(
         "[clickhouse] Scanned {} append vec files for tombstones",
         stats.append_vecs_total
     );
-    info!(
+    debug!(
         "[clickhouse] Skipped {} append vec files while scanning tombstones",
         stats.skipped_append_vecs
     );
-    info!(
+    debug!(
         "[clickhouse] Canonical empty accounts found: {}",
         stats.canonical_empty_accounts
     );
-    info!(
+    debug!(
         "[clickhouse] Token-account tombstone versions written: {}",
         stats.token_accounts_marked_deleted
     );
@@ -623,10 +757,10 @@ impl SupportedLoader {
         progress_tracking: Box<dyn ReadProgressTracking>,
     ) -> solana_snapshot_etl::Result<Self> {
         Ok(if path.is_dir() {
-            info!("Reading unpacked snapshot");
+            debug!("Reading unpacked snapshot");
             Self::Unpacked(UnpackedSnapshotExtractor::open(path, progress_tracking)?)
         } else {
-            info!("Reading snapshot archive");
+            debug!("Reading snapshot archive");
             Self::ArchiveFile(ArchiveSnapshotExtractor::open(path)?)
         })
     }
@@ -635,7 +769,7 @@ impl SupportedLoader {
         path: &Path,
         last_processed_slot: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        info!("Reading incremental snapshot archive");
+        debug!("Reading incremental snapshot archive");
         // The archive can repeat storage from the full base. Only apply files
         // newer than the database watermark.
         let loader =
@@ -647,7 +781,7 @@ impl SupportedLoader {
         path: &Path,
         last_processed_slot: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        info!("Reading full snapshot archive");
+        debug!("Reading full snapshot archive");
         // Full archives are canonical, but watch mode may discover one after
         // some slots are already indexed. Keep the same slot filter so files
         // at or below the database watermark are not rewritten.
@@ -677,5 +811,53 @@ impl SnapshotExtractor for SupportedLoader {
             SupportedLoader::Unpacked(loader) => loader.append_vec_count_hint(),
             SupportedLoader::ArchiveFile(loader) => loader.append_vec_count_hint(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        discover_full_snapshots, discover_incremental_snapshots, resume_slot_from_max_updated_slot,
+        watched_snapshot_candidates, WatchedSnapshot,
+    };
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn rewinds_database_watermark_without_underflow() {
+        assert_eq!(resume_slot_from_max_updated_slot(5_000), 4_000);
+        assert_eq!(resume_slot_from_max_updated_slot(1_000), 0);
+        assert_eq!(resume_slot_from_max_updated_slot(999), 0);
+    }
+
+    #[test]
+    fn bootstrap_waits_for_a_full_snapshot_even_when_incremental_is_eligible() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "solana-snapshot-etl-bootstrap-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let hash = "3dBjB2KwbPjeqjQwNzwx48qgK4hdkcw5uxmwcgDh5zkD";
+        fs::write(
+            directory.join(format!("incremental-snapshot-0-1500-{hash}.tar.zst")),
+            [],
+        )
+        .unwrap();
+        fs::write(directory.join(format!("snapshot-2000-{hash}.tar.zst")), []).unwrap();
+
+        let candidates = watched_snapshot_candidates(
+            discover_incremental_snapshots(&directory).unwrap(),
+            discover_full_snapshots(&directory).unwrap(),
+            0,
+            true,
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert!(matches!(&candidates[0], WatchedSnapshot::Full(_)));
+        fs::remove_dir_all(directory).unwrap();
     }
 }
