@@ -1,5 +1,5 @@
 -- ========================================
--- 0. raw_account: 原始账户快照表（未解析的原始元信息）
+-- 0. raw_account: 当前服役组原始账户快照表（未解析的原始元信息）
 -- ========================================
 CREATE TABLE solana.raw_account
 (
@@ -16,7 +16,7 @@ COMMENT 'L0: 原始账户快照表，一行对应链上一个账户的元信息�
 
 
 -- ========================================
--- 1. raw_token_account: SPL Token 账户（余额表）
+-- 1. raw_token_account: 当前服役组 SPL Token 账户（余额表）
 -- ========================================
 CREATE TABLE solana.raw_token_account
 (
@@ -36,54 +36,8 @@ ENGINE = ReplacingMergeTree(updated_slot, is_deleted)
 ORDER BY pubkey
 COMMENT 'L1: SPL Token 账户余额快照表，一行对应一个 token account 的最新状态；pubkey 是稳定版本键，支持用 CloseAccount tombstone 覆盖旧持仓';
 
-ALTER TABLE solana.raw_token_account
-    MODIFY SETTING deduplicate_merge_projection_mode = 'rebuild';
-
--- 按 mint 查询 holder / Top-N 的 Projection
-ALTER TABLE solana.raw_token_account
-    ADD PROJECTION proj_by_mint_owner
-    (
-        SELECT *
-        ORDER BY (mint, owner, pubkey)
-    );
-
--- 反查用的 Projection：按 owner 优先排序，加速"某地址持有哪些 token"的查询
-ALTER TABLE solana.raw_token_account
-    ADD PROJECTION proj_by_owner
-    (
-        SELECT *
-        ORDER BY (owner, mint, pubkey)
-    );
-
-ALTER TABLE solana.raw_token_account MATERIALIZE PROJECTION proj_by_owner;
-ALTER TABLE solana.raw_token_account MATERIALIZE PROJECTION proj_by_mint_owner;
-
--- 当前有效 token account 的查询模板。ReplacingMergeTree 的物理 merge 是异步的，
--- 因此对强一致当前态查询必须使用 FINAL，并排除 CloseAccount 写入的 tombstone。
-SELECT *
-FROM solana.raw_token_account FINAL
-WHERE is_deleted = 0;
-
--- updated_slot 是唯一的业务版本字段。官方 canonical snapshot 不会保留同一
--- pubkey 在同一 slot 的多个有效版本，因此不需要用 AppendVec 的物理位置推断顺序。
--- is_deleted 作为 ReplacingMergeTree 的第二个参数，UInt8=1 表示删除版本；引擎会在
--- 版本比较和后台合并时按删除标记处理，查询时仍建议显式使用 FINAL 并过滤 is_deleted=0。
-
--- 迁移说明：旧版表使用 ORDER BY (mint, owner, pubkey)，不能原地改为以
--- pubkey 去重，也无法从已经丢失的历史 CloseAccount 反推出 tombstone。
--- 已部署旧版时，先保留旧表，再按本文件的 DDL 创建新的 raw_token_account：
---
--- RENAME TABLE solana.raw_token_account TO solana.raw_token_account_v1_backup;
---
--- 然后从一个新的全量 snapshot 重建，并连续消费该全量 snapshot 之后的
--- incremental snapshots。验证无误后再删除 _v1_backup；不要把新的全量
--- snapshot 直接追加到旧表。
--- 当前版本移除了 append_vec_id/account_offset/final_version。旧表的字段布局和引擎定义
--- 不兼容，应新建表并从全量 snapshot 重新导入。
-
-
 -- ========================================
--- 2. raw_token_mint: SPL Token 的 Mint 账户（供应量/权限表）
+-- 2. raw_token_mint: 当前服役组 SPL Token Mint 账户（供应量/权限表）
 -- ========================================
 CREATE TABLE solana.raw_token_mint
 (
@@ -101,7 +55,7 @@ COMMENT 'L1: SPL Token Mint 账户快照表，记录每个 token 的供应量与
 
 
 -- ========================================
--- 3. raw_token_metadata: Metaplex Token Metadata 账户（展示信息表）
+-- 3. raw_token_metadata: 当前服役组 Metaplex Token Metadata 账户（展示信息表）
 -- ========================================
 CREATE TABLE solana.raw_token_metadata
 (
@@ -128,14 +82,182 @@ COMMENT 'L1: Metaplex Token Metadata 账户快照表，记录每个 token 的名
 -- import_hot_token 只写入 mint 列；rank、request_count 等 CSV 统计列不会入库。
 CREATE TABLE solana.hot_token
 (
-    mint String COMMENT '热点 token 地址（base58）'
+    mint    String COMMENT 'Token mint 地址',
+    enable  UInt8 DEFAULT 1 COMMENT '1=启用，0=禁用',
+    version UInt64 DEFAULT 1 COMMENT '同一 mint 的递增版本号'
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY mint
+COMMENT '热点 Token 集合及其启用状态';
+-- 修改时，必须增加 version 编号。
+
+-- 创建一个只返回启用 Token 的视图，后续二层 Materialized View 都引用它
+CREATE VIEW solana.hot_token_enabled AS
+SELECT mint, version
+FROM solana.hot_token FINAL
+WHERE enable = 1;
+
+
+
+-- ========================================
+-- 5. hot_index_control: 表组切换控制
+-- ========================================
+CREATE TABLE solana.hot_index_control
+(
+    control_key       LowCardinality(String)
+                       COMMENT '控制项名称，固定为 default',
+
+    active_group      UInt8
+                       COMMENT '最近一次切换后的逻辑组编号：1 或 2；仅供编排与审计，查询不依赖此字段路由',
+
+    generation        UInt64
+                       COMMENT '全局递增代数，每次切换必须递增',
+
+    ready_slot        UInt64
+                       COMMENT '当前 active group 已完成的快照 slot',
+
+    hot_token_version UInt64
+                       COMMENT '本组构建时使用的 hot_token 版本',
+
+    updated_at        DateTime64(3, 'UTC')
+                       DEFAULT now64(3)
+                       COMMENT '控制记录更新时间'
+)
+ENGINE = ReplacingMergeTree(generation)
+ORDER BY control_key
+COMMENT '热门 Token 二层索引的 active group 控制表';
+
+-- generation 必须全局严格递增；
+-- ready_slot 只有在目标组完成全量、增量和聚合刷新后才能写入；
+-- 编排程序查询控制表时必须使用 FINAL；
+-- 查询服务固定访问无后缀的 active 表，不读取 active_group 决定表名；
+
+
+-- ============================================================
+-- hot_token_account_state
+-- L2 状态明细：只保存启用热门 Token 的 Token Account 最新状态。
+--
+-- 用途：
+-- 1. 作为 raw_token_account 的热门币筛选子集；
+-- 2. 保留 token-account 粒度的版本与删除状态；
+-- 3. 为 hot_wallet_token_balance 的钱包维度聚合提供正确输入。
+-- ============================================================
+CREATE TABLE solana.hot_token_account_state
+(
+    pubkey       String
+                 COMMENT 'SPL Token Account 地址；一个账户对应一个 mint 和一个钱包 owner，是本表的业务主键',
+
+    mint         String
+                 COMMENT 'Token mint 地址；仅存当前 hot_token 中 enable=1 的普通 Token',
+
+    owner        String
+                 COMMENT 'Token Account 的实际持有人钱包地址；同一钱包可通过多个 Token Account 持有同一种 Token',
+
+    amount       UInt64
+                 COMMENT '该 Token Account 的余额，最小单位整数；展示时需结合 hot_token_info.decimals 换算',
+
+    state        Enum8(
+                     'uninitialized' = 0,
+                     'initialized'   = 1,
+                     'frozen'        = 2
+                 )
+                 COMMENT 'SPL Token Account 状态；initialized 和 frozen 都是有效持仓，uninitialized 不应进入钱包余额聚合',
+
+    is_deleted   UInt8
+                 COMMENT '删除版本标志：0=当前有效账户版本，1=CloseAccount tombstone；tombstone 的 mint/owner/amount 可为中性值',
+
+    updated_slot UInt64
+                 COMMENT '账户版本所属的 Solana slot；ReplacingMergeTree 按此字段选择同一 pubkey 的最新版本'
+)
+ENGINE = ReplacingMergeTree(updated_slot, is_deleted)
+ORDER BY pubkey
+COMMENT 'L2：热门 Token 的逐 Token-Account 当前态表；支持用 tombstone 覆盖已关闭账户';
+
+-- ============================================================
+-- hot_wallet_token_balance
+-- L3 服务聚合：每个 钱包 × 热门 Token 仅一行的当前持仓。
+--
+-- 用途：
+-- 1. 快速查询某钱包持有的所有热门普通 Token；
+-- 2. 快速查询某一个热门 Token 的 Top-N holder；
+-- 3. 避免服务层每次请求扫描并聚合多个 Token Account。
+-- ============================================================
+CREATE TABLE solana.hot_wallet_token_balance
+(
+    mint         String
+                 COMMENT 'Token mint 地址；与 owner 共同唯一标识一条钱包级持仓',
+
+    owner        String
+                 COMMENT '钱包地址；一个钱包针对同一 mint 的多个 Token Account 已在 amount_raw 中汇总',
+
+    amount_raw   UInt64
+                 COMMENT '钱包对该 mint 的总持仓，最小单位整数；等于所有有效 Token Account 的 amount 之和',
+
+    updated_slot UInt64
+                 COMMENT '构成该聚合结果的 Token Account 中最大 updated_slot；用于观察数据新鲜度，不作为精确聚合版本语义'
 )
 ENGINE = MergeTree
-ORDER BY mint
-COMMENT '外部查询的热点 token mint 集合，用于筛选 raw_* 表中的子集';
+ORDER BY (mint, amount_raw DESC, owner)
+COMMENT 'L3：热门 Token 的钱包级当前余额表；主排序直接服务指定 mint 的 holder Top-N 查询';
 
--- 已有表只增加 schema 时可执行：
--- ALTER TABLE solana.raw_token_metadata
---     ADD COLUMN IF NOT EXISTS token_standard Nullable(UInt8) AFTER is_mutable;
--- 这只会让历史行显示 NULL。若需要补齐历史 token_standard，须从新的全量
--- snapshot 重建/重灌 raw_token_metadata，因为 L1 表不保留 metadata 原始 bytes。
+ALTER TABLE solana.hot_wallet_token_balance
+    ADD PROJECTION proj_by_owner
+    (
+        SELECT
+            mint,
+            owner,
+            amount_raw,
+            updated_slot
+        ORDER BY (owner, mint)
+    );
+
+ALTER TABLE solana.hot_wallet_token_balance
+    MATERIALIZE PROJECTION proj_by_owner;
+
+
+-- ============================================================
+-- hot_token_info
+-- L2 展示信息：启用热门 Token 的 mint 和 metadata 当前信息。
+--
+-- 用途：
+-- 1. 为钱包资产列表、Token holder 榜单提供名称、symbol、小数位等展示字段；
+-- 2. 避免下游服务再 JOIN 数亿级 raw_token_mint/raw_token_metadata；
+-- 3. 与同组 hot_wallet_token_balance 联合使用，保证切换时数据代际一致。
+-- ============================================================
+
+CREATE TABLE solana.hot_token_info
+(
+    mint             String COMMENT 'Token mint 地址；本表业务主键，仅存启用的热门 Token',
+    decimals         UInt8 COMMENT '小数位数；amount_raw / 10^decimals 为展示数量',
+    supply_raw       UInt64 COMMENT '当前总供应量，最小单位整数',
+    name             String COMMENT 'Token 名称；无 Metaplex metadata 时为空字符串',
+    symbol           String COMMENT 'Token 符号；无 Metaplex metadata 时为空字符串',
+    uri              String COMMENT 'Metaplex metadata URI；无 metadata 时为空字符串',
+    token_standard   Nullable(UInt8) COMMENT 'Metaplex TokenStandard；无 metadata 或未设置时为 NULL',
+    mint_updated_slot UInt64 COMMENT 'raw_token_mint 当前版本的更新 slot',
+    metadata_updated_slot UInt64 COMMENT 'raw_token_metadata 当前版本的更新 slot；无 metadata 时为 0',
+    updated_slot     UInt64 COMMENT '本行派生版本；等于 mint_updated_slot 与 metadata_updated_slot 的较大值'
+)
+ENGINE = ReplacingMergeTree(updated_slot)
+ORDER BY mint
+COMMENT 'L2：热门 Token 的 mint 和 metadata 当前展示信息表，为下游展示避免扫描 raw 表';
+
+-- ============================================================
+-- 双路部署说明
+-- ============================================================
+-- 双路切换要求 raw 层和二层派生表都各有两组：不带后缀的 active 组，
+-- 以及带 `_bak` 后缀的 staging/备用组。本文件前面的 DDL 创建 active 组；
+-- 使用下面的语句创建空的备用组。CREATE TABLE ... AS 会复制字段、引擎和
+-- 排序键定义，但不会复制数据。
+
+CREATE TABLE solana.raw_account_bak AS solana.raw_account;
+CREATE TABLE solana.raw_token_mint_bak AS solana.raw_token_mint;
+CREATE TABLE solana.raw_token_account_bak AS solana.raw_token_account;
+CREATE TABLE solana.raw_token_metadata_bak AS solana.raw_token_metadata;
+CREATE TABLE solana.hot_token_info_bak AS solana.hot_token_info;
+CREATE TABLE solana.hot_wallet_token_balance_bak AS solana.hot_wallet_token_balance;
+CREATE TABLE solana.hot_token_account_state_bak AS solana.hot_token_account_state;
+
+-- 查询服务始终访问不带后缀的 active 表。后续切换使用 EXCHANGE TABLES，
+-- 每对交换原子，但多对表按顺序交换；详细的写入屏障、交换顺序和短暂跨表
+-- 不一致窗口见 hot-index-double-buffer.md。

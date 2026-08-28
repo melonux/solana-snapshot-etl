@@ -4,7 +4,7 @@ use clickhouse::{Client, Row};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::{debug, error, warn};
 use percent_encoding::percent_decode_str;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use solana_sdk::program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
 use solana_snapshot_etl::append_vec::{AppendVec, StoredAccountMeta};
@@ -30,9 +30,8 @@ const TOKEN_METADATA_TABLE: &str = "raw_token_metadata";
 // RowBinary stream regularly, so sparse derived tables cannot leave an idle chunked request open
 // long enough for ClickHouse or a reverse proxy to close it.
 // ClickHouse's MergeTree merger is storage-bound. Bigger input parts greatly
-// reduce merge amplification, especially for raw_token_account which has two
-// projections. Keep this bounded by bytes so token rows cannot grow without
-// limit in memory.
+// reduce merge amplification. Keep this bounded by bytes so token rows cannot
+// grow without limit in memory.
 const MAX_BATCH_ROWS: u64 = 1_000_000;
 const MAX_BATCH_BYTES: u64 = 256 * 1024 * 1024;
 const BATCH_LIMIT_CHECK_INTERVAL: u16 = 1_024;
@@ -58,8 +57,8 @@ const IDLE_INSERT_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 const HTTP_RECEIVE_TIMEOUT_SECS: &str = "600";
 const HTTP_RECEIVE_TIMEOUT: Duration = Duration::from_secs(600);
 // A ClickHouse INSERT is not finished when the client has uploaded the
-// RowBinary body: MergeTree still has to build parts and (for
-// raw_token_account) two projections before returning HTTP 200.  The permit
+// RowBinary body: MergeTree still has to build parts before returning HTTP 200.
+// The permit
 // limits the number of finalizations, but it must not be smaller than the
 // number of parser workers: an Inserter has already opened its HTTP request
 // while rows are being serialized, so a worker waiting behind a single permit
@@ -773,6 +772,431 @@ pub(crate) async fn max_raw_account_updated_slot(connection_url: &str) -> Result
         .fetch_one::<u64>()
         .await
         .map_err(Into::into)
+}
+
+#[derive(Row, Deserialize)]
+struct SystemTableRow {
+    name: String,
+    engine: String,
+    sorting_key: String,
+    engine_full: String,
+}
+
+#[derive(Row, Deserialize)]
+struct SystemColumnRow {
+    table: String,
+    name: String,
+    r#type: String,
+}
+
+#[derive(Row, Deserialize)]
+struct SystemProjectionRow {
+    table: String,
+    name: String,
+}
+
+/// Validate the schema required by the dual-buffer importer before any
+/// snapshot bytes are read.  The active tables use their stable names and the
+/// staging tables use the `_bak` suffix; both groups must have identical
+/// schemas because either group can become active after EXCHANGE TABLES.
+pub(crate) async fn validate_clickhouse_schema(connection_url: &str) -> Result<()> {
+    let client = new_clickhouse_client(connection_url)?;
+    let required_tables = required_table_names();
+    let table_list = sql_string_list(&required_tables);
+    let table_rows = client
+        .query(&format!(
+            "SELECT name, engine, sorting_key, engine_full FROM system.tables WHERE database = '{DATABASE}' AND name IN ({table_list})"
+        ))
+        .fetch_all::<SystemTableRow>()
+        .await
+        .map_err(|err| format!("ClickHouse schema check failed while reading system.tables: {err}"))?;
+
+    let mut table_definitions = HashMap::with_capacity(table_rows.len());
+    for row in table_rows {
+        table_definitions.insert(row.name.clone(), row);
+    }
+
+    let mut errors = Vec::new();
+    for spec in required_table_specs() {
+        match table_definitions.get(spec.name) {
+            None => errors.push(format!("missing table solana.{}", spec.name)),
+            Some(definition) => {
+                if definition.engine != spec.engine {
+                    errors.push(format!(
+                        "table solana.{} uses engine {}, expected {}",
+                        spec.name, definition.engine, spec.engine
+                    ));
+                }
+                if !definition.engine_full.starts_with(spec.engine_full_prefix) {
+                    errors.push(format!(
+                        "table solana.{} uses engine definition {}, expected prefix {}",
+                        spec.name, definition.engine_full, spec.engine_full_prefix
+                    ));
+                }
+                if !spec.sorting_key.is_empty() && definition.sorting_key != spec.sorting_key {
+                    errors.push(format!(
+                        "table solana.{} uses sorting key {}, expected {}",
+                        spec.name, definition.sorting_key, spec.sorting_key
+                    ));
+                }
+            }
+        }
+    }
+
+    let column_rows = client
+        .query(&format!(
+            "SELECT table, name, type FROM system.columns WHERE database = '{DATABASE}' AND table IN ({table_list})"
+        ))
+        .fetch_all::<SystemColumnRow>()
+        .await
+        .map_err(|err| format!("ClickHouse schema check failed while reading system.columns: {err}"))?;
+    let columns = column_rows
+        .into_iter()
+        .map(|row| ((row.table, row.name), row.r#type))
+        .collect::<HashMap<_, _>>();
+
+    for (table, column, expected_type) in required_columns() {
+        let actual_table = table.to_owned();
+        let Some(actual_type) = columns.get(&(actual_table.clone(), column.to_owned())) else {
+            errors.push(format!("missing column solana.{actual_table}.{column}"));
+            continue;
+        };
+        if !actual_type_matches(actual_type, expected_type) {
+            errors.push(format!(
+                "column solana.{actual_table}.{column} uses type {actual_type}, expected {expected_type}"
+            ));
+        }
+    }
+
+    let projection_rows = client
+        .query(&format!(
+            "SELECT table, name FROM system.projections WHERE database = '{DATABASE}' AND table IN ({table_list})"
+        ))
+        .fetch_all::<SystemProjectionRow>()
+        .await
+        .map_err(|err| {
+            format!(
+                "ClickHouse schema check failed while reading system.projections: {err}"
+            )
+        })?;
+    let projections = projection_rows
+        .into_iter()
+        .map(|row| (row.table, row.name))
+        .collect::<std::collections::HashSet<_>>();
+    for table in ["hot_wallet_token_balance", "hot_wallet_token_balance_bak"] {
+        if !projections.contains(&(table.to_owned(), "proj_by_owner".to_owned())) {
+            errors.push(format!("missing projection solana.{table}.proj_by_owner"));
+        }
+    }
+
+    if errors.is_empty() {
+        debug!(
+            "[clickhouse] Schema validation passed: {} tables, required columns, and wallet projections",
+            required_tables.len()
+        );
+        Ok(())
+    } else {
+        errors.sort_unstable();
+        Err(format!(
+            "ClickHouse schema validation failed; refusing to process snapshots:\n{}",
+            errors
+                .into_iter()
+                .map(|error| format!("  - {error}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+        .into())
+    }
+}
+
+fn required_table_names() -> Vec<String> {
+    required_table_specs()
+        .into_iter()
+        .map(|spec| spec.name.to_owned())
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+struct RequiredTableSpec {
+    name: &'static str,
+    engine: &'static str,
+    engine_full_prefix: &'static str,
+    sorting_key: &'static str,
+}
+
+fn required_table_specs() -> Vec<RequiredTableSpec> {
+    vec![
+        RequiredTableSpec {
+            name: "raw_account",
+            engine: "ReplacingMergeTree",
+            engine_full_prefix: "ReplacingMergeTree(updated_slot)",
+            sorting_key: "owner, pubkey",
+        },
+        RequiredTableSpec {
+            name: "raw_token_account",
+            engine: "ReplacingMergeTree",
+            engine_full_prefix: "ReplacingMergeTree(updated_slot, is_deleted)",
+            sorting_key: "pubkey",
+        },
+        RequiredTableSpec {
+            name: "raw_token_mint",
+            engine: "ReplacingMergeTree",
+            engine_full_prefix: "ReplacingMergeTree(updated_slot)",
+            sorting_key: "mint",
+        },
+        RequiredTableSpec {
+            name: "raw_token_metadata",
+            engine: "ReplacingMergeTree",
+            engine_full_prefix: "ReplacingMergeTree(updated_slot)",
+            sorting_key: "mint",
+        },
+        RequiredTableSpec {
+            name: "raw_account_bak",
+            engine: "ReplacingMergeTree",
+            engine_full_prefix: "ReplacingMergeTree(updated_slot)",
+            sorting_key: "owner, pubkey",
+        },
+        RequiredTableSpec {
+            name: "raw_token_account_bak",
+            engine: "ReplacingMergeTree",
+            engine_full_prefix: "ReplacingMergeTree(updated_slot, is_deleted)",
+            sorting_key: "pubkey",
+        },
+        RequiredTableSpec {
+            name: "raw_token_mint_bak",
+            engine: "ReplacingMergeTree",
+            engine_full_prefix: "ReplacingMergeTree(updated_slot)",
+            sorting_key: "mint",
+        },
+        RequiredTableSpec {
+            name: "raw_token_metadata_bak",
+            engine: "ReplacingMergeTree",
+            engine_full_prefix: "ReplacingMergeTree(updated_slot)",
+            sorting_key: "mint",
+        },
+        RequiredTableSpec {
+            name: "hot_token",
+            engine: "ReplacingMergeTree",
+            engine_full_prefix: "ReplacingMergeTree(version)",
+            sorting_key: "mint",
+        },
+        RequiredTableSpec {
+            name: "hot_token_enabled",
+            engine: "View",
+            engine_full_prefix: "View",
+            sorting_key: "",
+        },
+        RequiredTableSpec {
+            name: "hot_index_control",
+            engine: "ReplacingMergeTree",
+            engine_full_prefix: "ReplacingMergeTree(generation)",
+            sorting_key: "control_key",
+        },
+        RequiredTableSpec {
+            name: "hot_token_account_state",
+            engine: "ReplacingMergeTree",
+            engine_full_prefix: "ReplacingMergeTree(updated_slot, is_deleted)",
+            sorting_key: "pubkey",
+        },
+        RequiredTableSpec {
+            name: "hot_token_account_state_bak",
+            engine: "ReplacingMergeTree",
+            engine_full_prefix: "ReplacingMergeTree(updated_slot, is_deleted)",
+            sorting_key: "pubkey",
+        },
+        RequiredTableSpec {
+            name: "hot_wallet_token_balance",
+            engine: "MergeTree",
+            engine_full_prefix: "MergeTree",
+            sorting_key: "mint, amount_raw, owner",
+        },
+        RequiredTableSpec {
+            name: "hot_wallet_token_balance_bak",
+            engine: "MergeTree",
+            engine_full_prefix: "MergeTree",
+            sorting_key: "mint, amount_raw, owner",
+        },
+        RequiredTableSpec {
+            name: "hot_token_info",
+            engine: "ReplacingMergeTree",
+            engine_full_prefix: "ReplacingMergeTree(updated_slot)",
+            sorting_key: "mint",
+        },
+        RequiredTableSpec {
+            name: "hot_token_info_bak",
+            engine: "ReplacingMergeTree",
+            engine_full_prefix: "ReplacingMergeTree(updated_slot)",
+            sorting_key: "mint",
+        },
+    ]
+}
+
+fn required_columns() -> Vec<(&'static str, &'static str, &'static str)> {
+    const RAW_ACCOUNT: &[(&str, &str)] = &[
+        ("pubkey", "String"),
+        ("owner", "LowCardinality(String)"),
+        ("lamports", "UInt64"),
+        ("data_len", "UInt64"),
+        ("executable", "Bool"),
+        ("updated_slot", "UInt64"),
+    ];
+    const RAW_TOKEN_ACCOUNT: &[(&str, &str)] = &[
+        ("pubkey", "String"),
+        ("mint", "String"),
+        ("owner", "String"),
+        ("amount", "UInt64"),
+        ("delegate", "Nullable(String)"),
+        ("delegated_amount", "UInt64"),
+        ("state", "Enum8"),
+        ("close_authority", "Nullable(String)"),
+        ("is_deleted", "UInt8"),
+        ("updated_slot", "UInt64"),
+    ];
+    const RAW_TOKEN_MINT: &[(&str, &str)] = &[
+        ("mint", "String"),
+        ("mint_authority", "Nullable(String)"),
+        ("supply", "UInt64"),
+        ("decimals", "UInt8"),
+        ("is_initialized", "Bool"),
+        ("freeze_authority", "Nullable(String)"),
+        ("updated_slot", "UInt64"),
+    ];
+    const RAW_TOKEN_METADATA: &[(&str, &str)] = &[
+        ("mint", "String"),
+        ("name", "String"),
+        ("symbol", "String"),
+        ("uri", "String"),
+        ("update_authority", "LowCardinality(String)"),
+        ("is_mutable", "Bool"),
+        ("token_standard", "Nullable(UInt8)"),
+        ("seller_fee_basis_points", "UInt16"),
+        ("creators", "Array(String)"),
+        ("updated_slot", "UInt64"),
+    ];
+    const HOT_TOKEN: &[(&str, &str)] = &[
+        ("mint", "String"),
+        ("enable", "UInt8"),
+        ("version", "UInt64"),
+    ];
+    const HOT_INDEX_CONTROL: &[(&str, &str)] = &[
+        ("control_key", "LowCardinality(String)"),
+        ("active_group", "UInt8"),
+        ("generation", "UInt64"),
+        ("ready_slot", "UInt64"),
+        ("hot_token_version", "UInt64"),
+        ("updated_at", "DateTime64"),
+    ];
+    const HOT_TOKEN_ACCOUNT_STATE: &[(&str, &str)] = &[
+        ("pubkey", "String"),
+        ("mint", "String"),
+        ("owner", "String"),
+        ("amount", "UInt64"),
+        ("state", "Enum8"),
+        ("is_deleted", "UInt8"),
+        ("updated_slot", "UInt64"),
+    ];
+    const HOT_WALLET_TOKEN_BALANCE: &[(&str, &str)] = &[
+        ("mint", "String"),
+        ("owner", "String"),
+        ("amount_raw", "UInt64"),
+        ("updated_slot", "UInt64"),
+    ];
+    const HOT_TOKEN_INFO: &[(&str, &str)] = &[
+        ("mint", "String"),
+        ("decimals", "UInt8"),
+        ("supply_raw", "UInt64"),
+        ("name", "String"),
+        ("symbol", "String"),
+        ("uri", "String"),
+        ("token_standard", "Nullable(UInt8)"),
+        ("mint_updated_slot", "UInt64"),
+        ("metadata_updated_slot", "UInt64"),
+        ("updated_slot", "UInt64"),
+    ];
+
+    let mut required = Vec::new();
+    for table in ["raw_account", "raw_account_bak"] {
+        required.extend(
+            RAW_ACCOUNT
+                .iter()
+                .map(|(column, expected)| (table, *column, *expected)),
+        );
+    }
+    for table in ["raw_token_account", "raw_token_account_bak"] {
+        required.extend(
+            RAW_TOKEN_ACCOUNT
+                .iter()
+                .map(|(column, expected)| (table, *column, *expected)),
+        );
+    }
+    for table in ["raw_token_mint", "raw_token_mint_bak"] {
+        required.extend(
+            RAW_TOKEN_MINT
+                .iter()
+                .map(|(column, expected)| (table, *column, *expected)),
+        );
+    }
+    for table in ["raw_token_metadata", "raw_token_metadata_bak"] {
+        required.extend(
+            RAW_TOKEN_METADATA
+                .iter()
+                .map(|(column, expected)| (table, *column, *expected)),
+        );
+    }
+    required.extend(
+        HOT_TOKEN
+            .iter()
+            .map(|(column, expected)| ("hot_token", *column, *expected)),
+    );
+    required.extend(
+        HOT_INDEX_CONTROL
+            .iter()
+            .map(|(column, expected)| ("hot_index_control", *column, *expected)),
+    );
+    for table in ["hot_token_account_state", "hot_token_account_state_bak"] {
+        required.extend(
+            HOT_TOKEN_ACCOUNT_STATE
+                .iter()
+                .map(|(column, expected)| (table, *column, *expected)),
+        );
+    }
+    for table in ["hot_wallet_token_balance", "hot_wallet_token_balance_bak"] {
+        required.extend(
+            HOT_WALLET_TOKEN_BALANCE
+                .iter()
+                .map(|(column, expected)| (table, *column, *expected)),
+        );
+    }
+    for table in ["hot_token_info", "hot_token_info_bak"] {
+        required.extend(
+            HOT_TOKEN_INFO
+                .iter()
+                .map(|(column, expected)| (table, *column, *expected)),
+        );
+    }
+    required.extend([
+        ("hot_token_enabled", "mint", "String"),
+        ("hot_token_enabled", "version", "UInt64"),
+    ]);
+    required
+}
+
+fn actual_type_matches(actual: &str, expected: &str) -> bool {
+    if expected == "Enum8" {
+        actual.starts_with("Enum8")
+    } else if expected == "DateTime64" {
+        actual.starts_with("DateTime64")
+    } else {
+        actual == expected
+    }
+}
+
+fn sql_string_list(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("'{}'", value.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn parse_clickhouse_connection_url(connection_url: &str) -> Result<ClickhouseConnection> {

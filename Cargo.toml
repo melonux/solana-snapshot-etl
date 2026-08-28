@@ -66,8 +66,3 @@ required-features = ["standalone"]
 [[bin]]
 name = "solana-opcode-stats"
 required-features = ["opcode_stats"]
-
-[[bin]]
-name = "import_hot_token"
-path = "src/bin/import_hot_token/main.rs"
-required-features = ["standalone"]

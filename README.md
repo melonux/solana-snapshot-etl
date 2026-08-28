@@ -136,6 +136,11 @@ CLICKHOUSE_URL=http://user:password@clickhouse.example:8123
 # Percent-encode URL-reserved characters in username or password, for example @ as %40.
 ```
 
+When ClickHouse output is enabled, the importer validates the required active and `_bak` tables,
+column types, engines, and wallet-balance projections at startup before reading the snapshot. A
+schema error stops the process without starting a partial import. The dual-buffer lifecycle and
+stable table names are described in [`docs/hot-index-double-buffer.md`](docs/hot-index-double-buffer.md).
+
 Run the importer with `--clickhouse`:
 
 ```shell

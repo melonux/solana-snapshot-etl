@@ -1,5 +1,6 @@
 use crate::clickhouse::{
-    max_raw_account_updated_slot, ClickhouseIndexer, CloseTombstoneStats, SnapshotKind,
+    max_raw_account_updated_slot, validate_clickhouse_schema, ClickhouseIndexer,
+    CloseTombstoneStats, SnapshotKind,
 };
 use clap::{ArgGroup, Parser};
 use env_logger::{Builder, Env, Target};
@@ -198,10 +199,14 @@ fn _main(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         if args.incremental_poll_interval_secs == 0 {
             return Err("--incremental-poll-interval-secs must be greater than zero".into());
         }
+        validate_clickhouse_prerequisites()?;
         return run_incremental_snapshots(&args, directory);
     }
     if args.bootstrap {
         return Err("--bootstrap requires --incremental-snapshot-dir".into());
+    }
+    if args.clickhouse || args.clickhouse_close_tombstones {
+        validate_clickhouse_prerequisites()?;
     }
 
     let source = args
@@ -210,6 +215,18 @@ fn _main(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("a snapshot source is required")?;
     let mut loader = SupportedLoader::new(source, Box::new(LoadProgressTracking {}))?;
     process_single_snapshot(&args, &mut loader)
+}
+
+fn validate_clickhouse_prerequisites() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
+    let clickhouse_url = std::env::var("CLICKHOUSE_URL")
+        .map_err(|_| "CLICKHOUSE_URL must be set in the environment or .env file")?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime
+        .block_on(validate_clickhouse_schema(&clickhouse_url))
+        .map_err(Into::into)
 }
 
 fn process_single_snapshot(
