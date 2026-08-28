@@ -827,7 +827,9 @@ pub(crate) async fn validate_clickhouse_schema(connection_url: &str) -> Result<(
                         spec.name, definition.engine, spec.engine
                     ));
                 }
-                if !definition.engine_full.starts_with(spec.engine_full_prefix) {
+                if !spec.engine_full_prefix.is_empty()
+                    && !definition.engine_full.starts_with(spec.engine_full_prefix)
+                {
                     errors.push(format!(
                         "table solana.{} uses engine definition {}, expected prefix {}",
                         spec.name, definition.engine_full, spec.engine_full_prefix
@@ -983,7 +985,8 @@ fn required_table_specs() -> Vec<RequiredTableSpec> {
         RequiredTableSpec {
             name: "hot_token_enabled",
             engine: "View",
-            engine_full_prefix: "View",
+            // ClickHouse reports an empty engine_full for a regular View.
+            engine_full_prefix: "",
             sorting_key: "",
         },
         RequiredTableSpec {
