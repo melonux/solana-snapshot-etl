@@ -1619,7 +1619,10 @@ pub(crate) async fn validate_clickhouse_schema(connection_url: &str) -> Result<(
                         spec.name, definition.engine_full, spec.engine_full_prefix
                     ));
                 }
-                if !spec.sorting_key.is_empty() && definition.sorting_key != spec.sorting_key {
+                if !spec.sorting_key.is_empty()
+                    && normalize_sorting_key(&definition.sorting_key)
+                        != normalize_sorting_key(spec.sorting_key)
+                {
                     errors.push(format!(
                         "table solana.{} uses sorting key {}, expected {}",
                         spec.name, definition.sorting_key, spec.sorting_key
@@ -1664,7 +1667,10 @@ pub(crate) async fn validate_clickhouse_schema(connection_url: &str) -> Result<(
 
     let projection_rows = client
         .query(&format!(
-            "SELECT table, name, sorting_key FROM system.projections WHERE database = '{DATABASE}' AND table IN ({table_list})"
+            // `system.projections.sorting_key` is Nullable/String-like across
+            // ClickHouse versions.  Force a non-null String in the result so
+            // clickhouse-rs RowBinary decoding remains stable.
+            "SELECT table, name, toString(sorting_key) AS sorting_key FROM system.projections WHERE database = '{DATABASE}' AND table IN ({table_list})"
         ))
         .fetch_all::<SystemProjectionRow>()
         .await
@@ -1685,7 +1691,10 @@ pub(crate) async fn validate_clickhouse_schema(connection_url: &str) -> Result<(
             let key = (table.to_owned(), projection.to_owned());
             match projections.get(&key) {
                 None => errors.push(format!("missing projection solana.{table}.{projection}")),
-                Some(actual_sorting_key) if actual_sorting_key != expected_sorting_key => {
+                Some(actual_sorting_key)
+                    if normalize_sorting_key(actual_sorting_key)
+                        != normalize_sorting_key(expected_sorting_key) =>
+                {
                     errors.push(format!(
                         "projection solana.{table}.{projection} uses sorting key {actual_sorting_key}, expected {expected_sorting_key}"
                     ));
@@ -1748,6 +1757,21 @@ fn table_has_rebuild_projection_mode(create_table_query: &str) -> bool {
         .filter(|ch| !ch.is_ascii_whitespace())
         .collect::<String>();
     normalized.contains("deduplicate_merge_projection_mode='rebuild'")
+}
+
+fn normalize_sorting_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| {
+            !ch.is_ascii_whitespace()
+                && *ch != '('
+                && *ch != ')'
+                && *ch != '['
+                && *ch != ']'
+                && *ch != '\''
+                && *ch != '"'
+        })
+        .collect()
 }
 
 fn required_table_specs() -> Vec<RequiredTableSpec> {
@@ -3155,6 +3179,18 @@ mod tests {
     fn only_incremental_archives_collect_close_tombstones() {
         assert!(!SnapshotKind::Full.collect_close_tombstones());
         assert!(SnapshotKind::Incremental.collect_close_tombstones());
+    }
+
+    #[test]
+    fn normalizes_clickhouse_projection_sorting_key_formats() {
+        assert_eq!(
+            normalize_sorting_key("['mint','amount_raw','owner']"),
+            normalize_sorting_key("mint, amount_raw, owner")
+        );
+        assert_eq!(
+            normalize_sorting_key("(owner, mint)"),
+            normalize_sorting_key("owner, mint")
+        );
     }
 
     #[test]
