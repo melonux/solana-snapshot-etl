@@ -84,7 +84,7 @@ ORDER BY pubkey
 
 同一 `pubkey` 的最新版本由 `updated_slot` 决定，CloseAccount 由更高 slot 的 `is_deleted = 1` tombstone 表示。强一致当前态查询需要 `FINAL` 并过滤 `is_deleted = 0`。
 
-全量归档不包含历史 tombstone；增量归档包含 tombstone。新组从全量冷启动后，再连续应用其后的增量，删除状态只需要在本次全量周期内正确传播。
+全量归档不包含历史 tombstone；增量归档包含 tombstone。新组从全量冷启动后，再连续应用其后的增量，删除状态只需要在本次全量周期内正确传播。全量归档本身已是当前态，因此全量导入后的 L2 回填直接扫描 raw 表，不执行 `FINAL`；后续增量只将变化版本和 tombstone 追加到 L2，由 L2 自身的 `ReplacingMergeTree` 负责版本覆盖。
 
 ### 3.2 热门 Token 状态层
 
@@ -104,18 +104,81 @@ ORDER BY pubkey
 
 表的排序键 `(mint, amount_raw DESC, owner)` 服务指定 Token 的 Top-N；owner projection 服务指定钱包的资产列表。`amount_raw` 始终保留最小单位整数，展示时再结合 `hot_token_info.decimals` 或 `hot_token_info_bak.decimals` 换算。
 
+全量阶段的 L3 聚合也直接读取刚建立的 L2 当前态，不做 `FINAL`。聚合使用 `max_bytes_before_external_group_by` / `max_bytes_before_external_sort` 的 1 GiB 阈值：高基数的 `(mint, owner)` 中间状态会溢写到 ClickHouse 临时磁盘，而不是占满服务器内存。因此部署时必须为 ClickHouse 的临时目录预留空间。
+
 ## 4. 生命周期
 
 ### 4.1 初次冷启动
 
 初次部署时先构建无后缀 active 组：
 
-1. 清空并确认无后缀 raw 表和二层表为空；
-2. 以 `resume_slot = 0` 导入一个可用的全量快照；
-3. 按全量之后的增量顺序写入 active 组；
+1. 暂停 active 组四张 raw 表的后台 Merge；
+2. 清空并确认无后缀 raw 表和二层表为空；
+3. 以 `resume_slot = 0` 导入一个可用的全量快照；
 4. 构建并刷新 active 组的热门 Token 状态、钱包余额和 Token 信息；
-5. 创建空的 `_bak` 组；
-6. 将 `hot_index_control` 写成当前切换代数并记录 `ready_slot`，用于内部审计。
+5. 确认全量和二层刷新全部成功后，恢复 active 组 raw 表的后台 Merge；如果失败则保持暂停并退出，等待清理后重新冷启动；
+6. 按全量之后的增量顺序写入 active 组；
+7. 创建空的 `_bak` 组；
+8. 将 `hot_index_control` 写成当前切换代数并记录 `ready_slot`，用于内部审计。
+
+### 4.1.1 全量冷启动期间的 Merge 控制
+
+全量快照导入是追加写入最密集的阶段。`ReplacingMergeTree` 的后台 Merge 会同时消耗 CPU 和磁盘 IO，并可能让其他较稀疏的 HTTP RowBinary INSERT 流超过 ClickHouse 的接收空闲超时。因此，编排器只在全量冷启动期间暂停目标组的四张 raw 表：
+
+```sql
+SYSTEM STOP MERGES solana.raw_account;
+SYSTEM STOP MERGES solana.raw_token_account;
+SYSTEM STOP MERGES solana.raw_token_mint;
+SYSTEM STOP MERGES solana.raw_token_metadata;
+```
+
+新一轮全量构建 `_bak` 时只暂停 `_bak` 表；无后缀 active 组继续 Merge 并对外服务：
+
+```sql
+SYSTEM STOP MERGES solana.raw_account_bak;
+SYSTEM STOP MERGES solana.raw_token_account_bak;
+SYSTEM STOP MERGES solana.raw_token_mint_bak;
+SYSTEM STOP MERGES solana.raw_token_metadata_bak;
+```
+
+只有在全量导入和该组二层刷新全部成功、即将进入增量阶段时，才恢复后台 Merge：
+
+```sql
+SYSTEM START MERGES solana.raw_account_bak;
+SYSTEM START MERGES solana.raw_token_account_bak;
+SYSTEM START MERGES solana.raw_token_mint_bak;
+SYSTEM START MERGES solana.raw_token_metadata_bak;
+```
+
+如果 bootstrap 的解析、ClickHouse 导入、重置或二层刷新失败，则不执行 `SYSTEM START MERGES`，程序直接失败退出；该组数据必须清理后重新冷启动。如果失败发生在已经服役 active 的情况下（即 `_bak` staging），则只告警并清理 `_bak`，保持 active 继续服务，在主循环中重试全量，不影响 active 的增量更新。
+
+暂停 Merge 不会中断已经运行的 Merge，只阻止新的后台 Merge；INSERT 自身仍然需要压缩、写盘和创建 part。暂停期间会累积 parts，因此只能用于短期冷启动，不能在正常增量阶段长期保持。ClickHouse 的 `parts_to_delay_insert` / `parts_to_throw_insert` 阈值仍然有效，必须持续监控：
+
+```sql
+SELECT table, count() AS active_parts, sum(rows) AS rows
+FROM system.parts
+WHERE database = 'solana' AND active = 1
+GROUP BY table
+ORDER BY active_parts DESC;
+```
+
+当前程序在每个全量路径开始前自动执行 `SYSTEM STOP MERGES`；只有全量及二层刷新成功后才执行 `SYSTEM START MERGES`，并在日志中记录组名和操作结果。bootstrap 失败路径保持 Merge 暂停并退出；staging 失败路径保持 `_bak` Merge 暂停、清理后重试。恢复 Merge 后不强制执行 `OPTIMIZE FINAL`；让后台逐步追赶，避免再次制造一次性的 CPU/IO 峰值。全量 raw 是规范当前态，L2 回填和 mint/metadata 信息回填均不使用 `FINAL`；增量路径在需要读取 L2 当前态作钱包聚合时才使用 `FINAL`，并将聚合中间结果限制为可溢写到临时磁盘。
+
+该控制只覆盖全量冷启动。正常增量阶段不主动暂停或恢复 Merge；增量写入失败时沿用原有的失败即停止和按 active 最大 slot 重启续传策略。
+
+### 4.1.2. raw 已完成、hot 刷新失败时的修复
+
+全量 raw 写入和 hot 派生刷新是两个阶段。若日志显示 raw 已提交、但旧版本在 `ReplacingSorted`/`FINAL` 或构建 Join 右侧哈希表时因 ClickHouse 内存上限（`Code: 241 MEMORY_LIMIT_EXCEEDED`）失败，不需要再次解析或导入快照。使用一次性修复动作：
+
+```shell
+solana-snapshot-etl --clickhouse-rebuild-hot
+# 仓库中的辅助脚本也支持：
+./run.sh --clickhouse-rebuild-hot
+```
+
+该动作只读取现有无后缀 active raw 表，先暂停 active raw Merge，再重建三张 active hot 表；不会读取快照、不会清空或重灌 raw，也不会触碰 `_bak`。全量基线的 L2 回填不使用 `FINAL`；`hot_token_info` 按每批 10,000 个、按 mint 排序的连续范围构建，避免把完整 raw mint/metadata 表装入一个 Join 哈希表；余额聚合允许在 1 GiB 后溢写临时磁盘。三张表全部成功后才恢复 active raw Merge。若重建再次失败，程序退出并保持 Merge 暂停，便于先调整 ClickHouse 内存、临时磁盘或并发设置后重试；不能把不完整的 hot 结果当作成功状态继续追加增量。
+
+修复成功后，正常 watcher 应在不带 `--bootstrap` 的情况下启动，以 active raw 最大 slot 续传增量。仓库 `run.sh` 默认就是续传模式；只有首次建立空库时才显式追加 `./run.sh --bootstrap`。
 
 ### 4.2 正常增量阶段
 
@@ -132,14 +195,16 @@ ORDER BY pubkey
 当发现新的全量快照时，使用带 `_bak` 后缀的表作为 staging：
 
 1. 确认 `_bak` 表当前没有被查询服务使用；
-2. 清空所有 raw 和二层 `_bak` 表；
-3. 用 `resume_slot = 0` 将新全量完整导入 `_bak` 组；
-4. 记录该全量的 slot 作为 staging 基线；
-5. 继续把基线之后的增量应用到 `_bak` 组。
+2. 暂停 `_bak` 组四张 raw 表的后台 Merge；
+3. 清空所有 raw 和二层 `_bak` 表；
+4. 用 `resume_slot = 0` 将新全量完整导入 `_bak` 组；
+5. 完成该全量及二层刷新且确认成功后恢复 `_bak` raw 表的后台 Merge；失败时保持暂停，由主循环清理后重试，不影响 active；
+6. 记录该全量的 slot 作为 staging 基线；
+7. 继续把基线之后的增量应用到 `_bak` 组。
 
 在 `_bak` 重建期间，无后缀 active 表不能停服，继续接收新增量；同时由另一条独立的 staging 消费路径把全量之后的增量写入 `_bak`。两条路径互不扇出写入，各自维护自己的快照水位。
 
-两组都必须按相同的快照顺序推进，并记录各自最后成功的 `ready_slot`。如果 staging 导入失败，只保留 active 组继续服务，修复后清理 staging 组再重试。
+两组都必须按相同的快照顺序推进，并记录各自最后成功的 `ready_slot`。如果 staging 导入、解析或二层刷新失败，只保留 active 组继续服务；程序给出警告，保持 `_bak` raw Merge 暂停，清理 `_bak` 七张表后自动重试该全量，不退出主循环。若清理本身失败，下一轮重试时会再次尝试清理。
 
 ### 4.4 追平与切换
 
@@ -205,6 +270,8 @@ TRUNCATE TABLE solana.hot_wallet_token_balance_bak SETTINGS max_table_size_to_dr
 
 `hot_token` 是单份外部配置表，同一 mint 的变更通过递增 `version` 表示。构建一个 staging 组时，需要固定本轮使用的热门 Token 集合，否则构建期间新增或禁用 Token 会让同组表出现代际混合。
 
+当前实现默认不阻塞 `hot_token` 写入，而是在每个快照刷新前计算启用集合指纹；指纹变化时会对该组的 L2 状态执行一次全量回填，再重建 L3。因此配置变更最终会自动生效。若要求一次全量构建期间严格固定集合，仍可在外部配置层冻结 `hot_token` 写入。
+
 有两种实现方式：
 
 1. 在 staging 构建期间暂时冻结 `hot_token` 变更；
@@ -248,6 +315,8 @@ LIMIT {n};
 ## 7. 运行约束与校验
 
 - 两组 raw 和二层表必须使用同一套 schema、引擎和 Projection 定义。
+- 全量冷启动期间只暂停目标组四张 raw 表的后台 Merge；active 服役组在 staging 构建期间继续 Merge。
+- 只有冷启动和二层刷新全部成功后才恢复目标组 raw 表的 Merge；bootstrap 失败时保持暂停并退出，staging 失败时保持 `_bak` 暂停、清理后重试；暂停期间监控 `system.parts`，防止触发 parts 延迟/拒绝阈值。
 - 清空操作只能针对非 active 的 `_bak` 组执行，并且必须在 5 分钟回滚窗口结束后使用 `TRUNCATE TABLE ... SETTINGS max_table_size_to_drop = 0`。
 - 全量重建必须从 slot 0 开始，不能沿用 active 组的 raw 水位。
 - 增量文件要按 base slot 和 ending slot 校验顺序；两组不得跨越未处理的 slot gap。
@@ -260,15 +329,18 @@ LIMIT {n};
 
 ## 8. 与现有 ETL 的衔接
 
-当前 ETL 代码中的 ClickHouse 表名常量仍使用无后缀的单路名称（例如 `raw_account`、`raw_token_account`）。完成数据库双路建表后，还需要完成以下改造，才能上线本设计：
+ETL 现在已经按本设计实现双路表组。运行时通过 `TableGroup::Active` 和
+`TableGroup::Backup` 生成稳定表名与 `_bak` 表名，所有 raw 写入、tombstone
+写入及二层刷新都携带同一个逻辑组参数。核心行为如下：
 
-1. 将输出目标抽象为逻辑组 `active | staging`，由它生成四张 raw 表和三张二层表的固定名称；
-2. 冷启动 staging 组时强制使用 `resume_slot = 0`，不能读取 active 组的 raw 水位；
-3. 增量阶段由 active 和 staging 两条独立消费者路径负责：正常阶段只运行 active 路径；新全量到达后才启动 `_bak` 路径，并从其全量基线之后开始消费增量；
-4. 每组独立记录最后成功的 snapshot slot，只有两组追平后才更新 `hot_index_control`；
-5. 所有依赖 raw 表的查询、Materialized View、Projection 和诊断 SQL 都要绑定到同一个逻辑组，不能跨组 JOIN；换名后应确认依赖仍指向对应物理表 UUID。
+1. 冷启动时清空 active 组，从 `resume_slot = 0` 导入全量；新一轮全量到达后清空 `_bak` 并从 slot 0 构建 staging；
+2. 正常增量只导入 active。staging 存在时，每个增量分别打开两次 loader，按各自水位独立写入 active 与 `_bak`；
+3. 每次 raw 导入后自动刷新 `hot_token_account_state*`、`hot_wallet_token_balance*` 和 `hot_token_info*`。增量只筛选变更 slot，钱包聚合重建自热门状态表；hot_token 版本变化会触发状态回填；L3 两张服务表先在临时克隆表中构建，再用 `EXCHANGE TABLES` 换入，避免 active 查询看到半成品；
+4. 两组 slot 追平后暂停当前派发，比较三张派生表的行数及余额总量，依次执行七对 `EXCHANGE TABLES`，更新 `hot_index_control` 审计记录，并保留旧组 5 分钟；
+5. 安全窗口结束后按 `TRUNCATE TABLE ... SETTINGS max_table_size_to_drop = 0` 清空 `_bak`，等待下一轮全量。
+6. 每轮全量冷启动时，只暂停正在接收全量的目标组 raw Merge；只有全量及二层刷新成功后才恢复。bootstrap 失败则保持暂停并退出；staging 失败则保持 `_bak` 暂停、清理后重试。active 组在 staging 冷启动期间不暂停，继续对外服务。
 
-在改造完成前，不要直接启用双路表名并恢复导入；否则旧版 ETL 只会写入无后缀 active 表，无法从 slot 0 构建 `_bak`，也无法让两条路径追平。
+程序启动时仍会先校验两组表、字段、引擎和 Projection；校验失败不会读取快照。
 
 ## 9. 程序启动前的 schema 校验
 

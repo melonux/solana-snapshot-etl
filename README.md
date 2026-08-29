@@ -100,6 +100,8 @@ solana-snapshot-etl \
   --clickhouse
 ```
 
+仓库中的 `run.sh` 默认不带 `--bootstrap`，重启时会从 active raw 的最大 slot 续传；仅首次冷启动时显式执行 `./run.sh --bootstrap`。
+
 The importer recognizes both full files named
 `snapshot-<slot>-<accounts-hash>.tar.zst` and incremental files named
 `incremental-snapshot-<base-slot>-<slot>-<accounts-hash>.tar.zst`.
@@ -140,6 +142,29 @@ When ClickHouse output is enabled, the importer validates the required active an
 column types, engines, and wallet-balance projections at startup before reading the snapshot. A
 schema error stops the process without starting a partial import. The dual-buffer lifecycle and
 stable table names are described in [`docs/hot-index-double-buffer.md`](docs/hot-index-double-buffer.md).
+
+In watch mode, normal incrementals update only the active (suffix-free) group. When a newer full
+snapshot is available, the importer resets `_bak`, cold-loads that snapshot there, and opens each
+following incremental independently for both groups. Once their slots and derived hot indexes
+match, it exchanges the seven table pairs, records the generation, keeps the old group for five
+minutes, and truncates `_bak` with `max_table_size_to_drop = 0`.
+
+If a full snapshot has already finished importing into the raw tables but the derived hot-table
+refresh failed (for example because an older build ran out of memory during `FINAL` or a large
+raw-table Join), repair only the active hot tables without reading or re-importing the snapshot:
+
+```shell
+solana-snapshot-etl --clickhouse-rebuild-hot
+# or, when using the repository helper:
+./run.sh --clickhouse-rebuild-hot
+```
+
+This action requires `CLICKHOUSE_URL`, validates the schema first, pauses active raw-table Merge,
+rebuilds `hot_token_account_state`, `hot_wallet_token_balance`, and `hot_token_info` from the
+existing raw data, and restores Merge only after all three succeed. A full raw baseline is copied
+to L2 without `FINAL`; token information is built in ordered mint batches, and the wallet
+aggregation can spill after 1 GiB of intermediate state. On failure it exits with raw Merge still
+paused so the operator can retry after adjusting ClickHouse memory or temporary-disk capacity.
 
 Run the importer with `--clickhouse`:
 

@@ -6,7 +6,7 @@ set -euo pipefail
 # faster ClickHouse host, e.g. CLICKHOUSE_WORKERS=3 ./run.sh.  Two workers is
 # the safe default when ClickHouse shares the host: more upload streams can
 # overwhelm MergeTree background merges.
-clickhouse_workers="${CLICKHOUSE_WORKERS:-4}"
+clickhouse_workers="${CLICKHOUSE_WORKERS:-1}"
 
 # Keep one watcher from accidentally importing the same snapshot stream twice.
 # The lock is released automatically when this process exits.
@@ -16,6 +16,19 @@ if ! flock -n 9; then
   echo "another solana-snapshot-etl watcher is already running (lock: $lock_file)" >&2
   exit 1
 fi
+
+# Repair only the derived hot tables after a raw full snapshot has already
+# been imported.  This mode must not inherit the watch directory or
+# --bootstrap flags below: it reads active raw tables in place and exits.
+# Keep it behind the same lock so it cannot race a running watcher.
+for arg in "$@"; do
+  if [[ "$arg" == "--clickhouse-rebuild-hot" ]]; then
+    exec target/release/solana-snapshot-etl \
+      --clickhouse-rebuild-hot \
+      --log-file ./solana-snapshot-etl.log \
+      "$@"
+  fi
+done
 
 exec target/release/solana-snapshot-etl \
   --incremental-snapshot-dir /data-static/solana/snapshot \

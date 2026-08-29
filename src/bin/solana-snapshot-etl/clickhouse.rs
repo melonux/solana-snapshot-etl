@@ -2,7 +2,7 @@ use borsh::BorshDeserialize;
 use clickhouse::inserter::{Inserter, Quantities};
 use clickhouse::{Client, Row};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use solana_sdk::program_pack::Pack;
@@ -14,7 +14,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
@@ -25,6 +25,50 @@ const ACCOUNT_TABLE: &str = "raw_account";
 const TOKEN_ACCOUNT_TABLE: &str = "raw_token_account";
 const TOKEN_MINT_TABLE: &str = "raw_token_mint";
 const TOKEN_METADATA_TABLE: &str = "raw_token_metadata";
+const RAW_TABLES: [&str; 4] = [
+    ACCOUNT_TABLE,
+    TOKEN_ACCOUNT_TABLE,
+    TOKEN_MINT_TABLE,
+    TOKEN_METADATA_TABLE,
+];
+// `hot_token_info` is built in ordered mint ranges.  The full source mint and
+// metadata tables are sorted by mint, so a bounded range keeps the right side
+// of each JOIN small without repeatedly scanning overlapping key ranges.
+const HOT_TOKEN_INFO_BATCH_SIZE: u64 = 10_000;
+// Keep the high-cardinality wallet aggregation below the server-wide memory
+// cap.  ClickHouse spills intermediate GROUP BY / sort state to its temporary
+// disk once either limit is reached.
+const HOT_BALANCE_EXTERNAL_AGGREGATION_BYTES: &str = "1073741824";
+
+/// Physical table group used by the dual-buffer importer.  `Active` always
+/// maps to the stable query-facing names; `Backup` maps to the `_bak` staging
+/// names.  Keeping this choice in one value prevents a raw table from being
+/// written to one generation while its derived tables are written to another.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TableGroup {
+    Active,
+    Backup,
+}
+
+impl TableGroup {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Backup => "backup",
+        }
+    }
+
+    pub(crate) fn suffix(self) -> &'static str {
+        match self {
+            Self::Active => "",
+            Self::Backup => "_bak",
+        }
+    }
+
+    fn table(self, base: &str) -> String {
+        format!("{base}{}", self.suffix())
+    }
+}
 
 // Larger inserts reduce MergeTree part creation. The exporter also force-commits every open
 // RowBinary stream regularly, so sparse derived tables cannot leave an idle chunked request open
@@ -105,6 +149,7 @@ impl SnapshotKind {
 pub(crate) struct ClickhouseIndexer {
     client: Client,
     connection_url: String,
+    group: TableGroup,
     sink: ClickhouseSink,
     snapshot_slot: u64,
     multi_progress: MultiProgress,
@@ -237,6 +282,7 @@ impl ClickhouseIndexer {
         connection_url: String,
         snapshot_slot: u64,
         append_vec_count: Option<u64>,
+        group: TableGroup,
     ) -> Result<Self> {
         let spinner_style = ProgressStyle::with_template(
             "{prefix:>13.bold.dim} {spinner} rate={per_sec:>13} total={human_pos:>11} elapsed={elapsed_precise} {msg}",
@@ -284,9 +330,10 @@ impl ClickhouseIndexer {
         let client = new_clickhouse_client(&connection_url)?;
 
         Ok(Self {
-            sink: ClickhouseSink::new(&client, "main", None),
+            sink: ClickhouseSink::new(&client, "main", None, group),
             client,
             connection_url,
+            group,
             snapshot_slot,
             multi_progress,
             progress,
@@ -298,12 +345,26 @@ impl ClickhouseIndexer {
         iterator: AppendVecIterator<'_>,
         snapshot_kind: SnapshotKind,
         workers: usize,
+        refresh_from_slot: Option<u64>,
+        force_hot_rebuild: bool,
     ) -> Result<IndexStats> {
         if workers > 1 {
-            self.insert_all_parallel(iterator, snapshot_kind, workers)
-                .await
+            self.insert_all_parallel(
+                iterator,
+                snapshot_kind,
+                workers,
+                refresh_from_slot,
+                force_hot_rebuild,
+            )
+            .await
         } else {
-            self.insert_all_sequential(iterator, snapshot_kind).await
+            self.insert_all_sequential(
+                iterator,
+                snapshot_kind,
+                refresh_from_slot,
+                force_hot_rebuild,
+            )
+            .await
         }
     }
 
@@ -311,6 +372,8 @@ impl ClickhouseIndexer {
         mut self,
         iterator: AppendVecIterator<'_>,
         snapshot_kind: SnapshotKind,
+        refresh_from_slot: Option<u64>,
+        force_hot_rebuild: bool,
     ) -> Result<IndexStats> {
         let collect_close_tombstones = snapshot_kind.collect_close_tombstones();
         let mut worker = Worker {
@@ -369,13 +432,22 @@ impl ClickhouseIndexer {
 
         self.sink.end().await?;
         let token_accounts_marked_deleted = if collect_close_tombstones {
-            write_close_token_account_tombstones(&self.client, &closed_token_accounts).await?
+            write_close_token_account_tombstones(&self.client, self.group, &closed_token_accounts)
+                .await?
         } else {
             debug!(
                 "[clickhouse] Full snapshot: skipped tombstone candidate scan (archive excludes tombstones)"
             );
             0
         };
+        refresh_hot_indexes(
+            &self.client,
+            self.group,
+            snapshot_kind,
+            refresh_from_slot,
+            force_hot_rebuild,
+        )
+        .await?;
         self.progress.append_vecs.finish_with_message("done");
         self.progress.accounts.sync();
         self.progress.tokens.sync();
@@ -412,6 +484,8 @@ impl ClickhouseIndexer {
         iterator: AppendVecIterator<'_>,
         snapshot_kind: SnapshotKind,
         workers: usize,
+        refresh_from_slot: Option<u64>,
+        force_hot_rebuild: bool,
     ) -> Result<IndexStats> {
         let workers = workers.max(2);
         let collect_close_tombstones = snapshot_kind.collect_close_tombstones();
@@ -430,6 +504,7 @@ impl ClickhouseIndexer {
         for worker_index in 0..workers {
             let rx = rx.clone();
             let connection_url = self.connection_url.clone();
+            let group = self.group;
             let snapshot_slot = self.snapshot_slot;
             let progress = Arc::clone(&self.progress);
             let insert_gate = Arc::clone(&insert_gate);
@@ -451,6 +526,7 @@ impl ClickhouseIndexer {
                         &client,
                         format!("worker-{worker_index}"),
                         Some(insert_gate),
+                        group,
                     );
                     debug!("[clickhouse] Worker {worker_index} ready; waiting for AppendVec");
                     let mut worker = Worker {
@@ -646,14 +722,26 @@ impl ClickhouseIndexer {
             0
         };
         let token_accounts_marked_deleted = if collect_close_tombstones {
-            write_close_token_account_tombstones(&self.client, &totals.closed_token_accounts)
-                .await?
+            write_close_token_account_tombstones(
+                &self.client,
+                self.group,
+                &totals.closed_token_accounts,
+            )
+            .await?
         } else {
             debug!(
                 "[clickhouse] Full snapshot: skipped tombstone candidate scan (archive excludes tombstones)"
             );
             0
         };
+        refresh_hot_indexes(
+            &self.client,
+            self.group,
+            snapshot_kind,
+            refresh_from_slot,
+            force_hot_rebuild,
+        )
+        .await?;
         self.progress.append_vecs.finish_with_message("done");
         self.progress.accounts.sync();
         self.progress.tokens.sync();
@@ -723,7 +811,18 @@ impl ClickhouseIndexer {
         }
 
         let token_accounts_marked_deleted =
-            write_close_token_account_tombstones(&self.client, &closed_token_accounts).await?;
+            write_close_token_account_tombstones(&self.client, self.group, &closed_token_accounts)
+                .await?;
+        if token_accounts_marked_deleted > 0 {
+            refresh_hot_indexes(
+                &self.client,
+                self.group,
+                SnapshotKind::Incremental,
+                Some(self.snapshot_slot.saturating_sub(1)),
+                true,
+            )
+            .await?;
+        }
         self.progress.append_vecs.finish_with_message("done");
         self.progress.accounts.sync();
         self.progress.tokens.sync();
@@ -766,10 +865,532 @@ fn new_clickhouse_client(connection_url: &str) -> Result<Client> {
 /// Return the high-water mark that the snapshot watcher uses to resume an
 /// existing ClickHouse import. `coalesce` also makes an empty raw_account
 /// table start from slot zero.
-pub(crate) async fn max_raw_account_updated_slot(connection_url: &str) -> Result<u64> {
+pub(crate) async fn max_raw_account_updated_slot(
+    connection_url: &str,
+    group: TableGroup,
+) -> Result<u64> {
+    let table = group.table(ACCOUNT_TABLE);
     new_clickhouse_client(connection_url)?
-        .query("SELECT coalesce(max(updated_slot), toUInt64(0)) FROM raw_account")
+        .query(&format!(
+            "SELECT coalesce(max(updated_slot), toUInt64(0)) FROM {table}"
+        ))
         .fetch_one::<u64>()
+        .await
+        .map_err(Into::into)
+}
+
+/// Return the highest row version currently visible in the hot-token view.
+/// A change to this value causes the next derived-index refresh to rebuild the
+/// state subset, so newly enabled mints are backfilled from raw history.
+pub(crate) async fn hot_token_version(connection_url: &str) -> Result<u64> {
+    new_clickhouse_client(connection_url)?
+        .query("SELECT coalesce(max(version), toUInt64(0)) FROM hot_token_enabled")
+        .fetch_one::<u64>()
+        .await
+        .map_err(Into::into)
+}
+
+pub(crate) async fn hot_token_fingerprint(connection_url: &str) -> Result<u64> {
+    new_clickhouse_client(connection_url)?
+        .query("SELECT groupBitXor(cityHash64(concat(mint, ':', toString(version)))) FROM hot_token_enabled")
+        .fetch_one::<u64>()
+        .await
+        .map_err(Into::into)
+}
+
+pub(crate) async fn reset_table_group(connection_url: &str, group: TableGroup) -> Result<()> {
+    let client = new_clickhouse_client(connection_url)?;
+    for base in RAW_TABLES.into_iter().chain([
+        "hot_token_account_state",
+        "hot_token_info",
+        "hot_wallet_token_balance",
+    ]) {
+        let table = group.table(base);
+        client
+            .query(&format!(
+                "TRUNCATE TABLE {table} SETTINGS max_table_size_to_drop = 0"
+            ))
+            .execute()
+            .await
+            .map_err(|err| format!("failed to truncate {table}: {err}"))?;
+    }
+    Ok(())
+}
+
+/// Enable or disable ClickHouse's background merges for the four raw tables
+/// in one physical table group.  Full snapshot loading is append-heavy and
+/// does not need background ReplacingMergeTree deduplication while rows are
+/// arriving; deferring those merges keeps CPU/IO available for INSERTs.  The
+/// caller re-enables merges only after a successful cold load and derived
+/// refresh.  On failure the process exits with merges stopped so that an
+/// incomplete generation cannot continue receiving incrementals; the group
+/// must be cleaned and rebuilt from a valid full snapshot.
+pub(crate) async fn set_raw_table_merges(
+    connection_url: &str,
+    group: TableGroup,
+    enabled: bool,
+) -> Result<()> {
+    let client = new_clickhouse_client(connection_url)?;
+    let action = if enabled { "START" } else { "STOP" };
+    info!(
+        "[clickhouse] SYSTEM {action} MERGES for raw tables group={} table_count={}",
+        group.as_str(),
+        RAW_TABLES.len()
+    );
+    let mut first_error = None;
+    for base in RAW_TABLES {
+        let table = group.table(base);
+        if let Err(err) = client
+            .query(&format!("SYSTEM {action} MERGES {table}"))
+            .execute()
+            .await
+        {
+            let message = format!(
+                "failed to SYSTEM {action} MERGES for {table} (group={}): {err}",
+                group.as_str()
+            );
+            warn!("[clickhouse] {message}");
+            if first_error.is_none() {
+                first_error = Some(message);
+            }
+        }
+    }
+    match first_error {
+        Some(err) => Err(err.into()),
+        None => Ok(()),
+    }
+}
+
+/// Refresh the L2 hot-account state and L3 wallet aggregate for one physical
+/// table group.  Raw rows are inserted first; this function then applies only
+/// the changed token-account versions for incrementals and performs a cheap
+/// rebuild of the compact L3 table.  Full snapshots rebuild the state table
+/// from scratch, which is also the staging cold-start path.
+pub(crate) async fn refresh_hot_indexes(
+    client: &Client,
+    group: TableGroup,
+    snapshot_kind: SnapshotKind,
+    refresh_from_slot: Option<u64>,
+    force_state_rebuild: bool,
+) -> Result<()> {
+    debug!(
+        "[clickhouse] refreshing hot indexes group={} kind={} from_slot={:?} force_rebuild={}",
+        group.as_str(),
+        snapshot_kind.as_str(),
+        refresh_from_slot,
+        force_state_rebuild
+    );
+    let raw = group.table(TOKEN_ACCOUNT_TABLE);
+    let state = group.table("hot_token_account_state");
+    let info = group.table("hot_token_info");
+    let balance = group.table("hot_wallet_token_balance");
+    let enabled_hot_tokens = client
+        .query("SELECT count() FROM hot_token_enabled")
+        .fetch_one::<u64>()
+        .await
+        .map_err(|err| format!("failed to count hot_token_enabled: {err}"))?;
+    info!(
+        "[clickhouse] raw tables committed; starting hot-index refresh group={} kind={} enabled_hot_tokens={}",
+        group.as_str(),
+        snapshot_kind.as_str(),
+        enabled_hot_tokens
+    );
+    if matches!(snapshot_kind, SnapshotKind::Full) {
+        info!(
+            "[clickhouse] full raw is a canonical baseline; L2 and token-info refresh will not use raw FINAL"
+        );
+    }
+
+    if matches!(snapshot_kind, SnapshotKind::Full) || force_state_rebuild {
+        for table in [&state, &info, &balance] {
+            client
+                .query(&format!(
+                    "TRUNCATE TABLE {table} SETTINGS max_table_size_to_drop = 0"
+                ))
+                .execute()
+                .await
+                .map_err(|err| format!("failed to reset derived table {table}: {err}"))?;
+        }
+    }
+
+    // Do not use FINAL here.  A newly loaded full snapshot contains one
+    // current version per account, and the L2 ReplacingMergeTree itself is
+    // the version boundary for later incremental rows.  During incrementals
+    // it is also safe (and much cheaper) to append every changed version: the
+    // highest slot wins in L2, while a tombstone can be kept even when the
+    // preceding account was not hot.  This avoids a billion-row raw FINAL
+    // merely to copy rows into another ReplacingMergeTree.
+    let changed_filter =
+        if matches!(snapshot_kind, SnapshotKind::Incremental) && !force_state_rebuild {
+            format!(
+                " AND r.updated_slot >= toUInt64({})",
+                refresh_from_slot.unwrap_or(0)
+            )
+        } else {
+            String::new()
+        };
+    let state_sql = format!(
+        "INSERT INTO {state} (pubkey, mint, owner, amount, state, is_deleted, updated_slot) \
+         SELECT r.pubkey, r.mint, r.owner, r.amount, r.state, r.is_deleted, r.updated_slot \
+         FROM {raw} AS r \
+         WHERE (r.is_deleted = 0 AND r.mint IN (SELECT mint FROM hot_token_enabled)){changed_filter} \
+            OR (r.is_deleted = 1{changed_filter})"
+    );
+    client
+        .query(&state_sql)
+        .execute()
+        .await
+        .map_err(|err| format!("failed to refresh {state}: {err}"))?;
+
+    // MergeTree is deliberately used for the serving table because its sort
+    // key puts the largest balances first. Build both serving tables in a
+    // temporary clone and exchange them into place, so normal active-path
+    // refreshes never expose an empty table to readers.
+    let state_source = if matches!(snapshot_kind, SnapshotKind::Full) {
+        state.to_owned()
+    } else {
+        format!("{state} FINAL")
+    };
+    let balance_query = format!(
+        "SELECT mint, owner, sum(amount) AS amount_raw, max(updated_slot) AS updated_slot \
+         FROM {state_source} \
+         WHERE is_deleted = 0 AND state != 0 \
+         GROUP BY mint, owner \
+         HAVING amount_raw > 0"
+    );
+    rebuild_wallet_balance_table(client, &balance, &balance_query).await?;
+
+    info!(
+        "[clickhouse] rebuilding hot_token_info in ordered mint batches size={HOT_TOKEN_INFO_BATCH_SIZE}"
+    );
+    rebuild_token_info_table(client, group, snapshot_kind, &info).await?;
+    let state_rows = client
+        .query(&format!("SELECT count() FROM {state}"))
+        .fetch_one::<u64>()
+        .await
+        .map_err(|err| format!("failed to count {state}: {err}"))?;
+    let balance_rows = client
+        .query(&format!("SELECT count() FROM {balance}"))
+        .fetch_one::<u64>()
+        .await
+        .map_err(|err| format!("failed to count {balance}: {err}"))?;
+    let info_rows = client
+        .query(&format!("SELECT count() FROM {info}"))
+        .fetch_one::<u64>()
+        .await
+        .map_err(|err| format!("failed to count {info}: {err}"))?;
+    info!(
+        "[clickhouse] hot indexes refreshed group={} kind={} enabled_hot_tokens={} state_rows={} wallet_rows={} token_info_rows={}",
+        group.as_str(),
+        snapshot_kind.as_str(),
+        enabled_hot_tokens,
+        state_rows,
+        balance_rows,
+        info_rows
+    );
+    Ok(())
+}
+
+/// Rebuild all active hot tables from an already imported raw full snapshot.
+/// This repair path intentionally leaves raw tables untouched and uses the
+/// same full-refresh semantics as a normal cold load.
+pub(crate) async fn rebuild_hot_indexes_from_raw(
+    connection_url: &str,
+    group: TableGroup,
+) -> Result<()> {
+    let client = new_clickhouse_client(connection_url)?;
+    info!(
+        "[clickhouse] rebuilding hot indexes from existing raw tables group={} without raw import",
+        group.as_str()
+    );
+    refresh_hot_indexes(&client, group, SnapshotKind::Full, None, true).await
+}
+
+/// Build the wallet serving table with external aggregation enabled. L2 is
+/// ordered by token-account pubkey rather than wallet/mint, so an exact
+/// wallet aggregation can have a large number of live groups. Spilling keeps
+/// the query bounded by disk rather than the server-wide RAM cap.
+async fn rebuild_wallet_balance_table(
+    client: &Client,
+    target: &str,
+    select_sql: &str,
+) -> Result<()> {
+    let nonce = format!(
+        "{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let temporary = format!("{target}__build_{nonce}");
+    client
+        .query(&format!("CREATE TABLE {temporary} AS {target}"))
+        .execute()
+        .await
+        .map_err(|err| format!("failed to create temporary table {temporary}: {err}"))?;
+    let result = async {
+        client
+            .query(&format!("INSERT INTO {temporary} {select_sql}"))
+            .with_setting("max_threads", "1")
+            .with_setting("max_final_threads", "1")
+            .with_setting(
+                "max_bytes_before_external_group_by",
+                HOT_BALANCE_EXTERNAL_AGGREGATION_BYTES,
+            )
+            .with_setting(
+                "max_bytes_before_external_sort",
+                HOT_BALANCE_EXTERNAL_AGGREGATION_BYTES,
+            )
+            .execute()
+            .await
+            .map_err(|err| format!("failed to populate temporary table {temporary}: {err}"))?;
+        client
+            .query(&format!("EXCHANGE TABLES {target} AND {temporary}"))
+            .execute()
+            .await
+            .map_err(|err| format!("failed to exchange rebuilt table {target}: {err}"))?;
+        client
+            .query(&format!(
+                "DROP TABLE {temporary} SETTINGS max_table_size_to_drop = 0"
+            ))
+            .execute()
+            .await
+            .map_err(|err| format!("failed to drop old table {temporary}: {err}"))?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = client
+            .query(&format!(
+                "DROP TABLE IF EXISTS {temporary} SETTINGS max_table_size_to_drop = 0"
+            ))
+            .execute()
+            .await;
+    }
+    result
+}
+
+#[derive(Row, Deserialize)]
+struct HotMintRow {
+    mint: String,
+}
+
+/// Rebuild token display information without making ClickHouse hash every
+/// row in the global raw mint and metadata tables. `hot_token_enabled` is
+/// read in sorted mint batches; each batch joins only the matching contiguous
+/// primary-key interval from the two raw tables. The temporary table is
+/// exchanged only once all batches have succeeded.
+async fn rebuild_token_info_table(
+    client: &Client,
+    group: TableGroup,
+    snapshot_kind: SnapshotKind,
+    target: &str,
+) -> Result<()> {
+    let nonce = format!(
+        "{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let temporary = format!("{target}__build_{nonce}");
+    client
+        .query(&format!("CREATE TABLE {temporary} AS {target}"))
+        .execute()
+        .await
+        .map_err(|err| format!("failed to create temporary table {temporary}: {err}"))?;
+
+    let mint_table = group.table(TOKEN_MINT_TABLE);
+    let metadata_table = group.table(TOKEN_METADATA_TABLE);
+    // A full snapshot is already a canonical current-state baseline. Do not
+    // pay FINAL's ReplacingSorted memory cost just to fill display fields.
+    // Incremental refreshes need the current version, but only within the
+    // bounded mint range of each batch.
+    let mint_source = if matches!(snapshot_kind, SnapshotKind::Full) {
+        mint_table
+    } else {
+        format!("{mint_table} FINAL")
+    };
+    let metadata_source = if matches!(snapshot_kind, SnapshotKind::Full) {
+        metadata_table
+    } else {
+        format!("{metadata_table} FINAL")
+    };
+
+    let result = async {
+        let mut previous_last_mint: Option<String> = None;
+        let mut batch_count = 0_u64;
+        let mut inserted_tokens = 0_u64;
+        loop {
+            let resume_predicate = previous_last_mint.as_ref().map_or_else(String::new, |mint| {
+                format!("WHERE mint > {}", sql_string_literal(mint))
+            });
+            let mint_batch_sql = format!(
+                "SELECT mint FROM hot_token_enabled {resume_predicate} ORDER BY mint LIMIT {HOT_TOKEN_INFO_BATCH_SIZE}"
+            );
+            let mints = client
+                .query(&mint_batch_sql)
+                .fetch_all::<HotMintRow>()
+                .await
+                .map_err(|err| format!("failed to read hot-token info batch: {err}"))?;
+            let Some(first) = mints.first() else {
+                break;
+            };
+            let last = mints
+                .last()
+                .expect("nonempty hot-token batch has a last mint");
+            let lower = sql_string_literal(&first.mint);
+            let upper = sql_string_literal(&last.mint);
+            let range = format!("mint >= {lower} AND mint <= {upper}");
+            let insert_sql = format!(
+                "INSERT INTO {temporary} \
+                 SELECT h.mint, ifNull(m.decimals, 0), ifNull(m.supply, 0), ifNull(md.name, ''), ifNull(md.symbol, ''), ifNull(md.uri, ''), md.token_standard, \
+                        ifNull(m.updated_slot, 0), ifNull(md.updated_slot, 0), greatest(ifNull(m.updated_slot, 0), ifNull(md.updated_slot, 0)) \
+                 FROM (SELECT mint FROM hot_token_enabled WHERE {range}) AS h \
+                 LEFT ANY JOIN (SELECT mint, decimals, supply, updated_slot FROM {mint_source} WHERE {range}) AS m USING (mint) \
+                 LEFT ANY JOIN (SELECT mint, name, symbol, uri, token_standard, updated_slot FROM {metadata_source} WHERE {range}) AS md USING (mint)"
+            );
+            client
+                .query(&insert_sql)
+                .with_setting("max_threads", "1")
+                .with_setting("max_final_threads", "1")
+                .execute()
+                .await
+                .map_err(|err| {
+                    format!(
+                        "failed to populate temporary table {temporary} in hot-token info batch {} (range {} .. {}): {err}",
+                        batch_count + 1,
+                        first.mint,
+                        last.mint
+                    )
+                })?;
+            previous_last_mint = Some(last.mint.clone());
+            batch_count += 1;
+            inserted_tokens += mints.len() as u64;
+            if batch_count == 1 || batch_count % 25 == 0 {
+                info!(
+                    "[clickhouse] hot_token_info build group={} batches={} tokens={} last_mint={}",
+                    group.as_str(),
+                    batch_count,
+                    inserted_tokens,
+                    last.mint
+                );
+            }
+        }
+        info!(
+            "[clickhouse] hot_token_info temporary build complete group={} batches={} tokens={}",
+            group.as_str(),
+            batch_count,
+            inserted_tokens
+        );
+        client
+            .query(&format!("EXCHANGE TABLES {target} AND {temporary}"))
+            .execute()
+            .await
+            .map_err(|err| format!("failed to exchange rebuilt table {target}: {err}"))?;
+        client
+            .query(&format!(
+                "DROP TABLE {temporary} SETTINGS max_table_size_to_drop = 0"
+            ))
+            .execute()
+            .await
+            .map_err(|err| format!("failed to drop old table {temporary}: {err}"))?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = client
+            .query(&format!(
+                "DROP TABLE IF EXISTS {temporary} SETTINGS max_table_size_to_drop = 0"
+            ))
+            .execute()
+            .await;
+    }
+    result
+}
+
+pub(crate) async fn exchange_table_groups(connection_url: &str) -> Result<()> {
+    let client = new_clickhouse_client(connection_url)?;
+    let pairs = [
+        ("raw_account", "raw_account_bak"),
+        ("raw_token_account", "raw_token_account_bak"),
+        ("raw_token_mint", "raw_token_mint_bak"),
+        ("raw_token_metadata", "raw_token_metadata_bak"),
+        ("hot_token_account_state", "hot_token_account_state_bak"),
+        ("hot_token_info", "hot_token_info_bak"),
+        ("hot_wallet_token_balance", "hot_wallet_token_balance_bak"),
+    ];
+    for (left, right) in pairs {
+        client
+            .query(&format!("EXCHANGE TABLES {left} AND {right}"))
+            .execute()
+            .await
+            .map_err(|err| format!("failed to exchange {left} and {right}: {err}"))?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn validate_group_parity(connection_url: &str) -> Result<()> {
+    let client = new_clickhouse_client(connection_url)?;
+    let metrics = async |table: &str, expression: &str| -> Result<u64> {
+        client
+            .query(&format!("SELECT {expression} FROM {table} FINAL"))
+            .fetch_one::<u64>()
+            .await
+            .map_err(Into::into)
+    };
+    for (base, expression) in [
+        ("hot_token_account_state", "count()"),
+        ("hot_token_info", "count()"),
+        ("hot_wallet_token_balance", "count()"),
+        (
+            "hot_wallet_token_balance",
+            "coalesce(sum(amount_raw), toUInt64(0))",
+        ),
+    ] {
+        let active = metrics(base, expression).await?;
+        let backup = metrics(&format!("{base}_bak"), expression).await?;
+        if active != backup {
+            return Err(format!(
+                "active/staging parity check failed for {base}: active={active}, staging={backup}"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn record_index_control(
+    connection_url: &str,
+    active_group: u8,
+    ready_slot: u64,
+    hot_token_version: u64,
+) -> Result<()> {
+    let client = new_clickhouse_client(connection_url)?;
+    let generation = client
+        .query("SELECT coalesce(max(generation), toUInt64(0)) + 1 FROM hot_index_control FINAL")
+        .fetch_one::<u64>()
+        .await
+        .map_err(|err| format!("failed to read hot_index_control generation: {err}"))?;
+    let sql = format!(
+        "INSERT INTO hot_index_control (control_key, active_group, generation, ready_slot, hot_token_version) VALUES ('default', {active_group}, {generation}, {ready_slot}, {hot_token_version})"
+    );
+    client
+        .query(&sql)
+        .execute()
+        .await
+        .map_err(|err| format!("failed to record hot_index_control: {err}"))?;
+    Ok(())
+}
+
+pub(crate) async fn active_group_id(connection_url: &str) -> Result<u8> {
+    new_clickhouse_client(connection_url)?
+        .query(
+            "SELECT if(count() = 0, toUInt8(1), argMax(active_group, generation)) FROM hot_index_control FINAL",
+        )
+        .fetch_one::<u8>()
         .await
         .map_err(Into::into)
 }
@@ -892,6 +1513,10 @@ pub(crate) async fn validate_clickhouse_schema(connection_url: &str) -> Result<(
     }
 
     if errors.is_empty() {
+        info!(
+            "[clickhouse] schema validation passed: {} tables, required columns, and wallet projections",
+            required_tables.len()
+        );
         debug!(
             "[clickhouse] Schema validation passed: {} tables, required columns, and wallet projections",
             required_tables.len()
@@ -1197,9 +1822,13 @@ fn actual_type_matches(actual: &str, expected: &str) -> bool {
 fn sql_string_list(values: &[String]) -> String {
     values
         .iter()
-        .map(|value| format!("'{}'", value.replace('\'', "''")))
+        .map(|value| sql_string_literal(value))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn parse_clickhouse_connection_url(connection_url: &str) -> Result<ClickhouseConnection> {
@@ -1233,6 +1862,10 @@ fn decode_url_component(value: &str) -> Result<String> {
 struct ClickhouseSink {
     worker_name: String,
     insert_gate: Option<Arc<Semaphore>>,
+    account_table: String,
+    token_account_table: String,
+    token_mint_table: String,
+    token_metadata_table: String,
     account: Inserter<AccountRow>,
     token_account: Inserter<TokenAccountRow>,
     token_mint: Inserter<TokenMintRow>,
@@ -1253,14 +1886,23 @@ impl ClickhouseSink {
         client: &Client,
         worker_name: impl Into<String>,
         insert_gate: Option<Arc<Semaphore>>,
+        group: TableGroup,
     ) -> Self {
+        let account_table = group.table(ACCOUNT_TABLE);
+        let token_account_table = group.table(TOKEN_ACCOUNT_TABLE);
+        let token_mint_table = group.table(TOKEN_MINT_TABLE);
+        let token_metadata_table = group.table(TOKEN_METADATA_TABLE);
         Self {
             worker_name: worker_name.into(),
             insert_gate,
-            account: new_inserter(client, ACCOUNT_TABLE),
-            token_account: new_inserter(client, TOKEN_ACCOUNT_TABLE),
-            token_mint: new_inserter(client, TOKEN_MINT_TABLE),
-            token_metadata: new_inserter(client, TOKEN_METADATA_TABLE),
+            account: new_inserter(client, &account_table),
+            token_account: new_inserter(client, &token_account_table),
+            token_mint: new_inserter(client, &token_mint_table),
+            token_metadata: new_inserter(client, &token_metadata_table),
+            account_table,
+            token_account_table,
+            token_mint_table,
+            token_metadata_table,
             account_rows_since_commit_check: 0,
             token_account_rows_since_commit_check: 0,
             token_mint_rows_since_commit_check: 0,
@@ -1277,14 +1919,14 @@ impl ClickhouseSink {
         if self.account.pending().rows == 0 {
             debug!(
                 "[clickhouse] {} writing table={} phase=start",
-                self.worker_name, ACCOUNT_TABLE
+                self.worker_name, self.account_table
             );
             self.account_opened_at = Some(Instant::now());
         }
         self.account.write(row).await?;
         check_batch_limit(
             &self.worker_name,
-            ACCOUNT_TABLE,
+            &self.account_table,
             &mut self.account,
             &mut self.account_rows_since_commit_check,
             self.insert_gate.as_ref(),
@@ -1298,14 +1940,14 @@ impl ClickhouseSink {
         if self.token_account.pending().rows == 0 {
             debug!(
                 "[clickhouse] {} writing table={} phase=start",
-                self.worker_name, TOKEN_ACCOUNT_TABLE
+                self.worker_name, self.token_account_table
             );
             self.token_account_opened_at = Some(Instant::now());
         }
         self.token_account.write(row).await?;
         check_batch_limit(
             &self.worker_name,
-            TOKEN_ACCOUNT_TABLE,
+            &self.token_account_table,
             &mut self.token_account,
             &mut self.token_account_rows_since_commit_check,
             self.insert_gate.as_ref(),
@@ -1319,14 +1961,14 @@ impl ClickhouseSink {
         if self.token_mint.pending().rows == 0 {
             debug!(
                 "[clickhouse] {} writing table={} phase=start",
-                self.worker_name, TOKEN_MINT_TABLE
+                self.worker_name, self.token_mint_table
             );
             self.token_mint_opened_at = Some(Instant::now());
         }
         self.token_mint.write(row).await?;
         check_batch_limit(
             &self.worker_name,
-            TOKEN_MINT_TABLE,
+            &self.token_mint_table,
             &mut self.token_mint,
             &mut self.token_mint_rows_since_commit_check,
             self.insert_gate.as_ref(),
@@ -1340,14 +1982,14 @@ impl ClickhouseSink {
         if self.token_metadata.pending().rows == 0 {
             debug!(
                 "[clickhouse] {} writing table={} phase=start",
-                self.worker_name, TOKEN_METADATA_TABLE
+                self.worker_name, self.token_metadata_table
             );
             self.token_metadata_opened_at = Some(Instant::now());
         }
         self.token_metadata.write(row).await?;
         check_batch_limit(
             &self.worker_name,
-            TOKEN_METADATA_TABLE,
+            &self.token_metadata_table,
             &mut self.token_metadata,
             &mut self.token_metadata_rows_since_commit_check,
             self.insert_gate.as_ref(),
@@ -1367,7 +2009,7 @@ impl ClickhouseSink {
         let now = Instant::now();
         force_aged_inserter(
             &self.worker_name,
-            ACCOUNT_TABLE,
+            &self.account_table,
             &mut self.account,
             &mut self.account_opened_at,
             now,
@@ -1376,7 +2018,7 @@ impl ClickhouseSink {
         .await?;
         force_aged_inserter(
             &self.worker_name,
-            TOKEN_ACCOUNT_TABLE,
+            &self.token_account_table,
             &mut self.token_account,
             &mut self.token_account_opened_at,
             now,
@@ -1385,7 +2027,7 @@ impl ClickhouseSink {
         .await?;
         force_aged_inserter(
             &self.worker_name,
-            TOKEN_MINT_TABLE,
+            &self.token_mint_table,
             &mut self.token_mint,
             &mut self.token_mint_opened_at,
             now,
@@ -1394,7 +2036,7 @@ impl ClickhouseSink {
         .await?;
         force_aged_inserter(
             &self.worker_name,
-            TOKEN_METADATA_TABLE,
+            &self.token_metadata_table,
             &mut self.token_metadata,
             &mut self.token_metadata_opened_at,
             now,
@@ -1422,46 +2064,55 @@ impl ClickhouseSink {
         // four finalizations together would only create a burst of storage
         // work at exactly the point where the producer is already starved.
         let gate = self.insert_gate.as_ref();
-        let account =
-            force_commit_with_gate(gate, &self.worker_name, ACCOUNT_TABLE, &mut self.account)
-                .await?;
+        let account = force_commit_with_gate(
+            gate,
+            &self.worker_name,
+            &self.account_table,
+            &mut self.account,
+        )
+        .await?;
         let token_account = force_commit_with_gate(
             gate,
             &self.worker_name,
-            TOKEN_ACCOUNT_TABLE,
+            &self.token_account_table,
             &mut self.token_account,
         )
         .await?;
         let token_mint = force_commit_with_gate(
             gate,
             &self.worker_name,
-            TOKEN_MINT_TABLE,
+            &self.token_mint_table,
             &mut self.token_mint,
         )
         .await?;
         let token_metadata = force_commit_with_gate(
             gate,
             &self.worker_name,
-            TOKEN_METADATA_TABLE,
+            &self.token_metadata_table,
             &mut self.token_metadata,
         )
         .await?;
-        log_insert_commit(&self.worker_name, ACCOUNT_TABLE, "idle flush", &account);
         log_insert_commit(
             &self.worker_name,
-            TOKEN_ACCOUNT_TABLE,
+            &self.account_table,
+            "idle flush",
+            &account,
+        );
+        log_insert_commit(
+            &self.worker_name,
+            &self.token_account_table,
             "idle flush",
             &token_account,
         );
         log_insert_commit(
             &self.worker_name,
-            TOKEN_MINT_TABLE,
+            &self.token_mint_table,
             "idle flush",
             &token_mint,
         );
         log_insert_commit(
             &self.worker_name,
-            TOKEN_METADATA_TABLE,
+            &self.token_metadata_table,
             "idle flush",
             &token_metadata,
         );
@@ -1504,29 +2155,39 @@ impl ClickhouseSink {
         let worker_name = self.worker_name;
         debug!("[clickhouse] {worker_name} final INSERT flush begin");
         let gate = self.insert_gate.as_ref();
-        let account = end_with_gate(gate, &worker_name, ACCOUNT_TABLE, self.account).await?;
-        let token_account =
-            end_with_gate(gate, &worker_name, TOKEN_ACCOUNT_TABLE, self.token_account).await?;
+        let account = end_with_gate(gate, &worker_name, &self.account_table, self.account).await?;
+        let token_account = end_with_gate(
+            gate,
+            &worker_name,
+            &self.token_account_table,
+            self.token_account,
+        )
+        .await?;
         let token_mint =
-            end_with_gate(gate, &worker_name, TOKEN_MINT_TABLE, self.token_mint).await?;
+            end_with_gate(gate, &worker_name, &self.token_mint_table, self.token_mint).await?;
         let token_metadata = end_with_gate(
             gate,
             &worker_name,
-            TOKEN_METADATA_TABLE,
+            &self.token_metadata_table,
             self.token_metadata,
         )
         .await?;
-        log_insert_commit(&worker_name, ACCOUNT_TABLE, "final flush", &account);
+        log_insert_commit(&worker_name, &self.account_table, "final flush", &account);
         log_insert_commit(
             &worker_name,
-            TOKEN_ACCOUNT_TABLE,
+            &self.token_account_table,
             "final flush",
             &token_account,
         );
-        log_insert_commit(&worker_name, TOKEN_MINT_TABLE, "final flush", &token_mint);
         log_insert_commit(
             &worker_name,
-            TOKEN_METADATA_TABLE,
+            &self.token_mint_table,
+            "final flush",
+            &token_mint,
+        );
+        log_insert_commit(
+            &worker_name,
+            &self.token_metadata_table,
             "final flush",
             &token_metadata,
         );
@@ -2066,6 +2727,7 @@ fn is_canonical_empty_account(
 
 async fn write_close_token_account_tombstones(
     client: &Client,
+    group: TableGroup,
     closed_token_accounts: &HashMap<String, AccountVersion>,
 ) -> Result<u64> {
     let mut pubkeys = closed_token_accounts.keys().collect::<Vec<_>>();
@@ -2077,7 +2739,9 @@ async fn write_close_token_account_tombstones(
     // deterministic, which is useful for diagnostics and reproducible imports.
     pubkeys.sort_unstable();
     let batch_count = pubkeys.len().div_ceil(CLOSE_TOMBSTONE_BATCH_SIZE);
-    let mut tombstone_insert: Inserter<TokenAccountRow> = new_inserter(client, TOKEN_ACCOUNT_TABLE);
+    let token_account_table = group.table(TOKEN_ACCOUNT_TABLE);
+    let mut tombstone_insert: Inserter<TokenAccountRow> =
+        new_inserter(client, &token_account_table);
     let mut marked_deleted = 0;
 
     for (batch_idx, pubkeys) in pubkeys.chunks(CLOSE_TOMBSTONE_BATCH_SIZE).enumerate() {

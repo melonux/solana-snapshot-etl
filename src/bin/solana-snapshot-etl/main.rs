@@ -1,11 +1,13 @@
 use crate::clickhouse::{
-    max_raw_account_updated_slot, validate_clickhouse_schema, ClickhouseIndexer,
-    CloseTombstoneStats, SnapshotKind,
+    active_group_id, exchange_table_groups, hot_token_fingerprint, hot_token_version,
+    max_raw_account_updated_slot, rebuild_hot_indexes_from_raw, record_index_control,
+    reset_table_group, set_raw_table_merges, validate_clickhouse_schema, validate_group_parity,
+    ClickhouseIndexer, CloseTombstoneStats, SnapshotKind, TableGroup,
 };
 use clap::{ArgGroup, Parser};
 use env_logger::{Builder, Env, Target};
 use indicatif::{ProgressBar, ProgressBarIter, ProgressStyle};
-use log::{debug, error, warn, LevelFilter};
+use log::{debug, error, info, warn, LevelFilter};
 use solana_snapshot_etl::archived::ArchiveSnapshotExtractor;
 use solana_snapshot_etl::incremental::{
     discover as discover_incremental_snapshots, discover_full as discover_full_snapshots,
@@ -27,7 +29,7 @@ mod mpl_metadata;
 #[clap(author, version, about, long_about = None)]
 #[clap(group(
     ArgGroup::new("source-input")
-        .required(true)
+        .required(false)
         .args(&["source", "incremental-snapshot-dir"]),
 ))]
 #[clap(group(
@@ -36,6 +38,7 @@ mod mpl_metadata;
         .multiple(false)
         .args(&[
             "clickhouse",
+            "clickhouse-rebuild-hot",
             "clickhouse-close-tombstones",
         ]),
 ))]
@@ -74,6 +77,12 @@ struct Args {
         help = "Write to ClickHouse configured by CLICKHOUSE_URL"
     )]
     clickhouse: bool,
+    #[clap(
+        long,
+        action,
+        help = "Rebuild active hot tables from already imported raw tables without reading a snapshot"
+    )]
+    clickhouse_rebuild_hot: bool,
     #[clap(
         long,
         default_value_t = default_clickhouse_workers(),
@@ -189,6 +198,20 @@ fn _main(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.clickhouse_workers > 4 {
         return Err("--clickhouse-workers must not exceed 4 on a shared ClickHouse host".into());
     }
+    if args.clickhouse_rebuild_hot {
+        if args.source.is_some()
+            || args.incremental_snapshot_dir.is_some()
+            || args.bootstrap
+            || args.clickhouse_close_tombstones
+        {
+            return Err(
+                "--clickhouse-rebuild-hot is a standalone repair action and cannot be combined with a snapshot source, --bootstrap, or tombstone mode"
+                    .into(),
+            );
+        }
+        validate_clickhouse_prerequisites()?;
+        return rebuild_hot_indexes_only();
+    }
     if let Some(directory) = &args.incremental_snapshot_dir {
         if args.clickhouse_close_tombstones {
             return Err(
@@ -229,6 +252,45 @@ fn validate_clickhouse_prerequisites() -> Result<(), Box<dyn std::error::Error>>
         .map_err(Into::into)
 }
 
+/// Repair only the derived hot tables after a raw full snapshot has already
+/// been imported successfully.  This deliberately does not read any archive
+/// and never truncates raw tables.  Raw merges remain paused when the repair
+/// fails; they are enabled only after the hot rebuild succeeds.
+fn rebuild_hot_indexes_only() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
+    let clickhouse_url = std::env::var("CLICKHOUSE_URL")
+        .map_err(|_| "CLICKHOUSE_URL must be set in the environment or .env file")?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    info!(
+        "[clickhouse] hot-only repair 启动：保留 active raw 数据，仅重建 hot 表；不读取快照、不清空 raw"
+    );
+    runtime.block_on(set_raw_table_merges(
+        &clickhouse_url,
+        TableGroup::Active,
+        false,
+    ))?;
+    let rebuild_result = runtime.block_on(rebuild_hot_indexes_from_raw(
+        &clickhouse_url,
+        TableGroup::Active,
+    ));
+    if let Err(err) = rebuild_result {
+        warn!(
+            "[clickhouse] hot-only repair failed; raw active MERGE remains paused for retry: {}",
+            err
+        );
+        return Err(err);
+    }
+    runtime.block_on(set_raw_table_merges(
+        &clickhouse_url,
+        TableGroup::Active,
+        true,
+    ))?;
+    info!("[clickhouse] hot-only repair 成功，active raw MERGE 已恢复");
+    Ok(())
+}
+
 fn process_single_snapshot(
     args: &Args,
     loader: &mut SupportedLoader,
@@ -253,8 +315,13 @@ fn process_single_snapshot(
             .enable_all()
             .build()?;
         let stats = match runtime.block_on(
-            ClickhouseIndexer::new(clickhouse_url, snapshot_slot, append_vec_count)?
-                .mark_close_tombstones(loader.iter()),
+            ClickhouseIndexer::new(
+                clickhouse_url,
+                snapshot_slot,
+                append_vec_count,
+                TableGroup::Active,
+            )?
+            .mark_close_tombstones(loader.iter()),
         ) {
             Ok(stats) => stats,
             Err(err) => {
@@ -286,11 +353,55 @@ fn process_single_snapshot(
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let stats =
-            match runtime.block_on(
-                ClickhouseIndexer::new(clickhouse_url, snapshot_slot, append_vec_count)?
-                    .insert_all(loader.iter(), snapshot_kind, args.clickhouse_workers),
-            ) {
+        let indexer = ClickhouseIndexer::new(
+            clickhouse_url.clone(),
+            snapshot_slot,
+            append_vec_count,
+            TableGroup::Active,
+        )?;
+        let pause_merges = matches!(snapshot_kind, SnapshotKind::Full);
+        if pause_merges {
+            if let Err(err) = runtime.block_on(set_raw_table_merges(
+                &clickhouse_url,
+                TableGroup::Active,
+                false,
+            )) {
+                return Err(err.into());
+            }
+            info!("[clickhouse] full snapshot cold load: raw active merges paused before INSERT");
+        }
+        let import_result = runtime.block_on(indexer.insert_all(
+            loader.iter(),
+            snapshot_kind,
+            args.clickhouse_workers,
+            None,
+            false,
+        ));
+        let stats = if pause_merges {
+            match import_result {
+                Ok(stats) => {
+                    runtime.block_on(set_raw_table_merges(
+                        &clickhouse_url,
+                        TableGroup::Active,
+                        true,
+                    ))?;
+                    stats
+                }
+                Err(err) => {
+                    warn!(
+                        "[clickhouse] full snapshot import failed; leaving raw active MERGE paused for cleanup/rebuild"
+                    );
+                    console_snapshot_status(
+                        "failed",
+                        snapshot_kind.as_str(),
+                        source_path,
+                        snapshot_slot,
+                    );
+                    return Err(err);
+                }
+            }
+        } else {
+            match import_result {
                 Ok(stats) => stats,
                 Err(err) => {
                     console_snapshot_status(
@@ -301,7 +412,8 @@ fn process_single_snapshot(
                     );
                     return Err(err);
                 }
-            };
+            }
+        };
         log_clickhouse_index_stats(&stats);
         console_snapshot_status(
             "completed",
@@ -372,13 +484,6 @@ impl WatchedSnapshot {
         }
     }
 
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::Incremental(_) => "incremental",
-            Self::Full(_) => "full",
-        }
-    }
-
     fn new_loader(&self, resume_slot: u64) -> Result<SupportedLoader, Box<dyn std::error::Error>> {
         match self {
             Self::Incremental(snapshot) => {
@@ -432,8 +537,111 @@ impl IncrementalOutput {
                 runtime,
                 ..
             } => runtime
-                .block_on(max_raw_account_updated_slot(clickhouse_url))
+                .block_on(max_raw_account_updated_slot(
+                    clickhouse_url,
+                    TableGroup::Active,
+                ))
                 .map_err(Into::into),
+        }
+    }
+
+    fn reset_group(&mut self, group: TableGroup) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::Clickhouse {
+                clickhouse_url,
+                runtime,
+                ..
+            } => runtime.block_on(reset_table_group(clickhouse_url, group)),
+        }
+    }
+
+    fn stop_raw_merges(&mut self, group: TableGroup) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::Clickhouse {
+                clickhouse_url,
+                runtime,
+                ..
+            } => runtime.block_on(set_raw_table_merges(clickhouse_url, group, false)),
+        }
+    }
+
+    fn start_raw_merges(&mut self, group: TableGroup) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::Clickhouse {
+                clickhouse_url,
+                runtime,
+                ..
+            } => runtime.block_on(set_raw_table_merges(clickhouse_url, group, true)),
+        }
+    }
+
+    fn exchange_groups(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::Clickhouse {
+                clickhouse_url,
+                runtime,
+                ..
+            } => runtime.block_on(exchange_table_groups(clickhouse_url)),
+        }
+    }
+
+    fn validate_group_parity(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::Clickhouse {
+                clickhouse_url,
+                runtime,
+                ..
+            } => runtime.block_on(validate_group_parity(clickhouse_url)),
+        }
+    }
+
+    fn hot_token_version(&mut self) -> Result<u64, Box<dyn std::error::Error>> {
+        match self {
+            Self::Clickhouse {
+                clickhouse_url,
+                runtime,
+                ..
+            } => runtime.block_on(hot_token_version(clickhouse_url)),
+        }
+    }
+
+    fn hot_token_fingerprint(&mut self) -> Result<u64, Box<dyn std::error::Error>> {
+        match self {
+            Self::Clickhouse {
+                clickhouse_url,
+                runtime,
+                ..
+            } => runtime.block_on(hot_token_fingerprint(clickhouse_url)),
+        }
+    }
+
+    fn record_control(
+        &mut self,
+        active_group: u8,
+        ready_slot: u64,
+        hot_token_version: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::Clickhouse {
+                clickhouse_url,
+                runtime,
+                ..
+            } => runtime.block_on(record_index_control(
+                clickhouse_url,
+                active_group,
+                ready_slot,
+                hot_token_version,
+            )),
+        }
+    }
+
+    fn active_group_id(&mut self) -> Result<u8, Box<dyn std::error::Error>> {
+        match self {
+            Self::Clickhouse {
+                clickhouse_url,
+                runtime,
+                ..
+            } => runtime.block_on(active_group_id(clickhouse_url)),
         }
     }
 
@@ -441,6 +649,9 @@ impl IncrementalOutput {
         &mut self,
         loader: &mut SupportedLoader,
         snapshot_kind: SnapshotKind,
+        group: TableGroup,
+        refresh_from_slot: Option<u64>,
+        force_hot_rebuild: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         match self {
             Self::Clickhouse {
@@ -450,6 +661,13 @@ impl IncrementalOutput {
             } => {
                 let snapshot_slot = loader.snapshot_slot();
                 let append_vec_count = loader.append_vec_count_hint();
+                info!(
+                    "[clickhouse] processing {} snapshot slot={} group={} append_vecs={:?}",
+                    snapshot_kind.as_str(),
+                    snapshot_slot,
+                    group.as_str(),
+                    append_vec_count
+                );
                 debug!(
                     "Dumping {} snapshot slot {snapshot_slot} to ClickHouse",
                     snapshot_kind.as_str()
@@ -459,14 +677,61 @@ impl IncrementalOutput {
                         clickhouse_url.clone(),
                         snapshot_slot,
                         append_vec_count,
+                        group,
                     )?
-                    .insert_all(loader.iter(), snapshot_kind, *workers),
+                    .insert_all(
+                        loader.iter(),
+                        snapshot_kind,
+                        *workers,
+                        refresh_from_slot,
+                        force_hot_rebuild,
+                    ),
                 )?;
                 log_clickhouse_index_stats(&stats);
+                info!(
+                    "[clickhouse] completed {} snapshot slot={} group={} accounts={} token_accounts={}",
+                    snapshot_kind.as_str(),
+                    snapshot_slot,
+                    group.as_str(),
+                    stats.accounts_total,
+                    stats.token_accounts_total
+                );
             }
         }
         Ok(())
     }
+}
+
+/// A failed staging generation must never take the already-serving active
+/// generation down.  Keep the backup raw Merge paused, clear all seven backup
+/// tables, and let the watcher retry the full snapshot on its next iteration.
+/// Cleanup is best-effort here; a later retry will attempt the TRUNCATE again.
+fn reset_failed_staging(
+    output: &mut IncrementalOutput,
+    candidate: &WatchedSnapshot,
+    poll_interval: Duration,
+    reason: &str,
+) {
+    warn!(
+        "[switch] staging 全量失败，active 继续服役；清理 _bak 后重试 file={} slot={} reason={}",
+        candidate.path().display(),
+        candidate.slot(),
+        reason
+    );
+    if let Err(err) = output.stop_raw_merges(TableGroup::Backup) {
+        warn!(
+            "[switch] staging 失败后再次暂停 _bak raw MERGE 失败：{}",
+            err
+        );
+    }
+    match output.reset_group(TableGroup::Backup) {
+        Ok(()) => info!("[switch] staging 失败后的 _bak 七张表已清理，等待后重试该全量"),
+        Err(err) => warn!(
+            "[switch] staging 失败后的 _bak 清理失败（下次重试时会再次清理）：{}",
+            err
+        ),
+    }
+    thread::sleep(poll_interval);
 }
 
 fn run_incremental_snapshots(
@@ -475,7 +740,12 @@ fn run_incremental_snapshots(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut output = IncrementalOutput::new(args)?;
     let mut bootstrap_pending = args.bootstrap;
-    let mut resume_slot = if bootstrap_pending {
+    let mut active_slot = if bootstrap_pending {
+        let existing_max_slot = output.max_raw_account_updated_slot()?;
+        info!(
+            "[watcher] bootstrap 启动：现有 active raw_account 最大 slot={} 将被忽略，active 组从 slot 0 等待并导入全量快照",
+            existing_max_slot
+        );
         0
     } else {
         let max_updated_slot = output.max_raw_account_updated_slot()?;
@@ -485,16 +755,38 @@ fn run_incremental_snapshots(
             "Read raw_account maximum updated_slot={max_updated_slot}; rewound {} slots to resume slot {resume_slot}",
             args.resume_slot_rewind
         );
+        info!(
+            "[watcher] 非 bootstrap 启动：active raw_account 最大 slot={}，回退 {} 个 slot，起始 resume_slot={}",
+            max_updated_slot,
+            args.resume_slot_rewind,
+            resume_slot
+        );
         resume_slot
     };
+    let mut staging_slot: Option<u64> = None;
+    let mut retired_until: Option<std::time::Instant> = None;
+    let mut hot_fingerprint = output.hot_token_fingerprint()?;
+    let mut active_group_id: u8 = if bootstrap_pending {
+        1
+    } else {
+        output.active_group_id().unwrap_or(1)
+    };
     let mut has_processed_snapshot = false;
+    let mut waiting_logged = false;
     let mut invalid_archives = HashSet::<PathBuf>::new();
     let poll_interval = Duration::from_secs(args.incremental_poll_interval_secs);
+    info!(
+        "[watcher] snapshot directory={} active_slot={} bootstrap={} poll_interval={}s",
+        directory.display(),
+        active_slot,
+        bootstrap_pending,
+        args.incremental_poll_interval_secs
+    );
 
     debug!(
         "Watching snapshot directory {} from resume slot {}{}",
         directory.display(),
-        resume_slot,
+        active_slot,
         if bootstrap_pending {
             " (bootstrap: requiring a full snapshot)"
         } else {
@@ -503,59 +795,73 @@ fn run_incremental_snapshots(
     );
 
     loop {
+        if let Some(deadline) = retired_until {
+            if std::time::Instant::now() >= deadline {
+                info!(
+                    "[switch] 5 分钟回滚安全窗口已结束，开始清空旧 _bak 表（TRUNCATE ... max_table_size_to_drop=0）"
+                );
+                output.reset_group(TableGroup::Backup)?;
+                info!("[switch] 旧 _bak 表已清空，可用于下一轮 staging 全量构建");
+                retired_until = None;
+            }
+        }
         let incrementals = discover_incremental_snapshots(directory)?;
         let fulls = discover_full_snapshots(directory)?;
         let has_archives = !incrementals.is_empty() || !fulls.is_empty();
         let next_incremental_base = incrementals
             .iter()
-            .filter(|snapshot| snapshot.slot() > resume_slot)
+            .filter(|snapshot| snapshot.slot() > active_slot)
             .map(|snapshot| snapshot.base_slot())
             .min();
-        let candidates =
-            watched_snapshot_candidates(incrementals, fulls, resume_slot, bootstrap_pending);
-        let mut selected: Option<(WatchedSnapshot, SupportedLoader)> = None;
-
-        for candidate in candidates {
-            if invalid_archives.contains(candidate.path()) {
-                continue;
+        // Before a new full snapshot is seen, only the active path consumes
+        // incrementals.  Once staging exists, every subsequent incremental is
+        // opened independently for each path and applied only where its slot
+        // is newer; this keeps the two raw states independent.
+        let selected_incremental = if bootstrap_pending {
+            None
+        } else if staging_slot.is_some() {
+            let stage_watermark = staging_slot.expect("staging slot checked above");
+            // Advance the lagging path first.  Choosing the furthest archive
+            // that is only eligible for staging could skip the active path's
+            // bridge archive (for example [1200,1300] followed by
+            // [2300,2400]).  Prefer an archive whose base is applicable to
+            // active; otherwise let staging make progress independently.
+            eligible_candidates(incrementals.clone(), active_slot)
+                .into_iter()
+                .filter(|snapshot| !invalid_archives.contains(snapshot.path()))
+                .next()
+                .or_else(|| {
+                    eligible_candidates(incrementals, stage_watermark)
+                        .into_iter()
+                        .filter(|snapshot| !invalid_archives.contains(snapshot.path()))
+                        .next()
+                })
+                .map(WatchedSnapshot::Incremental)
+        } else {
+            eligible_candidates(incrementals, active_slot)
+                .into_iter()
+                .filter(|snapshot| !invalid_archives.contains(snapshot.path()))
+                .next()
+                .map(WatchedSnapshot::Incremental)
+        };
+        let selected = selected_incremental.or_else(|| {
+            if (bootstrap_pending || staging_slot.is_none()) && retired_until.is_none() {
+                eligible_full_candidates(fulls, active_slot)
+                    .into_iter()
+                    .filter(|snapshot| !invalid_archives.contains(snapshot.path()))
+                    .next()
+                    .map(WatchedSnapshot::Full)
+            } else {
+                None
             }
+        });
 
-            candidate.log_verification();
-            let loader = match candidate.new_loader(resume_slot) {
-                Ok(loader) => loader,
-                Err(err) => {
-                    warn!(
-                        "Ignoring unreadable {} snapshot {}: {}",
-                        candidate.kind(),
-                        candidate.path().display(),
-                        err
-                    );
-                    invalid_archives.insert(candidate.path().to_path_buf());
-                    continue;
-                }
-            };
-
-            if loader.snapshot_slot() != candidate.slot() {
-                warn!(
-                    "Ignoring {} snapshot {}: filename expects slot={}, manifest has slot={}",
-                    candidate.kind(),
-                    candidate.path().display(),
-                    candidate.slot(),
-                    loader.snapshot_slot(),
-                );
-                invalid_archives.insert(candidate.path().to_path_buf());
-                continue;
-            }
-            selected = Some((candidate, loader));
-            break;
-        }
-
-        let Some((candidate, mut loader)) = selected else {
-            if !bootstrap_pending {
+        let Some(candidate) = selected else {
+            if !bootstrap_pending && staging_slot.is_none() && retired_until.is_none() {
                 if let Some(base_slot) = next_incremental_base {
-                    if base_slot > resume_slot {
+                    if base_slot > active_slot {
                         return Err(std::io::Error::other(format!(
-                            "no suitable snapshot for resume slot {resume_slot}: slot gap detected; the next incremental starts at base slot {base_slot} and no bridging full snapshot is available; stopping watcher"
+                            "no suitable snapshot for active slot {active_slot}: next incremental starts at base slot {base_slot} and no bridging full snapshot is available"
                         ))
                         .into());
                     }
@@ -577,9 +883,23 @@ fn run_incremental_snapshots(
                 ))
                 .into());
             }
+            if !waiting_logged {
+                info!(
+                    "[watcher] 当前没有可处理的新快照，active_slot={} staging_slot={:?}，等待 {} 秒后重试",
+                    active_slot,
+                    staging_slot,
+                    args.incremental_poll_interval_secs
+                );
+                waiting_logged = true;
+            }
             thread::sleep(poll_interval);
             continue;
         };
+
+        if waiting_logged {
+            info!("[watcher] 发现新的可处理快照，继续处理");
+            waiting_logged = false;
+        }
 
         let snapshot_kind = match &candidate {
             WatchedSnapshot::Incremental(_) => SnapshotKind::Incremental,
@@ -591,27 +911,200 @@ fn run_incremental_snapshots(
             candidate.path(),
             candidate.slot(),
         );
-        if let Err(err) = output.process(&mut loader, snapshot_kind) {
-            console_snapshot_status(
-                "failed",
-                snapshot_kind.as_str(),
-                candidate.path(),
-                candidate.slot(),
+        candidate.log_verification();
+        info!(
+            "[watcher] 选择 {} 快照 file={} slot={} active_slot={} staging_slot={:?}",
+            snapshot_kind.as_str(),
+            candidate.path().display(),
+            candidate.slot(),
+            active_slot,
+            staging_slot
+        );
+        if matches!(candidate, WatchedSnapshot::Full(_)) {
+            // A full snapshot starts a completely fresh staging generation.
+            let bootstrap_full = bootstrap_pending;
+            let group = if bootstrap_full {
+                TableGroup::Active
+            } else {
+                TableGroup::Backup
+            };
+            info!(
+                "[switch] {} 全量到达，准备 {} 组：清空目标组并从 slot 0 冷启动",
+                if bootstrap_full {
+                    "bootstrap"
+                } else {
+                    "新一轮"
+                },
+                group.as_str()
             );
-            error!(
-                "Failed to process {} snapshot {}: {}. Stopping watcher; the file was retained and slot {} remains current",
-                candidate.kind(),
-                candidate.path().display(),
-                err,
-                resume_slot
+            info!(
+                "[clickhouse] {} raw 全量冷启动：暂停 {} 组 raw 表后台 MERGE，以优先保障 INSERT",
+                if bootstrap_full {
+                    "bootstrap"
+                } else {
+                    "staging"
+                },
+                group.as_str()
             );
-            return Err(std::io::Error::other(format!(
-                "failed to process {} snapshot {} at slot {}: {err}; automatic retry is disabled",
-                candidate.kind(),
-                candidate.path().display(),
-                candidate.slot(),
-            ))
-            .into());
+            if let Err(err) = output.stop_raw_merges(group) {
+                warn!(
+                    "[clickhouse] failed to pause {} raw MERGE: {}",
+                    group.as_str(),
+                    err
+                );
+                if bootstrap_full {
+                    return Err(err);
+                }
+                reset_failed_staging(&mut output, &candidate, poll_interval, "STOP MERGES 失败");
+                continue;
+            }
+            if let Err(err) = output.reset_group(group) {
+                warn!(
+                    "[clickhouse] reset {} group failed: {}",
+                    group.as_str(),
+                    err
+                );
+                if bootstrap_full {
+                    return Err(err);
+                }
+                reset_failed_staging(
+                    &mut output,
+                    &candidate,
+                    poll_interval,
+                    "清理 staging 表失败",
+                );
+                continue;
+            }
+            let mut loader = match candidate.new_loader(0) {
+                Ok(loader) => loader,
+                Err(err) => {
+                    warn!(
+                        "[clickhouse] {} full snapshot loader failed: {}",
+                        group.as_str(),
+                        err
+                    );
+                    if bootstrap_full {
+                        console_snapshot_status(
+                            "failed",
+                            snapshot_kind.as_str(),
+                            candidate.path(),
+                            candidate.slot(),
+                        );
+                        return Err(err);
+                    }
+                    reset_failed_staging(
+                        &mut output,
+                        &candidate,
+                        poll_interval,
+                        "解析 full 快照失败",
+                    );
+                    continue;
+                }
+            };
+            let process_result = output.process(&mut loader, snapshot_kind, group, None, false);
+            if let Err(err) = process_result {
+                warn!(
+                    "[clickhouse] {} full snapshot import/derived refresh failed: {}",
+                    group.as_str(),
+                    err
+                );
+                if bootstrap_full {
+                    return Err(err);
+                }
+                reset_failed_staging(
+                    &mut output,
+                    &candidate,
+                    poll_interval,
+                    "ClickHouse 导入或二层刷新失败",
+                );
+                continue;
+            }
+            if let Err(err) = output.start_raw_merges(group) {
+                warn!(
+                    "[clickhouse] {} full snapshot succeeded but START MERGES failed: {}",
+                    group.as_str(),
+                    err
+                );
+                if bootstrap_full {
+                    return Err(err);
+                }
+                reset_failed_staging(&mut output, &candidate, poll_interval, "START MERGES 失败");
+                continue;
+            }
+            info!(
+                "[clickhouse] {} 组 raw 全量冷启动完成，已恢复后台 MERGE；开始后续派生/增量流程",
+                group.as_str()
+            );
+            hot_fingerprint = output.hot_token_fingerprint()?;
+            let control_hot_version = output.hot_token_version()?;
+            if bootstrap_full {
+                active_slot = candidate.slot();
+                bootstrap_pending = false;
+                if let Err(err) =
+                    output.record_control(active_group_id, active_slot, control_hot_version)
+                {
+                    warn!("Failed to record initial hot-index control state: {err}");
+                }
+                debug!("Full bootstrap complete at slot {}", active_slot);
+                info!(
+                    "[watcher] bootstrap 全量导入完成，active_slot={}，开始接收增量快照",
+                    active_slot
+                );
+            } else {
+                staging_slot = Some(candidate.slot());
+                debug!("Staging full snapshot ready at slot {}", candidate.slot());
+                info!(
+                    "[switch] staging 全量构建完成，staging_slot={}；后续增量将同时更新 active 与 _bak",
+                    candidate.slot()
+                );
+            }
+        } else {
+            let incremental = match &candidate {
+                WatchedSnapshot::Incremental(snapshot) => snapshot,
+                WatchedSnapshot::Full(_) => unreachable!(),
+            };
+            let current_hot_fingerprint = output.hot_token_fingerprint()?;
+            let force_hot_rebuild = current_hot_fingerprint != hot_fingerprint;
+            // Active path is always kept current.  During staging, the same
+            // archive is opened again with staging's own watermark.
+            if (staging_slot.is_none() || candidate.slot() > active_slot)
+                && incremental.base_slot() <= active_slot
+            {
+                let mut loader = match candidate.new_loader(active_slot) {
+                    Ok(loader) => loader,
+                    Err(err) => {
+                        invalid_archives.insert(candidate.path().to_path_buf());
+                        warn!(
+                            "Ignoring unreadable incremental snapshot {}: {}",
+                            candidate.path().display(),
+                            err
+                        );
+                        continue;
+                    }
+                };
+                output.process(
+                    &mut loader,
+                    snapshot_kind,
+                    TableGroup::Active,
+                    Some(incremental.base_slot()),
+                    force_hot_rebuild,
+                )?;
+                active_slot = candidate.slot();
+            }
+            if let Some(stage_slot) = staging_slot {
+                if candidate.slot() > stage_slot && incremental.base_slot() <= stage_slot {
+                    let mut loader = candidate.new_loader(stage_slot)?;
+                    output.process(
+                        &mut loader,
+                        snapshot_kind,
+                        TableGroup::Backup,
+                        Some(incremental.base_slot()),
+                        force_hot_rebuild,
+                    )?;
+                    staging_slot = Some(candidate.slot());
+                }
+            }
+            hot_fingerprint = current_hot_fingerprint;
         }
 
         console_snapshot_status(
@@ -620,13 +1113,44 @@ fn run_incremental_snapshots(
             candidate.path(),
             candidate.slot(),
         );
-        resume_slot = candidate.slot();
+        info!(
+            "[watcher] {} 快照处理完成：active_slot={} staging_slot={:?}",
+            snapshot_kind.as_str(),
+            active_slot,
+            staging_slot
+        );
         has_processed_snapshot = true;
-        if bootstrap_pending {
-            bootstrap_pending = false;
-            debug!("Full bootstrap complete; incremental snapshots are now eligible");
+        if let Some(stage_slot) = staging_slot {
+            if stage_slot == active_slot {
+                debug!(
+                    "Active and staging reached slot {}; exchanging table groups",
+                    stage_slot
+                );
+                info!(
+                    "[switch] active 与 _bak 已追平到 slot={}，执行切换前派生表一致性检查",
+                    stage_slot
+                );
+                output.validate_group_parity()?;
+                info!("[switch] 一致性检查通过，开始交换七对 active/_bak 表");
+                output.exchange_groups()?;
+                active_slot = stage_slot;
+                staging_slot = None;
+                active_group_id = if active_group_id == 1 { 2 } else { 1 };
+                let control_hot_version = output.hot_token_version().unwrap_or_default();
+                if let Err(err) =
+                    output.record_control(active_group_id, active_slot, control_hot_version)
+                {
+                    warn!("Table exchange succeeded but control audit write failed: {err}");
+                }
+                retired_until = Some(std::time::Instant::now() + Duration::from_secs(300));
+                info!(
+                    "[switch] 表组切换完成：active_group={} ready_slot={}；旧组进入 5 分钟回滚窗口",
+                    active_group_id, active_slot
+                );
+                debug!("Table-group switch complete; _bak rollback window is 5 minutes");
+            }
         }
-        debug!("Advanced resume slot to {resume_slot}");
+        debug!("Advanced active slot to {active_slot}");
         invalid_archives.retain(|path| path.exists());
     }
 }
