@@ -1,8 +1,9 @@
 use crate::clickhouse::{
     active_group_id, exchange_table_groups, hot_token_fingerprint, hot_token_version,
     max_raw_account_updated_slot, rebuild_hot_indexes_from_raw, record_index_control,
-    reset_table_group, set_raw_table_merges, validate_clickhouse_schema, validate_group_parity,
-    ClickhouseIndexer, CloseTombstoneStats, SnapshotKind, TableGroup,
+    reset_table_group, set_group_table_merges, validate_clickhouse_schema, validate_group_parity,
+    wait_for_group_merges_to_settle, ClickhouseIndexer, CloseTombstoneStats, SnapshotKind,
+    TableGroup,
 };
 use clap::{ArgGroup, Parser};
 use env_logger::{Builder, Env, Target};
@@ -19,7 +20,7 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{IoSliceMut, Read, Write};
 use std::path::{Path, PathBuf};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 mod clickhouse;
@@ -254,7 +255,7 @@ fn validate_clickhouse_prerequisites() -> Result<(), Box<dyn std::error::Error>>
 
 /// Repair only the derived hot tables after a raw full snapshot has already
 /// been imported successfully.  This deliberately does not read any archive
-/// and never truncates raw tables.  Raw merges remain paused when the repair
+/// and never truncates raw tables.  Group raw/hot merges remain paused when the repair
 /// fails; they are enabled only after the hot rebuild succeeds.
 fn rebuild_hot_indexes_only() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
@@ -266,7 +267,7 @@ fn rebuild_hot_indexes_only() -> Result<(), Box<dyn std::error::Error>> {
     info!(
         "[clickhouse] hot-only repair 启动：保留 active raw 数据，仅重建 hot 表；不读取快照、不清空 raw"
     );
-    runtime.block_on(set_raw_table_merges(
+    runtime.block_on(set_group_table_merges(
         &clickhouse_url,
         TableGroup::Active,
         false,
@@ -282,12 +283,12 @@ fn rebuild_hot_indexes_only() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Err(err);
     }
-    runtime.block_on(set_raw_table_merges(
+    runtime.block_on(set_group_table_merges(
         &clickhouse_url,
         TableGroup::Active,
         true,
     ))?;
-    info!("[clickhouse] hot-only repair 成功，active raw MERGE 已恢复");
+    info!("[clickhouse] hot-only repair 成功，active raw+hot MERGE 已恢复");
     Ok(())
 }
 
@@ -361,7 +362,7 @@ fn process_single_snapshot(
         )?;
         let pause_merges = matches!(snapshot_kind, SnapshotKind::Full);
         if pause_merges {
-            if let Err(err) = runtime.block_on(set_raw_table_merges(
+            if let Err(err) = runtime.block_on(set_group_table_merges(
                 &clickhouse_url,
                 TableGroup::Active,
                 false,
@@ -380,10 +381,14 @@ fn process_single_snapshot(
         let stats = if pause_merges {
             match import_result {
                 Ok(stats) => {
-                    runtime.block_on(set_raw_table_merges(
+                    runtime.block_on(set_group_table_merges(
                         &clickhouse_url,
                         TableGroup::Active,
                         true,
+                    ))?;
+                    runtime.block_on(wait_for_group_merges_to_settle(
+                        &clickhouse_url,
+                        TableGroup::Active,
                     ))?;
                     stats
                 }
@@ -469,6 +474,15 @@ enum WatchedSnapshot {
     Full(FullSnapshot),
 }
 
+/// A staging full snapshot is built independently of the watcher thread so
+/// that the already-serving active path can continue consuming incrementals.
+/// The snapshot value is retained for cleanup/retry if the background build
+/// fails.
+struct StagingBuild {
+    snapshot: FullSnapshot,
+    handle: JoinHandle<Result<(), String>>,
+}
+
 impl WatchedSnapshot {
     fn path(&self) -> &Path {
         match self {
@@ -520,14 +534,31 @@ impl IncrementalOutput {
         dotenvy::dotenv().ok();
         let clickhouse_url = std::env::var("CLICKHOUSE_URL")
             .map_err(|_| "CLICKHOUSE_URL must be set in the environment or .env file")?;
+        Self::from_config(clickhouse_url, args.clickhouse_workers)
+    }
+
+    fn from_config(
+        clickhouse_url: String,
+        workers: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         Ok(Self::Clickhouse {
             clickhouse_url,
             runtime,
-            workers: args.clickhouse_workers,
+            workers,
         })
+    }
+
+    fn clickhouse_config(&self) -> (String, usize) {
+        match self {
+            Self::Clickhouse {
+                clickhouse_url,
+                workers,
+                ..
+            } => (clickhouse_url.clone(), *workers),
+        }
     }
 
     fn max_raw_account_updated_slot(&self) -> Result<u64, Box<dyn std::error::Error>> {
@@ -555,23 +586,36 @@ impl IncrementalOutput {
         }
     }
 
-    fn stop_raw_merges(&mut self, group: TableGroup) -> Result<(), Box<dyn std::error::Error>> {
+    fn stop_group_merges(&mut self, group: TableGroup) -> Result<(), Box<dyn std::error::Error>> {
         match self {
             Self::Clickhouse {
                 clickhouse_url,
                 runtime,
                 ..
-            } => runtime.block_on(set_raw_table_merges(clickhouse_url, group, false)),
+            } => runtime.block_on(set_group_table_merges(clickhouse_url, group, false)),
         }
     }
 
-    fn start_raw_merges(&mut self, group: TableGroup) -> Result<(), Box<dyn std::error::Error>> {
+    fn start_group_merges(&mut self, group: TableGroup) -> Result<(), Box<dyn std::error::Error>> {
         match self {
             Self::Clickhouse {
                 clickhouse_url,
                 runtime,
                 ..
-            } => runtime.block_on(set_raw_table_merges(clickhouse_url, group, true)),
+            } => runtime.block_on(set_group_table_merges(clickhouse_url, group, true)),
+        }
+    }
+
+    fn wait_for_group_merges_to_settle(
+        &mut self,
+        group: TableGroup,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::Clickhouse {
+                clickhouse_url,
+                runtime,
+                ..
+            } => runtime.block_on(wait_for_group_merges_to_settle(clickhouse_url, group)),
         }
     }
 
@@ -718,9 +762,9 @@ fn reset_failed_staging(
         candidate.slot(),
         reason
     );
-    if let Err(err) = output.stop_raw_merges(TableGroup::Backup) {
+    if let Err(err) = output.stop_group_merges(TableGroup::Backup) {
         warn!(
-            "[switch] staging 失败后再次暂停 _bak raw MERGE 失败：{}",
+            "[switch] staging 失败后再次暂停 _bak raw+hot MERGE 失败：{}",
             err
         );
     }
@@ -732,6 +776,83 @@ fn reset_failed_staging(
         ),
     }
     thread::sleep(poll_interval);
+}
+
+/// Build a fresh `_bak` generation on a dedicated worker thread.  The
+/// watcher keeps its own ClickHouse runtime for active incrementals, while
+/// this worker owns a separate runtime/client for the staging path.
+fn build_staging_full(
+    snapshot: FullSnapshot,
+    clickhouse_url: String,
+    workers: usize,
+) -> Result<(), String> {
+    let mut output = IncrementalOutput::from_config(clickhouse_url, workers)
+        .map_err(|err| format!("failed to create staging ClickHouse runtime: {err}"))?;
+    let candidate = WatchedSnapshot::Full(snapshot);
+    let group = TableGroup::Backup;
+
+    output
+        .stop_group_merges(group)
+        .map_err(|err| format!("failed to pause _bak raw+hot MERGE: {err}"))?;
+    output
+        .reset_group(group)
+        .map_err(|err| format!("failed to reset _bak group: {err}"))?;
+    let mut loader = candidate
+        .new_loader(0)
+        .map_err(|err| format!("failed to create staging full snapshot loader: {err}"))?;
+    output
+        .process(&mut loader, SnapshotKind::Full, group, None, false)
+        .map_err(|err| format!("staging full snapshot import/derived refresh failed: {err}"))?;
+    output
+        .start_group_merges(group)
+        .map_err(|err| format!("staging full snapshot succeeded but START MERGES failed: {err}"))?;
+    output
+        .wait_for_group_merges_to_settle(group)
+        .map_err(|err| format!("staging raw+hot MERGE settle check failed: {err}"))?;
+    Ok(())
+}
+
+/// Atomically promote a staging generation once both paths have reached the
+/// same slot.  Returns `true` when a switch was performed.
+fn exchange_if_ready(
+    output: &mut IncrementalOutput,
+    active_group_id: &mut u8,
+    active_slot: &mut u64,
+    staging_slot: &mut Option<u64>,
+    retired_until: &mut Option<std::time::Instant>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(stage_slot) = *staging_slot else {
+        return Ok(false);
+    };
+    if stage_slot != *active_slot {
+        return Ok(false);
+    }
+
+    debug!(
+        "Active and staging reached slot {}; exchanging table groups",
+        stage_slot
+    );
+    info!(
+        "[switch] active 与 _bak 已追平到 slot={}，执行切换前派生表一致性检查",
+        stage_slot
+    );
+    output.validate_group_parity()?;
+    info!("[switch] 一致性检查通过，开始交换七对 active/_bak 表");
+    output.exchange_groups()?;
+    *active_slot = stage_slot;
+    *staging_slot = None;
+    *active_group_id = if *active_group_id == 1 { 2 } else { 1 };
+    let control_hot_version = output.hot_token_version().unwrap_or_default();
+    if let Err(err) = output.record_control(*active_group_id, *active_slot, control_hot_version) {
+        warn!("Table exchange succeeded but control audit write failed: {err}");
+    }
+    *retired_until = Some(std::time::Instant::now() + Duration::from_secs(300));
+    info!(
+        "[switch] 表组切换完成：active_group={} ready_slot={}；旧组进入 5 分钟回滚窗口",
+        *active_group_id, *active_slot
+    );
+    debug!("Table-group switch complete; _bak rollback window is 5 minutes");
+    Ok(true)
 }
 
 fn run_incremental_snapshots(
@@ -764,6 +885,7 @@ fn run_incremental_snapshots(
         resume_slot
     };
     let mut staging_slot: Option<u64> = None;
+    let mut staging_build: Option<StagingBuild> = None;
     let mut retired_until: Option<std::time::Instant> = None;
     let mut hot_fingerprint = output.hot_token_fingerprint()?;
     let mut active_group_id: u8 = if bootstrap_pending {
@@ -795,6 +917,65 @@ fn run_incremental_snapshots(
     );
 
     loop {
+        // A staging full is built in parallel with the active path.  Harvest
+        // its result without blocking; while it is still running, the normal
+        // candidate selection below continues to consume active incrementals.
+        if staging_build
+            .as_ref()
+            .is_some_and(|build| build.handle.is_finished())
+        {
+            let build = staging_build.take().expect("staging build checked above");
+            let snapshot = build.snapshot;
+            match build.handle.join() {
+                Ok(Ok(())) => {
+                    staging_slot = Some(snapshot.slot());
+                    has_processed_snapshot = true;
+                    debug!("Staging full snapshot ready at slot {}", snapshot.slot());
+                    info!(
+                        "[switch] staging 全量构建完成，staging_slot={}；active 已并行追赶，后续增量将同时更新 active 与 _bak",
+                        snapshot.slot()
+                    );
+                    console_snapshot_status(
+                        "completed",
+                        SnapshotKind::Full.as_str(),
+                        snapshot.path(),
+                        snapshot.slot(),
+                    );
+                }
+                Ok(Err(err)) => {
+                    let candidate = WatchedSnapshot::Full(snapshot);
+                    warn!("[switch] staging 后台构建失败：{}", err);
+                    reset_failed_staging(
+                        &mut output,
+                        &candidate,
+                        poll_interval,
+                        "后台全量导入或二层刷新失败",
+                    );
+                }
+                Err(panic) => {
+                    let candidate = WatchedSnapshot::Full(snapshot);
+                    warn!("[switch] staging 后台构建线程异常退出：{:?}", panic);
+                    reset_failed_staging(
+                        &mut output,
+                        &candidate,
+                        poll_interval,
+                        "后台构建线程异常退出",
+                    );
+                }
+            }
+        }
+
+        // If active consumed the same slot while staging was building, the
+        // newly completed backup can be promoted immediately rather than
+        // waiting for another incremental archive to arrive.
+        exchange_if_ready(
+            &mut output,
+            &mut active_group_id,
+            &mut active_slot,
+            &mut staging_slot,
+            &mut retired_until,
+        )?;
+
         if let Some(deadline) = retired_until {
             if std::time::Instant::now() >= deadline {
                 info!(
@@ -845,7 +1026,9 @@ fn run_incremental_snapshots(
                 .map(WatchedSnapshot::Incremental)
         };
         let selected = selected_incremental.or_else(|| {
-            if (bootstrap_pending || staging_slot.is_none()) && retired_until.is_none() {
+            if (bootstrap_pending || (staging_slot.is_none() && staging_build.is_none()))
+                && retired_until.is_none()
+            {
                 eligible_full_candidates(fulls, active_slot)
                     .into_iter()
                     .filter(|snapshot| !invalid_archives.contains(snapshot.path()))
@@ -857,6 +1040,17 @@ fn run_incremental_snapshots(
         });
 
         let Some(candidate) = selected else {
+            if staging_build.is_some() {
+                if !waiting_logged {
+                    info!(
+                        "[watcher] _bak 全量仍在后台制备，active_slot={}；继续等待可处理的 active 增量或 staging 完成",
+                        active_slot
+                    );
+                    waiting_logged = true;
+                }
+                thread::sleep(poll_interval);
+                continue;
+            }
             if !bootstrap_pending && staging_slot.is_none() && retired_until.is_none() {
                 if let Some(base_slot) = next_incremental_base {
                     if base_slot > active_slot {
@@ -913,12 +1107,13 @@ fn run_incremental_snapshots(
         );
         candidate.log_verification();
         info!(
-            "[watcher] 选择 {} 快照 file={} slot={} active_slot={} staging_slot={:?}",
+            "[watcher] 选择 {} 快照 file={} slot={} active_slot={} staging_slot={:?} staging_build={}",
             snapshot_kind.as_str(),
             candidate.path().display(),
             candidate.slot(),
             active_slot,
-            staging_slot
+            staging_slot,
+            staging_build.is_some()
         );
         if matches!(candidate, WatchedSnapshot::Full(_)) {
             // A full snapshot starts a completely fresh staging generation.
@@ -938,7 +1133,7 @@ fn run_incremental_snapshots(
                 group.as_str()
             );
             info!(
-                "[clickhouse] {} raw 全量冷启动：暂停 {} 组 raw 表后台 MERGE，以优先保障 INSERT",
+                "[clickhouse] {} 全量冷启动：暂停 {} 组 raw+hot 表后台 MERGE，以优先保障 INSERT",
                 if bootstrap_full {
                     "bootstrap"
                 } else {
@@ -946,9 +1141,45 @@ fn run_incremental_snapshots(
                 },
                 group.as_str()
             );
-            if let Err(err) = output.stop_raw_merges(group) {
+            if !bootstrap_full {
+                let staging_snapshot = match &candidate {
+                    WatchedSnapshot::Full(snapshot) => snapshot.clone(),
+                    WatchedSnapshot::Incremental(_) => unreachable!(),
+                };
+                let (clickhouse_url, workers) = output.clickhouse_config();
+                let snapshot_slot = staging_snapshot.slot();
+                let handle = match thread::Builder::new()
+                    .name("staging-full".to_owned())
+                    .spawn(move || build_staging_full(staging_snapshot, clickhouse_url, workers))
+                {
+                    Ok(handle) => handle,
+                    Err(err) => {
+                        warn!("[switch] 无法启动 staging 后台构建线程：{}", err);
+                        reset_failed_staging(
+                            &mut output,
+                            &candidate,
+                            poll_interval,
+                            "无法启动后台构建线程",
+                        );
+                        continue;
+                    }
+                };
+                staging_build = Some(StagingBuild {
+                    snapshot: match candidate {
+                        WatchedSnapshot::Full(snapshot) => snapshot,
+                        WatchedSnapshot::Incremental(_) => unreachable!(),
+                    },
+                    handle,
+                });
+                info!(
+                    "[switch] 新一轮全量 slot={} 已转入 _bak 后台制备；active 路径继续消费增量",
+                    snapshot_slot
+                );
+                continue;
+            }
+            if let Err(err) = output.stop_group_merges(group) {
                 warn!(
-                    "[clickhouse] failed to pause {} raw MERGE: {}",
+                    "[clickhouse] failed to pause {} raw+hot MERGE: {}",
                     group.as_str(),
                     err
                 );
@@ -1019,7 +1250,7 @@ fn run_incremental_snapshots(
                 );
                 continue;
             }
-            if let Err(err) = output.start_raw_merges(group) {
+            if let Err(err) = output.start_group_merges(group) {
                 warn!(
                     "[clickhouse] {} full snapshot succeeded but START MERGES failed: {}",
                     group.as_str(),
@@ -1031,8 +1262,9 @@ fn run_incremental_snapshots(
                 reset_failed_staging(&mut output, &candidate, poll_interval, "START MERGES 失败");
                 continue;
             }
+            output.wait_for_group_merges_to_settle(group)?;
             info!(
-                "[clickhouse] {} 组 raw 全量冷启动完成，已恢复后台 MERGE；开始后续派生/增量流程",
+                "[clickhouse] {} 组 raw 全量冷启动完成，后台 MERGE 已收敛到增量写入门槛；开始后续增量流程",
                 group.as_str()
             );
             hot_fingerprint = output.hot_token_fingerprint()?;
@@ -1120,36 +1352,13 @@ fn run_incremental_snapshots(
             staging_slot
         );
         has_processed_snapshot = true;
-        if let Some(stage_slot) = staging_slot {
-            if stage_slot == active_slot {
-                debug!(
-                    "Active and staging reached slot {}; exchanging table groups",
-                    stage_slot
-                );
-                info!(
-                    "[switch] active 与 _bak 已追平到 slot={}，执行切换前派生表一致性检查",
-                    stage_slot
-                );
-                output.validate_group_parity()?;
-                info!("[switch] 一致性检查通过，开始交换七对 active/_bak 表");
-                output.exchange_groups()?;
-                active_slot = stage_slot;
-                staging_slot = None;
-                active_group_id = if active_group_id == 1 { 2 } else { 1 };
-                let control_hot_version = output.hot_token_version().unwrap_or_default();
-                if let Err(err) =
-                    output.record_control(active_group_id, active_slot, control_hot_version)
-                {
-                    warn!("Table exchange succeeded but control audit write failed: {err}");
-                }
-                retired_until = Some(std::time::Instant::now() + Duration::from_secs(300));
-                info!(
-                    "[switch] 表组切换完成：active_group={} ready_slot={}；旧组进入 5 分钟回滚窗口",
-                    active_group_id, active_slot
-                );
-                debug!("Table-group switch complete; _bak rollback window is 5 minutes");
-            }
-        }
+        exchange_if_ready(
+            &mut output,
+            &mut active_group_id,
+            &mut active_slot,
+            &mut staging_slot,
+            &mut retired_until,
+        )?;
         debug!("Advanced active slot to {active_slot}");
         invalid_archives.retain(|path| path.exists());
     }

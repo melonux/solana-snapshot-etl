@@ -31,6 +31,20 @@ const RAW_TABLES: [&str; 4] = [
     TOKEN_MINT_TABLE,
     TOKEN_METADATA_TABLE,
 ];
+const GROUP_HOT_TABLES: [&str; 3] = [
+    "hot_token_account_state",
+    "hot_token_info",
+    "hot_wallet_token_balance",
+];
+const GROUP_MERGE_TABLES: [&str; 7] = [
+    ACCOUNT_TABLE,
+    TOKEN_ACCOUNT_TABLE,
+    TOKEN_MINT_TABLE,
+    TOKEN_METADATA_TABLE,
+    "hot_token_account_state",
+    "hot_token_info",
+    "hot_wallet_token_balance",
+];
 // `hot_token_info` is built in ordered mint ranges.  The full source mint and
 // metadata tables are sorted by mint, so a bounded range keeps the right side
 // of each JOIN small without repeatedly scanning overlapping key ranges.
@@ -39,6 +53,15 @@ const HOT_TOKEN_INFO_BATCH_SIZE: u64 = 10_000;
 // cap.  ClickHouse spills intermediate GROUP BY / sort state to its temporary
 // disk once either limit is reached.
 const HOT_BALANCE_EXTERNAL_AGGREGATION_BYTES: &str = "1073741824";
+// A cold full import deliberately leaves a bounded number of large parts in
+// each group table. Once background merges are restarted, let that backlog
+// shrink before accepting the next incremental INSERT: otherwise the merge
+// burst and another set of HTTP RowBinary INSERTs compete for the same disk.
+// The condition is strict: every active partition must have fewer than this
+// many active parts.
+pub(crate) const RAW_MERGE_READY_PARTS_PER_PARTITION_LIMIT: u64 = 20;
+const RAW_MERGE_READY_POLL_INTERVAL: Duration = Duration::from_secs(10);
+const RAW_MERGE_READY_LOG_EVERY_POLLS: u64 = 3;
 
 /// Physical table group used by the dual-buffer importer.  `Active` always
 /// maps to the stable query-facing names; `Backup` maps to the `_bak` staging
@@ -900,11 +923,7 @@ pub(crate) async fn hot_token_fingerprint(connection_url: &str) -> Result<u64> {
 
 pub(crate) async fn reset_table_group(connection_url: &str, group: TableGroup) -> Result<()> {
     let client = new_clickhouse_client(connection_url)?;
-    for base in RAW_TABLES.into_iter().chain([
-        "hot_token_account_state",
-        "hot_token_info",
-        "hot_wallet_token_balance",
-    ]) {
+    for base in RAW_TABLES.into_iter().chain(GROUP_HOT_TABLES) {
         let table = group.table(base);
         client
             .query(&format!(
@@ -917,15 +936,14 @@ pub(crate) async fn reset_table_group(connection_url: &str, group: TableGroup) -
     Ok(())
 }
 
-/// Enable or disable ClickHouse's background merges for the four raw tables
-/// in one physical table group.  Full snapshot loading is append-heavy and
-/// does not need background ReplacingMergeTree deduplication while rows are
-/// arriving; deferring those merges keeps CPU/IO available for INSERTs.  The
-/// caller re-enables merges only after a successful cold load and derived
-/// refresh.  On failure the process exits with merges stopped so that an
-/// incomplete generation cannot continue receiving incrementals; the group
-/// must be cleaned and rebuilt from a valid full snapshot.
-pub(crate) async fn set_raw_table_merges(
+/// Enable or disable ClickHouse's background merges for all seven tables in
+/// one physical table group. Full snapshot loading is append-heavy and does
+/// not need background ReplacingMergeTree deduplication while rows are
+/// arriving; deferring raw and derived-table merges keeps CPU/IO available
+/// for INSERTs. The caller re-enables merges only after a successful cold load
+/// and derived refresh. On failure the process exits (bootstrap) or cleans
+/// the staging group (backup) with merges stopped.
+pub(crate) async fn set_group_table_merges(
     connection_url: &str,
     group: TableGroup,
     enabled: bool,
@@ -933,12 +951,12 @@ pub(crate) async fn set_raw_table_merges(
     let client = new_clickhouse_client(connection_url)?;
     let action = if enabled { "START" } else { "STOP" };
     info!(
-        "[clickhouse] SYSTEM {action} MERGES for raw tables group={} table_count={}",
+        "[clickhouse] SYSTEM {action} MERGES for raw+hot tables group={} table_count={}",
         group.as_str(),
-        RAW_TABLES.len()
+        GROUP_MERGE_TABLES.len()
     );
     let mut first_error = None;
-    for base in RAW_TABLES {
+    for base in GROUP_MERGE_TABLES {
         let table = group.table(base);
         if let Err(err) = client
             .query(&format!("SYSTEM {action} MERGES {table}"))
@@ -958,6 +976,140 @@ pub(crate) async fn set_raw_table_merges(
     match first_error {
         Some(err) => Err(err.into()),
         None => Ok(()),
+    }
+}
+
+#[derive(Debug, Row, Deserialize)]
+struct RawMergePartCount {
+    partition: String,
+    parts_count: u64,
+    total_rows: u64,
+    total_size: String,
+}
+
+fn raw_merge_backlog_is_ready(parts: &[RawMergePartCount]) -> bool {
+    parts
+        .iter()
+        .all(|part| part.parts_count < RAW_MERGE_READY_PARTS_PER_PARTITION_LIMIT)
+}
+
+fn raw_merge_backlog_summary(table: &str, parts: &[RawMergePartCount]) -> String {
+    if parts.is_empty() {
+        return format!("{table}[no active parts]");
+    }
+
+    let partitions = parts
+        .iter()
+        .map(|part| {
+            format!(
+                "partition={} parts={} rows={} size={}",
+                part.partition, part.parts_count, part.total_rows, part.total_size
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{table}[{partitions}]")
+}
+
+async fn raw_merge_part_counts(client: &Client, table: &str) -> Result<Vec<RawMergePartCount>> {
+    client
+        .query(&format!(
+            "SELECT partition, count() AS parts_count, sum(rows) AS total_rows, \
+             formatReadableSize(sum(bytes_on_disk)) AS total_size \
+             FROM system.parts \
+             WHERE database = {database} AND table = {table_name} AND active = 1 \
+             GROUP BY partition \
+             ORDER BY parts_count DESC, partition",
+            database = sql_string_literal(DATABASE),
+            table_name = sql_string_literal(table),
+        ))
+        .fetch_all::<RawMergePartCount>()
+        .await
+        .map_err(|err| format!("failed to read active parts for {table}: {err}").into())
+}
+
+/// After a successful full import starts raw and derived-table Merge again,
+/// wait until every partition in every group table has a modest active-part
+/// backlog. This is a write barrier for the next incremental snapshot, not a
+/// request for a single fully merged part; keeping fewer than 20 parts per
+/// partition still gives ClickHouse room to finish the remaining background
+/// work naturally.
+///
+/// The probe retries transient ClickHouse failures.  At this point the full
+/// generation is already valid and MERGE has already been resumed, so a brief
+/// system.parts read failure must not cause the staging generation to be
+/// cleared and re-imported.
+pub(crate) async fn wait_for_group_merges_to_settle(
+    connection_url: &str,
+    group: TableGroup,
+) -> Result<()> {
+    let client = new_clickhouse_client(connection_url)?;
+    let tables = GROUP_MERGE_TABLES
+        .iter()
+        .map(|base| group.table(base))
+        .collect::<Vec<_>>();
+    let started_at = Instant::now();
+    let mut polls = 0_u64;
+
+    info!(
+        "[clickhouse] group MERGE 已恢复；等待 group={} 的每张 raw+hot 表每个 partition 活跃分片数 < {}，期间不派发该组后续增量 INSERT",
+        group.as_str(),
+        RAW_MERGE_READY_PARTS_PER_PARTITION_LIMIT
+    );
+
+    loop {
+        let mut summaries = Vec::with_capacity(tables.len());
+        let mut ready = true;
+        let mut probe_error = None;
+
+        for table in &tables {
+            match raw_merge_part_counts(&client, table).await {
+                Ok(parts) => {
+                    ready &= raw_merge_backlog_is_ready(&parts);
+                    summaries.push(raw_merge_backlog_summary(table, &parts));
+                }
+                Err(err) => {
+                    probe_error = Some(err);
+                    break;
+                }
+            }
+        }
+
+        if let Some(err) = probe_error {
+            warn!(
+                "[clickhouse] group MERGE 收敛检查失败 group={}；全量数据保持有效、不会清理，{} 秒后重试：{}",
+                group.as_str(),
+                RAW_MERGE_READY_POLL_INTERVAL.as_secs(),
+                err
+            );
+            tokio::time::sleep(RAW_MERGE_READY_POLL_INTERVAL).await;
+            continue;
+        }
+
+        let elapsed_secs = started_at.elapsed().as_secs();
+        if ready {
+            info!(
+                "[clickhouse] group MERGE 收敛完成 group={} elapsed={}s condition=all_tables_all_partitions_parts<{}；允许该组后续增量 INSERT：{}",
+                group.as_str(),
+                elapsed_secs,
+                RAW_MERGE_READY_PARTS_PER_PARTITION_LIMIT,
+                summaries.join("; ")
+            );
+            return Ok(());
+        }
+
+        if polls % RAW_MERGE_READY_LOG_EVERY_POLLS == 0 {
+            info!(
+                "[clickhouse] 等待 group MERGE 收敛 group={} elapsed={}s condition=all_tables_all_partitions_parts<{}；{} 秒后复查：{}",
+                group.as_str(),
+                elapsed_secs,
+                RAW_MERGE_READY_PARTS_PER_PARTITION_LIMIT,
+                RAW_MERGE_READY_POLL_INTERVAL.as_secs(),
+                summaries.join("; ")
+            );
+        }
+        polls += 1;
+        tokio::time::sleep(RAW_MERGE_READY_POLL_INTERVAL).await;
     }
 }
 
@@ -1001,8 +1153,22 @@ pub(crate) async fn refresh_hot_indexes(
         );
     }
 
-    if matches!(snapshot_kind, SnapshotKind::Full) || force_state_rebuild {
+    if matches!(snapshot_kind, SnapshotKind::Full) {
         for table in [&state, &info, &balance] {
+            client
+                .query(&format!(
+                    "TRUNCATE TABLE {table} SETTINGS max_table_size_to_drop = 0"
+                ))
+                .execute()
+                .await
+                .map_err(|err| format!("failed to reset derived table {table}: {err}"))?;
+        }
+    } else if force_state_rebuild {
+        // A hot-token list change requires rebuilding the account state and
+        // wallet aggregate, but token display metadata is intentionally
+        // immutable for the lifetime of this table group. It will be rebuilt
+        // with the next full generation.
+        for table in [&state, &balance] {
             client
                 .query(&format!(
                     "TRUNCATE TABLE {table} SETTINGS max_table_size_to_drop = 0"
@@ -1042,10 +1208,11 @@ pub(crate) async fn refresh_hot_indexes(
         .await
         .map_err(|err| format!("failed to refresh {state}: {err}"))?;
 
-    // MergeTree is deliberately used for the serving table because its sort
-    // key puts the largest balances first. Build both serving tables in a
-    // temporary clone and exchange them into place, so normal active-path
-    // refreshes never expose an empty table to readers.
+    // Build the ReplacingMergeTree serving table in a temporary clone and
+    // exchange it into place, so normal active-path refreshes never expose an
+    // empty table to readers.  The table is keyed by (mint, owner); newer
+    // updated_slot rows supersede older balance versions during background
+    // merges (or via FINAL/argMax for exact reads).
     let state_source = if matches!(snapshot_kind, SnapshotKind::Full) {
         state.to_owned()
     } else {
@@ -1060,10 +1227,23 @@ pub(crate) async fn refresh_hot_indexes(
     );
     rebuild_wallet_balance_table(client, &balance, &balance_query).await?;
 
-    info!(
-        "[clickhouse] rebuilding hot_token_info in ordered mint batches size={HOT_TOKEN_INFO_BATCH_SIZE}"
-    );
-    rebuild_token_info_table(client, group, snapshot_kind, &info).await?;
+    let info_rows = if matches!(snapshot_kind, SnapshotKind::Full) {
+        info!(
+            "[clickhouse] rebuilding hot_token_info from full raw baseline in ordered mint batches size={HOT_TOKEN_INFO_BATCH_SIZE}; no FINAL"
+        );
+        rebuild_token_info_table(client, group, &info).await?;
+        client
+            .query(&format!("SELECT count() FROM {info}"))
+            .fetch_one::<u64>()
+            .await
+            .map_err(|err| format!("failed to count {info}: {err}"))?
+            .to_string()
+    } else {
+        info!(
+            "[clickhouse] incremental hot-index refresh: hot_token_info is static for this table group; skip rebuild"
+        );
+        "unchanged".to_owned()
+    };
     let state_rows = client
         .query(&format!("SELECT count() FROM {state}"))
         .fetch_one::<u64>()
@@ -1074,11 +1254,6 @@ pub(crate) async fn refresh_hot_indexes(
         .fetch_one::<u64>()
         .await
         .map_err(|err| format!("failed to count {balance}: {err}"))?;
-    let info_rows = client
-        .query(&format!("SELECT count() FROM {info}"))
-        .fetch_one::<u64>()
-        .await
-        .map_err(|err| format!("failed to count {info}: {err}"))?;
     info!(
         "[clickhouse] hot indexes refreshed group={} kind={} enabled_hot_tokens={} state_rows={} wallet_rows={} token_info_rows={}",
         group.as_str(),
@@ -1181,12 +1356,7 @@ struct HotMintRow {
 /// read in sorted mint batches; each batch joins only the matching contiguous
 /// primary-key interval from the two raw tables. The temporary table is
 /// exchanged only once all batches have succeeded.
-async fn rebuild_token_info_table(
-    client: &Client,
-    group: TableGroup,
-    snapshot_kind: SnapshotKind,
-    target: &str,
-) -> Result<()> {
+async fn rebuild_token_info_table(client: &Client, group: TableGroup, target: &str) -> Result<()> {
     let nonce = format!(
         "{}_{}",
         std::process::id(),
@@ -1204,20 +1374,12 @@ async fn rebuild_token_info_table(
 
     let mint_table = group.table(TOKEN_MINT_TABLE);
     let metadata_table = group.table(TOKEN_METADATA_TABLE);
-    // A full snapshot is already a canonical current-state baseline. Do not
-    // pay FINAL's ReplacingSorted memory cost just to fill display fields.
-    // Incremental refreshes need the current version, but only within the
-    // bounded mint range of each batch.
-    let mint_source = if matches!(snapshot_kind, SnapshotKind::Full) {
-        mint_table
-    } else {
-        format!("{mint_table} FINAL")
-    };
-    let metadata_source = if matches!(snapshot_kind, SnapshotKind::Full) {
-        metadata_table
-    } else {
-        format!("{metadata_table} FINAL")
-    };
+    // This function is called only for a full generation build. The full
+    // snapshot is the canonical current-state baseline, so neither source
+    // table needs FINAL. Incrementals deliberately retain the metadata cache
+    // built here until the next full generation replaces this table group.
+    let mint_source = mint_table;
+    let metadata_source = metadata_table;
 
     let result = async {
         let mut previous_last_mint: Option<String> = None;
@@ -1255,7 +1417,6 @@ async fn rebuild_token_info_table(
             client
                 .query(&insert_sql)
                 .with_setting("max_threads", "1")
-                .with_setting("max_final_threads", "1")
                 .execute()
                 .await
                 .map_err(|err| {
@@ -1401,6 +1562,7 @@ struct SystemTableRow {
     engine: String,
     sorting_key: String,
     engine_full: String,
+    create_table_query: String,
 }
 
 #[derive(Row, Deserialize)]
@@ -1414,6 +1576,7 @@ struct SystemColumnRow {
 struct SystemProjectionRow {
     table: String,
     name: String,
+    sorting_key: String,
 }
 
 /// Validate the schema required by the dual-buffer importer before any
@@ -1426,7 +1589,7 @@ pub(crate) async fn validate_clickhouse_schema(connection_url: &str) -> Result<(
     let table_list = sql_string_list(&required_tables);
     let table_rows = client
         .query(&format!(
-            "SELECT name, engine, sorting_key, engine_full FROM system.tables WHERE database = '{DATABASE}' AND name IN ({table_list})"
+            "SELECT name, engine, sorting_key, engine_full, create_table_query FROM system.tables WHERE database = '{DATABASE}' AND name IN ({table_list})"
         ))
         .fetch_all::<SystemTableRow>()
         .await
@@ -1462,6 +1625,14 @@ pub(crate) async fn validate_clickhouse_schema(connection_url: &str) -> Result<(
                         spec.name, definition.sorting_key, spec.sorting_key
                     ));
                 }
+                if requires_rebuild_projection_mode(spec.name)
+                    && !table_has_rebuild_projection_mode(&definition.create_table_query)
+                {
+                    errors.push(format!(
+                        "table solana.{} must set deduplicate_merge_projection_mode = 'rebuild'",
+                        spec.name
+                    ));
+                }
             }
         }
     }
@@ -1493,7 +1664,7 @@ pub(crate) async fn validate_clickhouse_schema(connection_url: &str) -> Result<(
 
     let projection_rows = client
         .query(&format!(
-            "SELECT table, name FROM system.projections WHERE database = '{DATABASE}' AND table IN ({table_list})"
+            "SELECT table, name, sorting_key FROM system.projections WHERE database = '{DATABASE}' AND table IN ({table_list})"
         ))
         .fetch_all::<SystemProjectionRow>()
         .await
@@ -1504,21 +1675,33 @@ pub(crate) async fn validate_clickhouse_schema(connection_url: &str) -> Result<(
         })?;
     let projections = projection_rows
         .into_iter()
-        .map(|row| (row.table, row.name))
-        .collect::<std::collections::HashSet<_>>();
+        .map(|row| ((row.table, row.name), row.sorting_key))
+        .collect::<HashMap<_, _>>();
     for table in ["hot_wallet_token_balance", "hot_wallet_token_balance_bak"] {
-        if !projections.contains(&(table.to_owned(), "proj_by_owner".to_owned())) {
-            errors.push(format!("missing projection solana.{table}.proj_by_owner"));
+        for (projection, expected_sorting_key) in [
+            ("proj_by_mint_amount", "mint, amount_raw, owner"),
+            ("proj_by_owner", "owner, mint"),
+        ] {
+            let key = (table.to_owned(), projection.to_owned());
+            match projections.get(&key) {
+                None => errors.push(format!("missing projection solana.{table}.{projection}")),
+                Some(actual_sorting_key) if actual_sorting_key != expected_sorting_key => {
+                    errors.push(format!(
+                        "projection solana.{table}.{projection} uses sorting key {actual_sorting_key}, expected {expected_sorting_key}"
+                    ));
+                }
+                Some(_) => {}
+            }
         }
     }
 
     if errors.is_empty() {
         info!(
-            "[clickhouse] schema validation passed: {} tables, required columns, and wallet projections",
+            "[clickhouse] schema validation passed: {} tables, required columns, wallet projections, and projection merge settings",
             required_tables.len()
         );
         debug!(
-            "[clickhouse] Schema validation passed: {} tables, required columns, and wallet projections",
+            "[clickhouse] Schema validation passed: {} tables, required columns, wallet projections, and projection merge settings",
             required_tables.len()
         );
         Ok(())
@@ -1549,6 +1732,22 @@ struct RequiredTableSpec {
     engine: &'static str,
     engine_full_prefix: &'static str,
     sorting_key: &'static str,
+}
+
+fn requires_rebuild_projection_mode(table: &str) -> bool {
+    matches!(
+        table,
+        "hot_wallet_token_balance" | "hot_wallet_token_balance_bak"
+    )
+}
+
+fn table_has_rebuild_projection_mode(create_table_query: &str) -> bool {
+    let normalized = create_table_query
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect::<String>();
+    normalized.contains("deduplicate_merge_projection_mode='rebuild'")
 }
 
 fn required_table_specs() -> Vec<RequiredTableSpec> {
@@ -1634,15 +1833,15 @@ fn required_table_specs() -> Vec<RequiredTableSpec> {
         },
         RequiredTableSpec {
             name: "hot_wallet_token_balance",
-            engine: "MergeTree",
-            engine_full_prefix: "MergeTree",
-            sorting_key: "mint, amount_raw, owner",
+            engine: "ReplacingMergeTree",
+            engine_full_prefix: "ReplacingMergeTree(updated_slot)",
+            sorting_key: "mint, owner",
         },
         RequiredTableSpec {
             name: "hot_wallet_token_balance_bak",
-            engine: "MergeTree",
-            engine_full_prefix: "MergeTree",
-            sorting_key: "mint, amount_raw, owner",
+            engine: "ReplacingMergeTree",
+            engine_full_prefix: "ReplacingMergeTree(updated_slot)",
+            sorting_key: "mint, owner",
         },
         RequiredTableSpec {
             name: "hot_token_info",
@@ -2956,6 +3155,25 @@ mod tests {
     fn only_incremental_archives_collect_close_tombstones() {
         assert!(!SnapshotKind::Full.collect_close_tombstones());
         assert!(SnapshotKind::Incremental.collect_close_tombstones());
+    }
+
+    #[test]
+    fn raw_merge_backlog_requires_strictly_fewer_than_twenty_parts() {
+        let below_limit = vec![RawMergePartCount {
+            partition: "all".to_owned(),
+            parts_count: RAW_MERGE_READY_PARTS_PER_PARTITION_LIMIT - 1,
+            total_rows: 1,
+            total_size: "1 B".to_owned(),
+        }];
+        assert!(raw_merge_backlog_is_ready(&below_limit));
+
+        let at_limit = vec![RawMergePartCount {
+            partition: "all".to_owned(),
+            parts_count: RAW_MERGE_READY_PARTS_PER_PARTITION_LIMIT,
+            total_rows: 1,
+            total_size: "1 B".to_owned(),
+        }];
+        assert!(!raw_merge_backlog_is_ready(&at_limit));
     }
 
     #[test]

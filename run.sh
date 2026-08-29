@@ -6,7 +6,7 @@ set -euo pipefail
 # faster ClickHouse host, e.g. CLICKHOUSE_WORKERS=3 ./run.sh.  Two workers is
 # the safe default when ClickHouse shares the host: more upload streams can
 # overwhelm MergeTree background merges.
-clickhouse_workers="${CLICKHOUSE_WORKERS:-1}"
+clickhouse_workers="${CLICKHOUSE_WORKERS:-4}"
 
 # Keep one watcher from accidentally importing the same snapshot stream twice.
 # The lock is released automatically when this process exits.

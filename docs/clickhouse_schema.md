@@ -125,12 +125,14 @@ CREATE TABLE solana.hot_index_control
 )
 ENGINE = ReplacingMergeTree(generation)
 ORDER BY control_key
-COMMENT '热门 Token 二层索引的 active group 控制表';
+COMMENT '热门 Token 二层索引的内部编排与审计表；不参与查询路由，查询始终访问无后缀 active 表';
 
 -- generation 必须全局严格递增；
 -- ready_slot 只有在目标组完成全量、增量和聚合刷新后才能写入；
 -- 编排程序查询控制表时必须使用 FINAL；
+-- EXCHANGE TABLES 才是 active/_bak 的实际切换动作，控制表记录在切换成功后追加；
 -- 查询服务固定访问无后缀的 active 表，不读取 active_group 决定表名；
+-- 控制记录写入失败不影响已经完成的表交换，后续可通过校验后补写审计记录；
 
 
 -- ============================================================
@@ -194,25 +196,36 @@ CREATE TABLE solana.hot_wallet_token_balance
                  COMMENT '钱包对该 mint 的总持仓，最小单位整数；等于所有有效 Token Account 的 amount 之和',
 
     updated_slot UInt64
-                 COMMENT '构成该聚合结果的 Token Account 中最大 updated_slot；用于观察数据新鲜度，不作为精确聚合版本语义'
+                 COMMENT '该 (mint, owner) 聚合余额的版本 slot；ReplacingMergeTree 按此字段保留同一键的最新版本'
 )
-ENGINE = MergeTree
-ORDER BY (mint, amount_raw DESC, owner)
-COMMENT 'L3：热门 Token 的钱包级当前余额表；主排序直接服务指定 mint 的 holder Top-N 查询';
+ENGINE = ReplacingMergeTree(updated_slot)
+ORDER BY (mint, owner)
+COMMENT 'L3：热门 Token 的钱包级当前余额表；同一 (mint, owner) 通过 updated_slot 追加新版本，查询时按需使用 FINAL/argMax 得到最新余额';
 
+-- ReplacingMergeTree 合并时重建 Projection；默认 throw 会禁止 ADD PROJECTION。
+-- Projection 创建完成后仍须保留该设置，否则后续去重 Merge 可能失败或丢弃 Projection。
 ALTER TABLE solana.hot_wallet_token_balance
-    ADD PROJECTION proj_by_owner
+    MODIFY SETTING deduplicate_merge_projection_mode = 'rebuild';
+
+-- 按 mint 过滤后可供 Top-N 查询使用；Projection 定义使用升序，查询时再 DESC 排序。
+ALTER TABLE solana.hot_wallet_token_balance
+    ADD PROJECTION IF NOT EXISTS proj_by_mint_amount
     (
-        SELECT
-            mint,
-            owner,
-            amount_raw,
-            updated_slot
+        SELECT mint, owner, amount_raw, updated_slot
+        ORDER BY (mint, amount_raw, owner)
+    );
+
+-- 反查某钱包持有哪些热门 Token。
+ALTER TABLE solana.hot_wallet_token_balance
+    ADD PROJECTION IF NOT EXISTS proj_by_owner
+    (
+        SELECT mint, owner, amount_raw, updated_slot
         ORDER BY (owner, mint)
     );
 
-ALTER TABLE solana.hot_wallet_token_balance
-    MATERIALIZE PROJECTION proj_by_owner;
+-- 空表无需 MATERIALIZE；已有数据时分别执行：
+-- ALTER TABLE solana.hot_wallet_token_balance MATERIALIZE PROJECTION proj_by_mint_amount;
+-- ALTER TABLE solana.hot_wallet_token_balance MATERIALIZE PROJECTION proj_by_owner;
 
 
 -- ============================================================
@@ -257,6 +270,16 @@ CREATE TABLE solana.raw_token_metadata_bak AS solana.raw_token_metadata;
 CREATE TABLE solana.hot_token_info_bak AS solana.hot_token_info;
 CREATE TABLE solana.hot_wallet_token_balance_bak AS solana.hot_wallet_token_balance;
 CREATE TABLE solana.hot_token_account_state_bak AS solana.hot_token_account_state;
+
+-- 为确保两组定义一致，备用表也显式补齐设置和 Projection（IF NOT EXISTS 可安全重复执行）：
+ALTER TABLE solana.hot_wallet_token_balance_bak
+    MODIFY SETTING deduplicate_merge_projection_mode = 'rebuild';
+ALTER TABLE solana.hot_wallet_token_balance_bak
+    ADD PROJECTION IF NOT EXISTS proj_by_mint_amount
+    (SELECT mint, owner, amount_raw, updated_slot ORDER BY (mint, amount_raw, owner));
+ALTER TABLE solana.hot_wallet_token_balance_bak
+    ADD PROJECTION IF NOT EXISTS proj_by_owner
+    (SELECT mint, owner, amount_raw, updated_slot ORDER BY (owner, mint));
 
 -- 查询服务始终访问不带后缀的 active 表。后续切换使用 EXCHANGE TABLES，
 -- 每对交换原子，但多对表按顺序交换；详细的写入屏障、交换顺序和短暂跨表
