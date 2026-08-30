@@ -198,7 +198,19 @@ ORDER BY parts_count DESC, partition;
 
 检查间隔为 10 秒，未收敛时每 30 秒输出一次 INFO 进度。若 `system.parts` 查询暂时失败，已成功的全量数据不会被清理；程序保持 Merge 运行并重试该检查。bootstrap 失败路径保持 Merge 暂停并退出；staging 的全量/二层刷新失败路径保持 `_bak` Merge 暂停、清理后重试。全量 raw 是规范当前态，L2 回填和 mint/metadata 信息回填均不使用 `FINAL`；增量路径在需要读取 L2 当前态作钱包聚合时才使用 `FINAL`，并将聚合中间结果限制为可溢写到临时磁盘。
 
-该控制只覆盖全量冷启动。正常增量阶段不主动暂停或恢复 Merge；增量写入失败时沿用原有的失败即停止和按 active 最大 slot 重启续传策略。
+### 4.1.2 两路独立磁盘并行
+
+active 与 `_bak` 的 7 张表分别使用 `hot_active_policy` 和
+`hot_backup_policy`，落在两条独立的物理磁盘路径上。staging 全量构建运行在
+独立线程和 ClickHouse runtime 中；active watcher 不再向 staging 发送暂停请求，
+两路可以同时进行 raw INSERT、hot 刷新和各自的 Merge。
+
+两路仍然共享 ClickHouse 的 CPU、内存、网络和后台线程池，因此独立磁盘主要
+消除数据盘 I/O 的直接争抢，并不能保证所有资源完全隔离。两组的 slot 水位、
+失败处理和重试状态继续独立维护；任一路失败都不会回退或清理另一组。
+
+正常增量阶段不主动暂停或恢复 Merge；增量写入失败时沿用原有的失败即停止和
+按 active 最大 slot 重启续传策略。
 
 ### 4.1.2. raw 已完成、hot 刷新失败时的修复
 
@@ -237,7 +249,17 @@ solana-snapshot-etl --clickhouse-rebuild-hot
 6. 记录该全量的 slot 作为 staging 基线；
 7. 继续把基线之后的增量应用到 `_bak` 组。
 
-在 `_bak` 重建期间，无后缀 active 表继续对外服务，并由 watcher 主线程持续消费 active 路径的增量；`_bak` 全量导入、hot 刷新和 Merge 收敛在独立后台任务中进行。后台任务完成后，staging 才从自己的全量 slot 开始追赶增量。两条路径按各自水位处理同一批增量，互不扇出写入；因此 `_bak` 的冷启动和 Merge 高峰不会阻塞 active 增量更新。
+在 `_bak` 重建期间，无后缀 active 表继续对外服务，并由 watcher 主线程持续消费 active 路径的增量；`_bak` 全量导入、hot 刷新和 Merge 收敛在独立后台任务中进行。后台任务完成后，staging 才从自己的全量 slot 开始追赶增量。两条路径按各自水位处理同一批增量，互不扇出写入；staging 增量会在独立 runtime/thread 中与 active 增量并行执行。因此 `_bak` 的冷启动和 Merge 高峰不会阻塞 active 增量更新。
+
+staging 增量采用有序队列：同一时刻最多一个 `_bak` 增量任务在执行，后续任务先排队，完成后才推进 `staging_slot` 并启动下一个。watcher 不等待该任务结束，可以继续推进 active；只有切换前才要求队列为空且两组水位一致。
+
+新一轮全量发布后，增量文件的 `base_slot` 可能已经切换到新全量
+slot，而旧 active 仍落后几个 slot。此时 active 会先把该 full 视为一份
+“增量”处理，只读取其中 `slot > active_slot` 的 AppendVec；处理完成后
+active 水位推进到 full slot，随后即可正常消费以该 full 为 `base_slot` 的
+增量。staging 则从 slot 0 独立构建，二者各自维护水位，不共享 slot 变量。
+如果 staging 失败，程序只登记该 full 供后续重试，不回退 active 水位；active
+已经写入的版本可安全重复写入并由 ReplacingMergeTree 去重。
 
 两组都必须按相同的快照顺序推进，并记录各自最后成功的 `ready_slot`。如果 staging 导入、解析或二层刷新失败，只保留 active 组继续服务；程序给出警告，保持 `_bak` raw Merge 暂停，清理 `_bak` 七张表后自动重试该全量，不退出主循环。若清理本身失败，下一轮重试时会再次尝试清理。
 
@@ -354,7 +376,7 @@ LIMIT {n};
 - 只有冷启动和二层刷新全部成功后才恢复目标组 raw 表的 Merge；恢复后必须等待四张 raw 表每个 partition 的活跃分片数均小于 20，才派发下一份增量；bootstrap 失败时保持暂停并退出，staging 失败时保持 `_bak` 暂停、清理后重试；暂停期间监控 `system.parts`，防止触发 parts 延迟/拒绝阈值。
 - 清空操作只能针对非 active 的 `_bak` 组执行，并且必须在 5 分钟回滚窗口结束后使用 `TRUNCATE TABLE ... SETTINGS max_table_size_to_drop = 0`。
 - 全量重建必须从 slot 0 开始，不能沿用 active 组的 raw 水位。
-- 增量文件要按 base slot 和 ending slot 校验顺序；两组不得跨越未处理的 slot gap。
+- 增量文件要按 base slot 和 ending slot 校验顺序；新 full 到达后先由 active 过滤处理其高于 active 水位的 AppendVec，再处理后续增量；active 与 staging 始终维护独立 slot 水位。
 - `EXCHANGE TABLES` 切换必须先暂停两条增量路径的新快照派发，并等待两组未完成的 INSERT 全部提交。
 - 切换前比较两组的最新成功 slot、热门 Token 数、钱包余额总量和 Top-N 抽样结果。
 - 记录 `generation`、`ready_slot`、快照文件名和 `hot_token_version`，便于审计与回滚。
@@ -369,7 +391,7 @@ ETL 现在已经按本设计实现双路表组。运行时通过 `TableGroup::Ac
 写入及二层刷新都携带同一个逻辑组参数。核心行为如下：
 
 1. 冷启动时清空 active 组，从 `resume_slot = 0` 导入全量；新一轮全量到达后清空 `_bak` 并从 slot 0 构建 staging；
-2. 正常增量只导入 active。staging 存在时，每个增量分别打开两次 loader，按各自水位独立写入 active 与 `_bak`；
+2. 正常增量只导入 active。staging 存在时，每个增量分别打开两次 loader，按各自水位独立写入 active 与 `_bak`；staging 的 loader 在独立 runtime/thread 中与 active 并行执行；
 3. 全量 raw 导入后建立对应组的 `hot_token_account_state*`、`hot_wallet_token_balance*` 和 `hot_token_info*`；正常增量只筛选变更 slot 更新前两者，`hot_token_info*` 作为静态展示缓存保留到该组退役；L3 两张服务表先在临时克隆表中构建，再用 `EXCHANGE TABLES` 换入，避免 active 查询看到半成品；
 4. 两组 slot 追平后暂停当前派发，比较三张派生表的行数及余额总量，依次执行七对 `EXCHANGE TABLES`，更新 `hot_index_control` 审计记录，并保留旧组 5 分钟；
 5. 安全窗口结束后按 `TRUNCATE TABLE ... SETTINGS max_table_size_to_drop = 0` 清空 `_bak`，等待下一轮全量。

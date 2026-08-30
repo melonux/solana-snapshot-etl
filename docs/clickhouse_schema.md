@@ -1,3 +1,13 @@
+-- 说明：以下示例假定 ClickHouse 已配置两个 storage policy：
+--   hot_active_policy  -> active 组所在磁盘
+--   hot_backup_policy  -> _bak 组所在磁盘
+-- 如果实际 policy 名称不同，请统一替换这两个名称。
+-- raw_* 与 hot_* 双路表显式指定 policy；hot_token、hot_index_control
+-- 是共享控制表，未指定 policy 时使用 ClickHouse 默认 policy。
+-- storage_policy 必须在 CREATE TABLE 时直接指定。对已使用 default policy
+-- 的表执行 MODIFY SETTING 可能因旧 volume 不包含在新 policy 中而失败；
+-- 若表中已有数据，不要直接 DROP，需先按 ClickHouse storage policy 规则迁移。
+
 -- ========================================
 -- 0. raw_account: 当前服役组原始账户快照表（未解析的原始元信息）
 -- ========================================
@@ -12,6 +22,7 @@ CREATE TABLE solana.raw_account
 )
 ENGINE = ReplacingMergeTree(updated_slot)
 ORDER BY (owner, pubkey)
+SETTINGS storage_policy = 'hot_active_policy'
 COMMENT 'L0: 原始账户快照表，一行对应链上一个账户的元信息（不含 data 内容），是 raw_token_account / raw_token_mint 等 L1 解析表的数据来源';
 
 
@@ -34,6 +45,7 @@ CREATE TABLE solana.raw_token_account
 )
 ENGINE = ReplacingMergeTree(updated_slot, is_deleted)
 ORDER BY pubkey
+SETTINGS storage_policy = 'hot_active_policy'
 COMMENT 'L1: SPL Token 账户余额快照表，一行对应一个 token account 的最新状态；pubkey 是稳定版本键，支持用 CloseAccount tombstone 覆盖旧持仓';
 
 -- ========================================
@@ -51,6 +63,7 @@ CREATE TABLE solana.raw_token_mint
 )
 ENGINE = ReplacingMergeTree(updated_slot)
 ORDER BY mint
+SETTINGS storage_policy = 'hot_active_policy'
 COMMENT 'L1: SPL Token Mint 账户快照表，记录每个 token 的供应量与增发/冻结权限';
 
 
@@ -73,6 +86,7 @@ CREATE TABLE solana.raw_token_metadata
 )
 ENGINE = ReplacingMergeTree(updated_slot)
 ORDER BY mint
+SETTINGS storage_policy = 'hot_active_policy'
 COMMENT 'L1: Metaplex Token Metadata 账户快照表，记录每个 token 的名称/图标等展示信息，并非所有 token 都存在对应记录';
 
 
@@ -173,6 +187,7 @@ CREATE TABLE solana.hot_token_account_state
 )
 ENGINE = ReplacingMergeTree(updated_slot, is_deleted)
 ORDER BY pubkey
+SETTINGS storage_policy = 'hot_active_policy'
 COMMENT 'L2：热门 Token 的逐 Token-Account 当前态表；支持用 tombstone 覆盖已关闭账户';
 
 -- ============================================================
@@ -200,10 +215,10 @@ CREATE TABLE solana.hot_wallet_token_balance
 )
 ENGINE = ReplacingMergeTree(updated_slot)
 ORDER BY (mint, owner)
+SETTINGS storage_policy = 'hot_active_policy'
 COMMENT 'L3：热门 Token 的钱包级当前余额表；同一 (mint, owner) 通过 updated_slot 追加新版本，查询时按需使用 FINAL/argMax 得到最新余额';
 
--- ReplacingMergeTree 合并时重建 Projection；默认 throw 会禁止 ADD PROJECTION。
--- Projection 创建完成后仍须保留该设置，否则后续去重 Merge 可能失败或丢弃 Projection。
+-- ReplacingMergeTree 合并时重建 Projection；必须在 ADD PROJECTION 前设置。
 ALTER TABLE solana.hot_wallet_token_balance
     MODIFY SETTING deduplicate_merge_projection_mode = 'rebuild';
 
@@ -253,6 +268,7 @@ CREATE TABLE solana.hot_token_info
 )
 ENGINE = ReplacingMergeTree(updated_slot)
 ORDER BY mint
+SETTINGS storage_policy = 'hot_active_policy'
 COMMENT 'L2：热门 Token 的 mint 和 metadata 当前展示信息表，为下游展示避免扫描 raw 表';
 
 -- ============================================================
@@ -260,18 +276,125 @@ COMMENT 'L2：热门 Token 的 mint 和 metadata 当前展示信息表，为下�
 -- ============================================================
 -- 双路切换要求 raw 层和二层派生表都各有两组：不带后缀的 active 组，
 -- 以及带 `_bak` 后缀的 staging/备用组。本文件前面的 DDL 创建 active 组；
--- 使用下面的语句创建空的备用组。CREATE TABLE ... AS 会复制字段、引擎和
--- 排序键定义，但不会复制数据。
+-- 下面显式创建 backup 组。
+-- 不使用 CREATE TABLE ... AS：该语句可能复制 active 组的 storage_policy，
+-- 从而使 `_bak` 仍然写入 active 磁盘。两组表的字段、引擎、排序键和 Projection
+-- 必须一致，唯一差别是 storage_policy。
 
-CREATE TABLE solana.raw_account_bak AS solana.raw_account;
-CREATE TABLE solana.raw_token_mint_bak AS solana.raw_token_mint;
-CREATE TABLE solana.raw_token_account_bak AS solana.raw_token_account;
-CREATE TABLE solana.raw_token_metadata_bak AS solana.raw_token_metadata;
-CREATE TABLE solana.hot_token_info_bak AS solana.hot_token_info;
-CREATE TABLE solana.hot_wallet_token_balance_bak AS solana.hot_wallet_token_balance;
-CREATE TABLE solana.hot_token_account_state_bak AS solana.hot_token_account_state;
+CREATE TABLE solana.raw_account_bak
+(
+    pubkey       String              COMMENT '账户自身的地址（base58），唯一标识一个账户',
+    owner        LowCardinality(String) COMMENT '拥有该账户的 Program 地址，决定 data 字段应如何解析，如 Token Program、System Program 等；取值集合有限，适合字典编码',
+    lamports     UInt64              COMMENT '账户余额，单位为 lamports（1 SOL = 1e9 lamports）',
+    data_len     UInt64              COMMENT '账户 data 字段的字节长度；本表不存储 data 内容本身，仅记录长度，用于快速判断账户类型/是否为空账户',
+    executable   Bool                COMMENT '是否为可执行账户（即链上程序本身），普通钱包/数据账户此值为 false',
+    updated_slot UInt64              COMMENT '本条快照数据采集时对应的 slot 高度，用于版本去重'
+)
+ENGINE = ReplacingMergeTree(updated_slot)
+ORDER BY (owner, pubkey)
+SETTINGS storage_policy = 'hot_backup_policy'
+COMMENT 'L0：备用组原始账户快照表，与 solana.raw_account 结构一致';
 
--- 为确保两组定义一致，备用表也显式补齐设置和 Projection（IF NOT EXISTS 可安全重复执行）：
+CREATE TABLE solana.raw_token_account_bak
+(
+    pubkey            String              COMMENT 'token account 自身的地址，唯一标识一条持仓记录',
+    mint              String              COMMENT '这个持仓对应的 token 地址（关联 raw_token_mint.mint）',
+    owner             String              COMMENT '这个 token account 归属的钱包地址',
+    amount            UInt64              COMMENT '余额，最小单位整数，需配合 decimals 换算',
+    delegate          Nullable(String)    COMMENT '被授权可代为转出的地址，没有授权则为空',
+    delegated_amount  UInt64 DEFAULT 0    COMMENT '被授权可转出的最大数量，没有授权则为 0',
+    state             Enum8('uninitialized' = 0, 'initialized' = 1, 'frozen' = 2)
+                                          COMMENT '账户状态：uninitialized、initialized 或 frozen',
+    close_authority   Nullable(String)    COMMENT '有权限关闭此账户并收回 rent 押金的地址，没有设置则为空',
+    is_deleted        UInt8 DEFAULT 0     COMMENT '是否已通过 CloseAccount 关闭；0=存在，1=删除版本',
+    updated_slot      UInt64              COMMENT '账户版本所属的 Solana slot'
+)
+ENGINE = ReplacingMergeTree(updated_slot, is_deleted)
+ORDER BY pubkey
+SETTINGS storage_policy = 'hot_backup_policy'
+COMMENT 'L1：备用组 SPL Token 账户余额快照表';
+
+CREATE TABLE solana.raw_token_mint_bak
+(
+    mint              String              COMMENT 'token 地址，唯一标识一个 token',
+    mint_authority    Nullable(String)    COMMENT '有权限增发新 token 的地址',
+    supply            UInt64              COMMENT '当前总供应量，最小单位整数',
+    decimals          UInt8               COMMENT '小数位数，决定 amount/supply 的展示换算',
+    is_initialized    Bool                COMMENT '该 mint 账户是否已正常初始化',
+    freeze_authority  Nullable(String)    COMMENT '有权限冻结持币账户的地址',
+    updated_slot      UInt64              COMMENT '本条快照数据对应的 slot 高度，用于版本去重'
+)
+ENGINE = ReplacingMergeTree(updated_slot)
+ORDER BY mint
+SETTINGS storage_policy = 'hot_backup_policy'
+COMMENT 'L1：备用组 SPL Token Mint 账户快照表';
+
+CREATE TABLE solana.raw_token_metadata_bak
+(
+    mint                     String              COMMENT 'token 地址，关联 raw_token_mint.mint',
+    name                     String              COMMENT 'token 名称',
+    symbol                   String              COMMENT 'token 代号',
+    uri                      String              COMMENT '链下 JSON 文件的链接',
+    update_authority         LowCardinality(String) COMMENT '有权限修改展示信息的地址',
+    is_mutable               Bool                COMMENT '这些展示信息以后是否还能被修改',
+    token_standard           Nullable(UInt8)     COMMENT 'Metaplex TokenStandard 枚举值；未设置时为 NULL',
+    seller_fee_basis_points  UInt16 DEFAULT 0    COMMENT '版税比例（万分之一为单位）',
+    creators                 Array(String) DEFAULT [] COMMENT '创作者地址列表',
+    updated_slot             UInt64              COMMENT '本条快照数据对应的 slot 高度，用于版本去重'
+)
+ENGINE = ReplacingMergeTree(updated_slot)
+ORDER BY mint
+SETTINGS storage_policy = 'hot_backup_policy'
+COMMENT 'L1：备用组 Metaplex Token Metadata 账户快照表';
+
+CREATE TABLE solana.hot_token_account_state_bak
+(
+    pubkey       String COMMENT 'SPL Token Account 地址；本表业务主键',
+    mint         String COMMENT 'Token mint 地址；仅存启用的热门 Token',
+    owner        String COMMENT 'Token Account 的实际持有人钱包地址',
+    amount       UInt64 COMMENT 'Token Account 余额，最小单位整数',
+    state        Enum8('uninitialized' = 0, 'initialized' = 1, 'frozen' = 2)
+                 COMMENT 'SPL Token Account 状态',
+    is_deleted   UInt8 COMMENT '删除版本标志：0=有效，1=tombstone',
+    updated_slot UInt64 COMMENT '账户版本所属的 Solana slot'
+)
+ENGINE = ReplacingMergeTree(updated_slot, is_deleted)
+ORDER BY pubkey
+SETTINGS storage_policy = 'hot_backup_policy'
+COMMENT 'L2：备用组热门 Token 的逐 Token-Account 当前态表';
+
+CREATE TABLE solana.hot_wallet_token_balance_bak
+(
+    mint         String COMMENT 'Token mint 地址；与 owner 共同唯一标识一条钱包级持仓',
+    owner        String COMMENT '钱包地址',
+    amount_raw   UInt64 COMMENT '钱包对该 mint 的总持仓，最小单位整数',
+    updated_slot UInt64 COMMENT '该 (mint, owner) 聚合余额的版本 slot'
+)
+ENGINE = ReplacingMergeTree(updated_slot)
+ORDER BY (mint, owner)
+SETTINGS storage_policy = 'hot_backup_policy'
+COMMENT 'L3：备用组热门 Token 的钱包级当前余额表';
+
+CREATE TABLE solana.hot_token_info_bak
+(
+    mint                   String COMMENT 'Token mint 地址；本表业务主键，仅存启用的热门 Token',
+    decimals               UInt8 COMMENT '小数位数',
+    supply_raw             UInt64 COMMENT '当前总供应量，最小单位整数',
+    name                   String COMMENT 'Token 名称',
+    symbol                 String COMMENT 'Token 符号',
+    uri                    String COMMENT 'Metaplex metadata URI',
+    token_standard         Nullable(UInt8) COMMENT 'Metaplex TokenStandard；未设置时为 NULL',
+    mint_updated_slot      UInt64 COMMENT 'raw_token_mint 当前版本的更新 slot',
+    metadata_updated_slot  UInt64 COMMENT 'raw_token_metadata 当前版本的更新 slot',
+    updated_slot           UInt64 COMMENT '本行派生版本'
+)
+ENGINE = ReplacingMergeTree(updated_slot)
+ORDER BY mint
+SETTINGS storage_policy = 'hot_backup_policy'
+COMMENT 'L2：备用组热门 Token 的 mint 和 metadata 当前展示信息表';
+
+-- Projection 名称在单张表内部唯一；active 与 `_bak` 使用同名 Projection 是正确的。
+-- 为确保两组定义一致，备用表显式补齐设置和 Projection（IF NOT EXISTS 可安全重复执行）：
 ALTER TABLE solana.hot_wallet_token_balance_bak
     MODIFY SETTING deduplicate_merge_projection_mode = 'rebuild';
 ALTER TABLE solana.hot_wallet_token_balance_bak

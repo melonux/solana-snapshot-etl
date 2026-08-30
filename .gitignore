@@ -2,6 +2,7 @@
 .idea/
 *.tmp
 *.db
+*.csv
 unpacked_snapshot/
 *.tar
 *.zst

@@ -16,7 +16,7 @@ use solana_snapshot_etl::incremental::{
 };
 use solana_snapshot_etl::unpacked::UnpackedSnapshotExtractor;
 use solana_snapshot_etl::{AppendVecIterator, ReadProgressTracking, SnapshotExtractor};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{IoSliceMut, Read, Write};
 use std::path::{Path, PathBuf};
@@ -778,9 +778,10 @@ fn reset_failed_staging(
     thread::sleep(poll_interval);
 }
 
-/// Build a fresh `_bak` generation on a dedicated worker thread.  The
-/// watcher keeps its own ClickHouse runtime for active incrementals, while
-/// this worker owns a separate runtime/client for the staging path.
+/// Build a fresh `_bak` generation on a dedicated worker thread. The watcher
+/// keeps its own ClickHouse runtime for active work, while this worker owns a
+/// separate runtime/client for staging. The two paths intentionally run
+/// independently because their tables use separate ClickHouse disks.
 fn build_staging_full(
     snapshot: FullSnapshot,
     clickhouse_url: String,
@@ -810,6 +811,62 @@ fn build_staging_full(
         .wait_for_group_merges_to_settle(group)
         .map_err(|err| format!("staging raw+hot MERGE settle check failed: {err}"))?;
     Ok(())
+}
+
+/// Apply one incremental to the backup group on its own ClickHouse runtime.
+/// The watcher uses this helper so active and staging can process the same
+/// archive concurrently once the backup generation is ready.
+fn process_incremental_in_background(
+    snapshot: IncrementalSnapshot,
+    clickhouse_url: String,
+    workers: usize,
+    group: TableGroup,
+    resume_slot: u64,
+    refresh_from_slot: u64,
+    force_hot_rebuild: bool,
+) -> Result<(), String> {
+    let mut output = IncrementalOutput::from_config(clickhouse_url, workers).map_err(|err| {
+        format!("failed to create {group:?} incremental ClickHouse runtime: {err}")
+    })?;
+    let candidate = WatchedSnapshot::Incremental(snapshot);
+    let mut loader = candidate
+        .new_loader(resume_slot)
+        .map_err(|err| format!("failed to create {group:?} incremental snapshot loader: {err}"))?;
+    output
+        .process(
+            &mut loader,
+            SnapshotKind::Incremental,
+            group,
+            Some(refresh_from_slot),
+            force_hot_rebuild,
+        )
+        .map_err(|err| format!("{group:?} incremental import failed: {err}"))
+}
+
+fn spawn_staging_incremental(
+    snapshot: IncrementalSnapshot,
+    clickhouse_url: String,
+    workers: usize,
+    stage_slot: u64,
+    refresh_from_slot: u64,
+    force_hot_rebuild: bool,
+) -> Result<JoinHandle<Result<u64, String>>, String> {
+    let candidate_slot = snapshot.slot();
+    thread::Builder::new()
+        .name("staging-incremental".to_owned())
+        .spawn(move || {
+            process_incremental_in_background(
+                snapshot,
+                clickhouse_url,
+                workers,
+                TableGroup::Backup,
+                stage_slot,
+                refresh_from_slot,
+                force_hot_rebuild,
+            )
+            .map(|_| candidate_slot)
+        })
+        .map_err(|err| format!("failed to spawn staging incremental worker: {err}"))
 }
 
 /// Atomically promote a staging generation once both paths have reached the
@@ -886,6 +943,13 @@ fn run_incremental_snapshots(
     };
     let mut staging_slot: Option<u64> = None;
     let mut staging_build: Option<StagingBuild> = None;
+    let mut staging_incremental_handle: Option<JoinHandle<Result<u64, String>>> = None;
+    let mut staging_incremental_queue: VecDeque<(IncrementalSnapshot, bool)> = VecDeque::new();
+    // A failed staging full must be retried even if active has already
+    // advanced beyond that full while serving incrementals. Keep the retry
+    // candidate separately instead of rewinding the independent active
+    // watermark.
+    let mut retry_full: Option<FullSnapshot> = None;
     let mut retired_until: Option<std::time::Instant> = None;
     let mut hot_fingerprint = output.hot_token_fingerprint()?;
     let mut active_group_id: u8 = if bootstrap_pending {
@@ -928,6 +992,7 @@ fn run_incremental_snapshots(
             let snapshot = build.snapshot;
             match build.handle.join() {
                 Ok(Ok(())) => {
+                    retry_full = None;
                     staging_slot = Some(snapshot.slot());
                     has_processed_snapshot = true;
                     debug!("Staging full snapshot ready at slot {}", snapshot.slot());
@@ -943,8 +1008,14 @@ fn run_incremental_snapshots(
                     );
                 }
                 Ok(Err(err)) => {
+                    retry_full = Some(snapshot.clone());
                     let candidate = WatchedSnapshot::Full(snapshot);
                     warn!("[switch] staging 后台构建失败：{}", err);
+                    info!(
+                        "[switch] staging 失败：保留 active_slot={} 不变，登记 full slot={} 稍后重试",
+                        active_slot,
+                        candidate.slot()
+                    );
                     reset_failed_staging(
                         &mut output,
                         &candidate,
@@ -953,8 +1024,14 @@ fn run_incremental_snapshots(
                     );
                 }
                 Err(panic) => {
+                    retry_full = Some(snapshot.clone());
                     let candidate = WatchedSnapshot::Full(snapshot);
                     warn!("[switch] staging 后台构建线程异常退出：{:?}", panic);
+                    info!(
+                        "[switch] staging 线程异常：保留 active_slot={} 不变，登记 full slot={} 稍后重试",
+                        active_slot,
+                        candidate.slot()
+                    );
                     reset_failed_staging(
                         &mut output,
                         &candidate,
@@ -965,16 +1042,82 @@ fn run_incremental_snapshots(
             }
         }
 
+        // A backup incremental is deliberately not joined by the watcher
+        // after dispatch.  Harvest its result here when it finishes, while
+        // active may have consumed several newer incrementals in the
+        // meantime.  Only one backup job is in flight at a time so its slot
+        // order remains deterministic.
+        if staging_incremental_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            let handle = staging_incremental_handle
+                .take()
+                .expect("staging incremental handle checked above");
+            match handle.join() {
+                Ok(Ok(slot)) => {
+                    staging_slot = Some(slot);
+                    info!(
+                        "[switch] _bak 增量完成：staging_slot={}；active 可继续独立消费后续快照",
+                        slot
+                    );
+                }
+                Ok(Err(err)) => {
+                    return Err(format!("staging incremental import failed: {err}").into());
+                }
+                Err(_) => {
+                    return Err("staging incremental worker panicked".into());
+                }
+            }
+        }
+
+        // Start the next queued backup archive only after the previous one
+        // has committed. This preserves staging slot order without making
+        // the active watcher wait for the backup queue to drain.
+        if staging_incremental_handle.is_none() {
+            if let (Some(stage_slot), Some((snapshot, _))) =
+                (staging_slot, staging_incremental_queue.front().cloned())
+            {
+                if snapshot.slot() <= stage_slot {
+                    staging_incremental_queue.pop_front();
+                } else if snapshot.base_slot() > stage_slot {
+                    return Err(format!(
+                        "staging incremental gap: snapshot slot={} base_slot={} but staging_slot={}",
+                        snapshot.slot(),
+                        snapshot.base_slot(),
+                        stage_slot
+                    )
+                    .into());
+                } else {
+                    let snapshot = staging_incremental_queue
+                        .pop_front()
+                        .expect("staging queue front checked above");
+                    let (snapshot, force_hot_rebuild) = snapshot;
+                    let (clickhouse_url, workers) = output.clickhouse_config();
+                    staging_incremental_handle = Some(spawn_staging_incremental(
+                        snapshot.clone(),
+                        clickhouse_url,
+                        workers,
+                        stage_slot,
+                        snapshot.base_slot(),
+                        force_hot_rebuild,
+                    )?);
+                }
+            }
+        }
+
         // If active consumed the same slot while staging was building, the
         // newly completed backup can be promoted immediately rather than
         // waiting for another incremental archive to arrive.
-        exchange_if_ready(
-            &mut output,
-            &mut active_group_id,
-            &mut active_slot,
-            &mut staging_slot,
-            &mut retired_until,
-        )?;
+        if staging_incremental_handle.is_none() && staging_incremental_queue.is_empty() {
+            exchange_if_ready(
+                &mut output,
+                &mut active_group_id,
+                &mut active_slot,
+                &mut staging_slot,
+                &mut retired_until,
+            )?;
+        }
 
         if let Some(deadline) = retired_until {
             if std::time::Instant::now() >= deadline {
@@ -995,9 +1138,10 @@ fn run_incremental_snapshots(
             .map(|snapshot| snapshot.base_slot())
             .min();
         // Before a new full snapshot is seen, only the active path consumes
-        // incrementals.  Once staging exists, every subsequent incremental is
-        // opened independently for each path and applied only where its slot
-        // is newer; this keeps the two raw states independent.
+        // incrementals. Once the new full is selected, its high-slot tail is
+        // first applied to active as an incremental (see the full branch
+        // below), so subsequent incrementals can be consumed independently
+        // by the two paths using their own watermarks.
         let selected_incremental = if bootstrap_pending {
             None
         } else if staging_slot.is_some() {
@@ -1012,10 +1156,15 @@ fn run_incremental_snapshots(
                 .filter(|snapshot| !invalid_archives.contains(snapshot.path()))
                 .next()
                 .or_else(|| {
-                    eligible_candidates(incrementals, stage_watermark)
-                        .into_iter()
-                        .filter(|snapshot| !invalid_archives.contains(snapshot.path()))
-                        .next()
+                    if staging_incremental_handle.is_none() && staging_incremental_queue.is_empty()
+                    {
+                        eligible_candidates(incrementals, stage_watermark)
+                            .into_iter()
+                            .filter(|snapshot| !invalid_archives.contains(snapshot.path()))
+                            .next()
+                    } else {
+                        None
+                    }
                 })
                 .map(WatchedSnapshot::Incremental)
         } else {
@@ -1029,11 +1178,17 @@ fn run_incremental_snapshots(
             if (bootstrap_pending || (staging_slot.is_none() && staging_build.is_none()))
                 && retired_until.is_none()
             {
-                eligible_full_candidates(fulls, active_slot)
-                    .into_iter()
+                retry_full
+                    .clone()
                     .filter(|snapshot| !invalid_archives.contains(snapshot.path()))
-                    .next()
                     .map(WatchedSnapshot::Full)
+                    .or_else(|| {
+                        eligible_full_candidates(fulls, active_slot)
+                            .into_iter()
+                            .filter(|snapshot| !invalid_archives.contains(snapshot.path()))
+                            .next()
+                            .map(WatchedSnapshot::Full)
+                    })
             } else {
                 None
             }
@@ -1148,12 +1303,14 @@ fn run_incremental_snapshots(
                 };
                 let (clickhouse_url, workers) = output.clickhouse_config();
                 let snapshot_slot = staging_snapshot.slot();
+                let retry_snapshot = staging_snapshot.clone();
                 let handle = match thread::Builder::new()
                     .name("staging-full".to_owned())
                     .spawn(move || build_staging_full(staging_snapshot, clickhouse_url, workers))
                 {
                     Ok(handle) => handle,
                     Err(err) => {
+                        retry_full = Some(retry_snapshot);
                         warn!("[switch] 无法启动 staging 后台构建线程：{}", err);
                         reset_failed_staging(
                             &mut output,
@@ -1172,9 +1329,63 @@ fn run_incremental_snapshots(
                     handle,
                 });
                 info!(
-                    "[switch] 新一轮全量 slot={} 已转入 _bak 后台制备；active 路径继续消费增量",
+                    "[switch] 新一轮全量 slot={} 已转入 _bak 后台制备；active/_bak 使用独立磁盘并行运行，active 先处理该 full 的高 slot 尾段",
                     snapshot_slot
                 );
+
+                // The new full is also the only authoritative bridge from
+                // the old active watermark to the new incremental chain. Read
+                // it with the active watermark as a lower bound and treat
+                // the filtered tail as an incremental update. This keeps
+                // active moving while staging builds, and makes subsequent
+                // incrementals (whose base_slot is the new full slot)
+                // eligible without inventing a slot gap.
+                let active_candidate = match &staging_build {
+                    Some(build) => WatchedSnapshot::Full(build.snapshot.clone()),
+                    None => unreachable!("staging build was just installed"),
+                };
+                let active_resume_slot = active_slot;
+                let current_hot_fingerprint = output.hot_token_fingerprint()?;
+                let force_hot_rebuild = current_hot_fingerprint != hot_fingerprint;
+                let mut active_loader = active_candidate.new_loader(active_resume_slot)?;
+                let active_append_vecs = active_loader.append_vec_count_hint().unwrap_or(0);
+                if snapshot_slot <= active_resume_slot {
+                    info!(
+                        "[switch] active 已达到或超过 full_slot={}，不回退 active_slot={}；仅重试 _bak staging",
+                        snapshot_slot,
+                        active_resume_slot
+                    );
+                } else if active_append_vecs == 0 {
+                    info!(
+                        "[switch] active full 尾段无需写入：full_slot={} active_slot={}，继续等待后续增量",
+                        snapshot_slot,
+                        active_resume_slot
+                    );
+                } else {
+                    info!(
+                        "[switch] active 将新 full 作为增量尾段处理：full_slot={} resume_slot={} append_vecs={}",
+                        snapshot_slot,
+                        active_resume_slot,
+                        active_append_vecs
+                    );
+                    let process_result = output.process(
+                        &mut active_loader,
+                        SnapshotKind::Incremental,
+                        TableGroup::Active,
+                        Some(active_resume_slot),
+                        force_hot_rebuild,
+                    );
+                    process_result?;
+                    active_slot = snapshot_slot;
+                }
+                hot_fingerprint = current_hot_fingerprint;
+                has_processed_snapshot = true;
+                info!(
+                    "[switch] active full 尾段处理完成：active_slot={}；_bak 继续后台制备",
+                    active_slot
+                );
+                // `candidate` has been moved into StagingBuild above. The
+                // staging result is harvested at the top of the next loop.
                 continue;
             }
             if let Err(err) = output.stop_group_merges(group) {
@@ -1297,13 +1508,15 @@ fn run_incremental_snapshots(
             };
             let current_hot_fingerprint = output.hot_token_fingerprint()?;
             let force_hot_rebuild = current_hot_fingerprint != hot_fingerprint;
-            // Active path is always kept current.  During staging, the same
-            // archive is opened again with staging's own watermark.
-            if (staging_slot.is_none() || candidate.slot() > active_slot)
-                && incremental.base_slot() <= active_slot
-            {
-                let mut loader = match candidate.new_loader(active_slot) {
-                    Ok(loader) => loader,
+            // Active path is always kept current. During staging, the new
+            // full's high-slot tail has already been applied to active, so
+            // each following incremental can be validated against the active
+            // watermark independently from staging's watermark.
+            let active_eligible =
+                candidate.slot() > active_slot && incremental.base_slot() <= active_slot;
+            let mut active_loader = if active_eligible {
+                match candidate.new_loader(active_slot) {
+                    Ok(loader) => Some(loader),
                     Err(err) => {
                         invalid_archives.insert(candidate.path().to_path_buf());
                         warn!(
@@ -1313,28 +1526,54 @@ fn run_incremental_snapshots(
                         );
                         continue;
                     }
-                };
+                }
+            } else {
+                None
+            };
+
+            // Queue the same archive for staging in slot order. It is picked
+            // up by the independent worker above, so active never waits for
+            // the backup route to finish this snapshot.
+            if staging_slot.is_some_and(|stage_slot| {
+                candidate.slot() > stage_slot && incremental.base_slot() <= stage_slot
+            }) {
+                staging_incremental_queue.push_back((incremental.clone(), force_hot_rebuild));
+            }
+
+            let active_result = if let Some(ref mut loader) = active_loader {
                 output.process(
-                    &mut loader,
+                    loader,
                     snapshot_kind,
                     TableGroup::Active,
                     Some(incremental.base_slot()),
                     force_hot_rebuild,
-                )?;
-                active_slot = candidate.slot();
-            }
-            if let Some(stage_slot) = staging_slot {
-                if candidate.slot() > stage_slot && incremental.base_slot() <= stage_slot {
-                    let mut loader = candidate.new_loader(stage_slot)?;
-                    output.process(
-                        &mut loader,
-                        snapshot_kind,
-                        TableGroup::Backup,
-                        Some(incremental.base_slot()),
-                        force_hot_rebuild,
-                    )?;
-                    staging_slot = Some(candidate.slot());
+                )
+            } else {
+                Ok(())
+            };
+
+            if let Err(err) = active_result {
+                // Do not leave a detached writer behind if active fails and
+                // the process is about to exit. This is only the fatal-error
+                // cleanup path; normal processing never waits for staging.
+                if let Some(handle) = staging_incremental_handle.take() {
+                    match handle.join() {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(backup_err)) => {
+                            warn!(
+                                "[switch] active 增量失败，同时运行的 _bak 增量也失败：{}",
+                                backup_err
+                            )
+                        }
+                        Err(_) => {
+                            warn!("[switch] active 增量失败，同时运行的 _bak 增量线程异常退出")
+                        }
+                    }
                 }
+                return Err(err);
+            }
+            if active_loader.is_some() {
+                active_slot = candidate.slot();
             }
             hot_fingerprint = current_hot_fingerprint;
         }
@@ -1352,13 +1591,15 @@ fn run_incremental_snapshots(
             staging_slot
         );
         has_processed_snapshot = true;
-        exchange_if_ready(
-            &mut output,
-            &mut active_group_id,
-            &mut active_slot,
-            &mut staging_slot,
-            &mut retired_until,
-        )?;
+        if staging_incremental_handle.is_none() && staging_incremental_queue.is_empty() {
+            exchange_if_ready(
+                &mut output,
+                &mut active_group_id,
+                &mut active_slot,
+                &mut staging_slot,
+                &mut retired_until,
+            )?;
+        }
         debug!("Advanced active slot to {active_slot}");
         invalid_archives.retain(|path| path.exists());
     }
