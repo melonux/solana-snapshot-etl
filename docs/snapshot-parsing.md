@@ -219,15 +219,10 @@ executable = false
 
 因此 CloseAccount 归档记录中已经没有原来的 mint、token owner、close authority 等信息。仅靠这个空账户无法重新 unpack 出 SPL Token Account。
 
-它只能作为删除候选。导入器记录 empty account 的 pubkey 和 AppendVec 所属 slot，随后直接
-写入一条更高 `updated_slot`、`is_deleted=1` 的 tombstone。由于 empty account 已经没有旧的
-mint、owner、close authority 等字段，删除版本使用空字符串/空值等中性字段；
-`ReplacingMergeTree(updated_slot, is_deleted)` 只依赖 pubkey、版本和删除标记决定最终状态。
-
-canonical empty account 也可能只是普通账户，因此这种无查询的快速路径会为少量非 token
-pubkey 产生 tombstone 物理行。这些行在 `FINAL ... WHERE is_deleted = 0` 查询中不可见，且未来
-更高 slot 的 live token 行仍可覆盖它们；代价是额外的存储和 merge 工作，换取避免对数亿行
-`raw_token_account` 执行高内存 `FINAL` 回查。
+它只能作为删除候选。导入器记录 empty account 的 pubkey 和 AppendVec 所属 slot，在本组
+`hot_token_account_state FINAL` 按 pubkey 查找旧的 live 行。只有找到了 hot Token Account，
+才写入一条更高 `updated_slot`、`is_deleted=1` 的 tombstone，并复用旧行的 `mint`/`owner`。
+普通 canonical empty account 不进入 L2，因此不会积累空 mint/owner 的无意义删除行。
 
 ### 5.2 Full 和 incremental 对 tombstone 的区别
 
@@ -240,7 +235,8 @@ pubkey 产生 tombstone 物理行。这些行在 `FINAL ... WHERE is_deleted = 0
 
 ### 5.3 ClickHouse 表的最终版本设计
 
-`raw_token_account` 保留 `is_deleted` 和 `updated_slot`，不再保留 AppendVec 物理位置字段：
+`hot_token_account_state` 是唯一的 Token Account 状态表；解析器仅对本组冻结 hot mint
+直接写入该表，不再使用 `raw_token_account` 中转：
 
 ~~~sql
 is_deleted   UInt8 DEFAULT 0
@@ -260,7 +256,7 @@ ORDER BY pubkey
 
 ~~~sql
 SELECT *
-FROM solana.raw_token_account FINAL
+FROM solana.hot_token_account_state FINAL
 WHERE is_deleted = 0;
 ~~~
 
@@ -306,13 +302,13 @@ incremental snapshot。这样新库一定以完整基线开始；不传该参数
 由于 Agave 在归档 full snapshot 时使用 `TombstonesFilter::Exclude`，full archive
 不会包含需要传播的 tombstone。项目因此按 snapshot 类型选择入库路径：
 
-- **full**：直接把 AppendVec 中的 canonical 账户写入 `raw_account` 和各个解析表；不建立
-  关闭账户候选集合，也不执行 tombstone pass，适合重建 full 基线；
-- **incremental**：收集 canonical empty 账户，按 pubkey 去重后直接写入中性字段的
-  `is_deleted=1` tombstone。这样增量包仍能传播 full 基线中的删除状态，但不会触发全表
-  `FINAL` 回查。
+- **full**：直接把 AppendVec 中的 canonical 账户写入 `raw_account`；只有本组冻结 hot mint
+  的 Token Account、Mint 与 metadata 写入 L2 或 hot-only raw 表；不建立关闭账户候选集合；
+- **incremental**：收集 canonical empty 账户，按 pubkey 去重后在 L2 做 point lookup。只有
+  已存在的 hot Token Account 才追加携带原 mint/owner 的 `is_deleted=1` tombstone；不做 raw
+  历史扫描。
 
-这只是入库流程优化，不改变表引擎或版本语义：`raw_token_account` 仍使用
+这不改变版本语义：`hot_token_account_state` 仍使用
 `ReplacingMergeTree(updated_slot, is_deleted)`，后续增量仍可覆盖 full 写入的行。对于已经有
 旧数据、且中间漏掉了 incremental 的数据库，不能把新的 full 当作删除历史的补丁；full 本身
 不携带这些历史 tombstone，应该从新的 full 重新建立基线，再连续应用之后的 incremental。
@@ -328,7 +324,8 @@ snapshot archive
   -> owner 分流
      -> SPL Token / Token-2022 unpack
      -> Metaplex Borsh deserialize
-  -> ClickHouse raw_account / raw_token_account / raw_token_mint / raw_token_metadata
+  -> ClickHouse raw_account
+  -> frozen-hot only: raw_token_mint / raw_token_metadata / hot_token_account_state
 ~~~
 
 版本和删除语义则是：
@@ -346,5 +343,6 @@ snapshot archive
 3. 同一 slot 的多个物理文件或多个记录不能用物理顺序解释，canonical archive 中也不应出现；
 4. `write_version`、AppendVec ID 和 offset 都不能作为链上版本；
 5. full 用来建立完整基线，incremental 用来传播 full 之后的账户变化和删除；
-6. SPL Token 删除必须用 `updated_slot + is_deleted` tombstone 表达，删除版本的身份字段可以为空；
-7. ClickHouse 的 token 表只需要 `updated_slot + is_deleted` 表达最终状态。
+6. SPL Token 删除必须用 `updated_slot + is_deleted` tombstone 表达；删除行只在同组 L2 已有
+   旧 hot 行时写入，因此保留该行的 mint/owner；
+7. `raw_token_account` 已移除，ClickHouse 的 Token Account 当前态只由 L2 表维护。

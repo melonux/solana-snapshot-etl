@@ -1,9 +1,9 @@
 use crate::clickhouse::{
-    active_group_id, exchange_table_groups, hot_token_fingerprint, hot_token_version,
-    max_raw_account_updated_slot, rebuild_hot_indexes_from_raw, record_index_control,
-    reset_table_group, set_group_table_merges, validate_clickhouse_schema, validate_group_parity,
-    wait_for_group_merges_to_settle, ClickhouseIndexer, CloseTombstoneStats, SnapshotKind,
-    TableGroup,
+    active_group_id, exchange_table_groups, hot_token_version, load_group_hot_mints,
+    max_raw_account_updated_slot, rebuild_derived_indexes_from_state, record_index_control,
+    reset_table_group, set_group_table_merges, snapshot_group_hot_mints,
+    validate_clickhouse_schema, validate_staging_group, wait_for_group_merges_to_settle,
+    ClickhouseIndexer, CloseTombstoneStats, HotMintSet, SnapshotKind, TableGroup,
 };
 use clap::{ArgGroup, Parser};
 use env_logger::{Builder, Env, Target};
@@ -39,6 +39,7 @@ mod mpl_metadata;
         .multiple(false)
         .args(&[
             "clickhouse",
+            "clickhouse-validate-schema",
             "clickhouse-rebuild-hot",
             "clickhouse-close-tombstones",
         ]),
@@ -81,7 +82,13 @@ struct Args {
     #[clap(
         long,
         action,
-        help = "Rebuild active hot tables from already imported raw tables without reading a snapshot"
+        help = "Validate the ClickHouse schema and exit without reading a snapshot or writing data"
+    )]
+    clickhouse_validate_schema: bool,
+    #[clap(
+        long,
+        action,
+        help = "Rebuild active L3 wallet balances and token-info from existing direct-write hot state without reading a snapshot"
     )]
     clickhouse_rebuild_hot: bool,
     #[clap(
@@ -199,6 +206,21 @@ fn _main(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.clickhouse_workers > 4 {
         return Err("--clickhouse-workers must not exceed 4 on a shared ClickHouse host".into());
     }
+    if args.clickhouse_validate_schema {
+        if args.source.is_some()
+            || args.incremental_snapshot_dir.is_some()
+            || args.bootstrap
+            || args.clickhouse_close_tombstones
+        {
+            return Err(
+                "--clickhouse-validate-schema is a standalone read-only action and cannot be combined with a snapshot source, --bootstrap, or tombstone mode"
+                    .into(),
+            );
+        }
+        validate_clickhouse_prerequisites()?;
+        info!("[clickhouse] schema validation completed successfully; no snapshot was read and no data was written");
+        return Ok(());
+    }
     if args.clickhouse_rebuild_hot {
         if args.source.is_some()
             || args.incremental_snapshot_dir.is_some()
@@ -253,10 +275,10 @@ fn validate_clickhouse_prerequisites() -> Result<(), Box<dyn std::error::Error>>
         .map_err(Into::into)
 }
 
-/// Repair only the derived hot tables after a raw full snapshot has already
-/// been imported successfully.  This deliberately does not read any archive
-/// and never truncates raw tables.  Group raw/hot merges remain paused when the repair
-/// fails; they are enabled only after the hot rebuild succeeds.
+/// Repair only L3/token-info after direct-write L2 has already been imported.
+/// This deliberately does not read an archive or truncate raw/L2 tables.
+/// Group raw/hot merges remain paused when the repair fails; they are enabled
+/// only after the derived rebuild succeeds.
 fn rebuild_hot_indexes_only() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let clickhouse_url = std::env::var("CLICKHOUSE_URL")
@@ -265,20 +287,20 @@ fn rebuild_hot_indexes_only() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     info!(
-        "[clickhouse] hot-only repair 启动：保留 active raw 数据，仅重建 hot 表；不读取快照、不清空 raw"
+        "[clickhouse] derived-only repair 启动：保留 active raw/L2 数据，仅重建 L3 与 token-info；不读取快照、不清空表"
     );
     runtime.block_on(set_group_table_merges(
         &clickhouse_url,
         TableGroup::Active,
         false,
     ))?;
-    let rebuild_result = runtime.block_on(rebuild_hot_indexes_from_raw(
+    let rebuild_result = runtime.block_on(rebuild_derived_indexes_from_state(
         &clickhouse_url,
         TableGroup::Active,
     ));
     if let Err(err) = rebuild_result {
         warn!(
-            "[clickhouse] hot-only repair failed; raw active MERGE remains paused for retry: {}",
+            "[clickhouse] derived-only repair failed; active MERGE remains paused for retry: {}",
             err
         );
         return Err(err);
@@ -288,7 +310,7 @@ fn rebuild_hot_indexes_only() -> Result<(), Box<dyn std::error::Error>> {
         TableGroup::Active,
         true,
     ))?;
-    info!("[clickhouse] hot-only repair 成功，active raw+hot MERGE 已恢复");
+    info!("[clickhouse] derived-only repair 成功，active raw+hot MERGE 已恢复");
     Ok(())
 }
 
@@ -315,12 +337,15 @@ fn process_single_snapshot(
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+        let hot_mints =
+            runtime.block_on(load_group_hot_mints(&clickhouse_url, TableGroup::Active))?;
         let stats = match runtime.block_on(
             ClickhouseIndexer::new(
                 clickhouse_url,
                 snapshot_slot,
                 append_vec_count,
                 TableGroup::Active,
+                hot_mints,
             )?
             .mark_close_tombstones(loader.iter()),
         ) {
@@ -354,29 +379,37 @@ fn process_single_snapshot(
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+        let pause_merges = matches!(snapshot_kind, SnapshotKind::Full);
+        if pause_merges {
+            runtime.block_on(set_group_table_merges(
+                &clickhouse_url,
+                TableGroup::Active,
+                false,
+            ))?;
+            runtime.block_on(reset_table_group(&clickhouse_url, TableGroup::Active))?;
+            info!(
+                "[clickhouse] standalone full snapshot cold load: active group reset and merges paused before INSERT"
+            );
+        }
+        let hot_mints = if matches!(snapshot_kind, SnapshotKind::Full) {
+            runtime.block_on(snapshot_group_hot_mints(
+                &clickhouse_url,
+                TableGroup::Active,
+            ))?
+        } else {
+            runtime.block_on(load_group_hot_mints(&clickhouse_url, TableGroup::Active))?
+        };
         let indexer = ClickhouseIndexer::new(
             clickhouse_url.clone(),
             snapshot_slot,
             append_vec_count,
             TableGroup::Active,
+            hot_mints,
         )?;
-        let pause_merges = matches!(snapshot_kind, SnapshotKind::Full);
-        if pause_merges {
-            if let Err(err) = runtime.block_on(set_group_table_merges(
-                &clickhouse_url,
-                TableGroup::Active,
-                false,
-            )) {
-                return Err(err.into());
-            }
-            info!("[clickhouse] full snapshot cold load: raw active merges paused before INSERT");
-        }
         let import_result = runtime.block_on(indexer.insert_all(
             loader.iter(),
             snapshot_kind,
             args.clickhouse_workers,
-            None,
-            false,
         ));
         let stats = if pause_merges {
             match import_result {
@@ -466,6 +499,7 @@ enum IncrementalOutput {
         clickhouse_url: String,
         runtime: tokio::runtime::Runtime,
         workers: usize,
+        hot_mints: Option<HotMintSet>,
     },
 }
 
@@ -480,7 +514,7 @@ enum WatchedSnapshot {
 /// fails.
 struct StagingBuild {
     snapshot: FullSnapshot,
-    handle: JoinHandle<Result<(), String>>,
+    handle: JoinHandle<Result<HotMintSet, String>>,
 }
 
 impl WatchedSnapshot {
@@ -548,6 +582,7 @@ impl IncrementalOutput {
             clickhouse_url,
             runtime,
             workers,
+            hot_mints: None,
         })
     }
 
@@ -558,6 +593,50 @@ impl IncrementalOutput {
                 workers,
                 ..
             } => (clickhouse_url.clone(), *workers),
+        }
+    }
+
+    /// Full builds take a new snapshot of the mutable global configuration;
+    /// incrementals reuse this process-local group snapshot. After a watcher
+    /// restart the snapshot is restored once from the group's swapped filter
+    /// table, never from `hot_token_enabled`.
+    fn hot_mints_for(
+        &mut self,
+        group: TableGroup,
+        snapshot_kind: SnapshotKind,
+    ) -> Result<HotMintSet, Box<dyn std::error::Error>> {
+        match self {
+            Self::Clickhouse {
+                clickhouse_url,
+                runtime,
+                hot_mints,
+                ..
+            } => {
+                let mints = if matches!(snapshot_kind, SnapshotKind::Full) {
+                    runtime.block_on(snapshot_group_hot_mints(clickhouse_url, group))?
+                } else if let Some(mints) = hot_mints.as_ref() {
+                    std::sync::Arc::clone(mints)
+                } else {
+                    runtime.block_on(load_group_hot_mints(clickhouse_url, group))?
+                };
+                *hot_mints = Some(std::sync::Arc::clone(&mints));
+                Ok(mints)
+            }
+        }
+    }
+
+    fn set_hot_mints(&mut self, mints: HotMintSet) {
+        match self {
+            Self::Clickhouse { hot_mints, .. } => *hot_mints = Some(mints),
+        }
+    }
+
+    fn frozen_hot_mints(&self) -> Result<HotMintSet, Box<dyn std::error::Error>> {
+        match self {
+            Self::Clickhouse { hot_mints, .. } => hot_mints
+                .as_ref()
+                .map(std::sync::Arc::clone)
+                .ok_or_else(|| "no frozen hot-token set is loaded for this output".into()),
         }
     }
 
@@ -629,13 +708,13 @@ impl IncrementalOutput {
         }
     }
 
-    fn validate_group_parity(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn validate_staging_group(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         match self {
             Self::Clickhouse {
                 clickhouse_url,
                 runtime,
                 ..
-            } => runtime.block_on(validate_group_parity(clickhouse_url)),
+            } => runtime.block_on(validate_staging_group(clickhouse_url)),
         }
     }
 
@@ -646,16 +725,6 @@ impl IncrementalOutput {
                 runtime,
                 ..
             } => runtime.block_on(hot_token_version(clickhouse_url)),
-        }
-    }
-
-    fn hot_token_fingerprint(&mut self) -> Result<u64, Box<dyn std::error::Error>> {
-        match self {
-            Self::Clickhouse {
-                clickhouse_url,
-                runtime,
-                ..
-            } => runtime.block_on(hot_token_fingerprint(clickhouse_url)),
         }
     }
 
@@ -694,14 +763,14 @@ impl IncrementalOutput {
         loader: &mut SupportedLoader,
         snapshot_kind: SnapshotKind,
         group: TableGroup,
-        refresh_from_slot: Option<u64>,
-        force_hot_rebuild: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let hot_mints = self.hot_mints_for(group, snapshot_kind)?;
         match self {
             Self::Clickhouse {
                 clickhouse_url,
                 runtime,
                 workers,
+                ..
             } => {
                 let snapshot_slot = loader.snapshot_slot();
                 let append_vec_count = loader.append_vec_count_hint();
@@ -722,14 +791,9 @@ impl IncrementalOutput {
                         snapshot_slot,
                         append_vec_count,
                         group,
+                        hot_mints,
                     )?
-                    .insert_all(
-                        loader.iter(),
-                        snapshot_kind,
-                        *workers,
-                        refresh_from_slot,
-                        force_hot_rebuild,
-                    ),
+                    .insert_all(loader.iter(), snapshot_kind, *workers),
                 )?;
                 log_clickhouse_index_stats(&stats);
                 info!(
@@ -786,7 +850,7 @@ fn build_staging_full(
     snapshot: FullSnapshot,
     clickhouse_url: String,
     workers: usize,
-) -> Result<(), String> {
+) -> Result<HotMintSet, String> {
     let mut output = IncrementalOutput::from_config(clickhouse_url, workers)
         .map_err(|err| format!("failed to create staging ClickHouse runtime: {err}"))?;
     let candidate = WatchedSnapshot::Full(snapshot);
@@ -802,7 +866,7 @@ fn build_staging_full(
         .new_loader(0)
         .map_err(|err| format!("failed to create staging full snapshot loader: {err}"))?;
     output
-        .process(&mut loader, SnapshotKind::Full, group, None, false)
+        .process(&mut loader, SnapshotKind::Full, group)
         .map_err(|err| format!("staging full snapshot import/derived refresh failed: {err}"))?;
     output
         .start_group_merges(group)
@@ -810,7 +874,9 @@ fn build_staging_full(
     output
         .wait_for_group_merges_to_settle(group)
         .map_err(|err| format!("staging raw+hot MERGE settle check failed: {err}"))?;
-    Ok(())
+    output
+        .frozen_hot_mints()
+        .map_err(|err| format!("staging full completed without frozen hot-token set: {err}"))
 }
 
 /// Apply one incremental to the backup group on its own ClickHouse runtime.
@@ -822,24 +888,18 @@ fn process_incremental_in_background(
     workers: usize,
     group: TableGroup,
     resume_slot: u64,
-    refresh_from_slot: u64,
-    force_hot_rebuild: bool,
+    hot_mints: HotMintSet,
 ) -> Result<(), String> {
     let mut output = IncrementalOutput::from_config(clickhouse_url, workers).map_err(|err| {
         format!("failed to create {group:?} incremental ClickHouse runtime: {err}")
     })?;
+    output.set_hot_mints(hot_mints);
     let candidate = WatchedSnapshot::Incremental(snapshot);
     let mut loader = candidate
         .new_loader(resume_slot)
         .map_err(|err| format!("failed to create {group:?} incremental snapshot loader: {err}"))?;
     output
-        .process(
-            &mut loader,
-            SnapshotKind::Incremental,
-            group,
-            Some(refresh_from_slot),
-            force_hot_rebuild,
-        )
+        .process(&mut loader, SnapshotKind::Incremental, group)
         .map_err(|err| format!("{group:?} incremental import failed: {err}"))
 }
 
@@ -848,8 +908,7 @@ fn spawn_staging_incremental(
     clickhouse_url: String,
     workers: usize,
     stage_slot: u64,
-    refresh_from_slot: u64,
-    force_hot_rebuild: bool,
+    hot_mints: HotMintSet,
 ) -> Result<JoinHandle<Result<u64, String>>, String> {
     let candidate_slot = snapshot.slot();
     thread::Builder::new()
@@ -861,8 +920,7 @@ fn spawn_staging_incremental(
                 workers,
                 TableGroup::Backup,
                 stage_slot,
-                refresh_from_slot,
-                force_hot_rebuild,
+                hot_mints,
             )
             .map(|_| candidate_slot)
         })
@@ -876,6 +934,7 @@ fn exchange_if_ready(
     active_group_id: &mut u8,
     active_slot: &mut u64,
     staging_slot: &mut Option<u64>,
+    staging_hot_mints: &mut Option<HotMintSet>,
     retired_until: &mut Option<std::time::Instant>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let Some(stage_slot) = *staging_slot else {
@@ -890,12 +949,16 @@ fn exchange_if_ready(
         stage_slot
     );
     info!(
-        "[switch] active 与 _bak 已追平到 slot={}，执行切换前派生表一致性检查",
+        "[switch] active 与 _bak 已追平到 slot={}，执行 staging 自检",
         stage_slot
     );
-    output.validate_group_parity()?;
-    info!("[switch] 一致性检查通过，开始交换七对 active/_bak 表");
+    output.validate_staging_group()?;
+    info!("[switch] staging 自检通过，开始交换七对 active/_bak 表");
     output.exchange_groups()?;
+    let staged_mints = staging_hot_mints
+        .take()
+        .ok_or("staging group reached a slot without a frozen hot-token set")?;
+    output.set_hot_mints(staged_mints);
     *active_slot = stage_slot;
     *staging_slot = None;
     *active_group_id = if *active_group_id == 1 { 2 } else { 1 };
@@ -942,16 +1005,16 @@ fn run_incremental_snapshots(
         resume_slot
     };
     let mut staging_slot: Option<u64> = None;
+    let mut staging_hot_mints: Option<HotMintSet> = None;
     let mut staging_build: Option<StagingBuild> = None;
     let mut staging_incremental_handle: Option<JoinHandle<Result<u64, String>>> = None;
-    let mut staging_incremental_queue: VecDeque<(IncrementalSnapshot, bool)> = VecDeque::new();
+    let mut staging_incremental_queue: VecDeque<IncrementalSnapshot> = VecDeque::new();
     // A failed staging full must be retried even if active has already
     // advanced beyond that full while serving incrementals. Keep the retry
     // candidate separately instead of rewinding the independent active
     // watermark.
     let mut retry_full: Option<FullSnapshot> = None;
     let mut retired_until: Option<std::time::Instant> = None;
-    let mut hot_fingerprint = output.hot_token_fingerprint()?;
     let mut active_group_id: u8 = if bootstrap_pending {
         1
     } else {
@@ -991,9 +1054,10 @@ fn run_incremental_snapshots(
             let build = staging_build.take().expect("staging build checked above");
             let snapshot = build.snapshot;
             match build.handle.join() {
-                Ok(Ok(())) => {
+                Ok(Ok(hot_mints)) => {
                     retry_full = None;
                     staging_slot = Some(snapshot.slot());
+                    staging_hot_mints = Some(hot_mints);
                     has_processed_snapshot = true;
                     debug!("Staging full snapshot ready at slot {}", snapshot.slot());
                     info!(
@@ -1075,7 +1139,7 @@ fn run_incremental_snapshots(
         // has committed. This preserves staging slot order without making
         // the active watcher wait for the backup queue to drain.
         if staging_incremental_handle.is_none() {
-            if let (Some(stage_slot), Some((snapshot, _))) =
+            if let (Some(stage_slot), Some(snapshot)) =
                 (staging_slot, staging_incremental_queue.front().cloned())
             {
                 if snapshot.slot() <= stage_slot {
@@ -1092,15 +1156,17 @@ fn run_incremental_snapshots(
                     let snapshot = staging_incremental_queue
                         .pop_front()
                         .expect("staging queue front checked above");
-                    let (snapshot, force_hot_rebuild) = snapshot;
                     let (clickhouse_url, workers) = output.clickhouse_config();
+                    let hot_mints = staging_hot_mints
+                        .as_ref()
+                        .map(std::sync::Arc::clone)
+                        .ok_or("staging incremental queued without a frozen hot-token set")?;
                     staging_incremental_handle = Some(spawn_staging_incremental(
                         snapshot.clone(),
                         clickhouse_url,
                         workers,
                         stage_slot,
-                        snapshot.base_slot(),
-                        force_hot_rebuild,
+                        hot_mints,
                     )?);
                 }
             }
@@ -1115,6 +1181,7 @@ fn run_incremental_snapshots(
                 &mut active_group_id,
                 &mut active_slot,
                 &mut staging_slot,
+                &mut staging_hot_mints,
                 &mut retired_until,
             )?;
         }
@@ -1297,6 +1364,10 @@ fn run_incremental_snapshots(
                 group.as_str()
             );
             if !bootstrap_full {
+                // This generation will freeze its own hot-mint set in the
+                // background full build.  Never let a failed/retried build
+                // reuse a previous staging set.
+                staging_hot_mints = None;
                 let staging_snapshot = match &candidate {
                     WatchedSnapshot::Full(snapshot) => snapshot.clone(),
                     WatchedSnapshot::Incremental(_) => unreachable!(),
@@ -1345,8 +1416,6 @@ fn run_incremental_snapshots(
                     None => unreachable!("staging build was just installed"),
                 };
                 let active_resume_slot = active_slot;
-                let current_hot_fingerprint = output.hot_token_fingerprint()?;
-                let force_hot_rebuild = current_hot_fingerprint != hot_fingerprint;
                 let mut active_loader = active_candidate.new_loader(active_resume_slot)?;
                 let active_append_vecs = active_loader.append_vec_count_hint().unwrap_or(0);
                 if snapshot_slot <= active_resume_slot {
@@ -1372,13 +1441,10 @@ fn run_incremental_snapshots(
                         &mut active_loader,
                         SnapshotKind::Incremental,
                         TableGroup::Active,
-                        Some(active_resume_slot),
-                        force_hot_rebuild,
                     );
                     process_result?;
                     active_slot = snapshot_slot;
                 }
-                hot_fingerprint = current_hot_fingerprint;
                 has_processed_snapshot = true;
                 info!(
                     "[switch] active full 尾段处理完成：active_slot={}；_bak 继续后台制备",
@@ -1443,7 +1509,7 @@ fn run_incremental_snapshots(
                     continue;
                 }
             };
-            let process_result = output.process(&mut loader, snapshot_kind, group, None, false);
+            let process_result = output.process(&mut loader, snapshot_kind, group);
             if let Err(err) = process_result {
                 warn!(
                     "[clickhouse] {} full snapshot import/derived refresh failed: {}",
@@ -1478,7 +1544,6 @@ fn run_incremental_snapshots(
                 "[clickhouse] {} 组 raw 全量冷启动完成，后台 MERGE 已收敛到增量写入门槛；开始后续增量流程",
                 group.as_str()
             );
-            hot_fingerprint = output.hot_token_fingerprint()?;
             let control_hot_version = output.hot_token_version()?;
             if bootstrap_full {
                 active_slot = candidate.slot();
@@ -1506,8 +1571,6 @@ fn run_incremental_snapshots(
                 WatchedSnapshot::Incremental(snapshot) => snapshot,
                 WatchedSnapshot::Full(_) => unreachable!(),
             };
-            let current_hot_fingerprint = output.hot_token_fingerprint()?;
-            let force_hot_rebuild = current_hot_fingerprint != hot_fingerprint;
             // Active path is always kept current. During staging, the new
             // full's high-slot tail has already been applied to active, so
             // each following incremental can be validated against the active
@@ -1537,17 +1600,11 @@ fn run_incremental_snapshots(
             if staging_slot.is_some_and(|stage_slot| {
                 candidate.slot() > stage_slot && incremental.base_slot() <= stage_slot
             }) {
-                staging_incremental_queue.push_back((incremental.clone(), force_hot_rebuild));
+                staging_incremental_queue.push_back(incremental.clone());
             }
 
             let active_result = if let Some(ref mut loader) = active_loader {
-                output.process(
-                    loader,
-                    snapshot_kind,
-                    TableGroup::Active,
-                    Some(incremental.base_slot()),
-                    force_hot_rebuild,
-                )
+                output.process(loader, snapshot_kind, TableGroup::Active)
             } else {
                 Ok(())
             };
@@ -1575,7 +1632,6 @@ fn run_incremental_snapshots(
             if active_loader.is_some() {
                 active_slot = candidate.slot();
             }
-            hot_fingerprint = current_hot_fingerprint;
         }
 
         console_snapshot_status(
@@ -1597,6 +1653,7 @@ fn run_incremental_snapshots(
                 &mut active_group_id,
                 &mut active_slot,
                 &mut staging_slot,
+                &mut staging_hot_mints,
                 &mut retired_until,
             )?;
         }

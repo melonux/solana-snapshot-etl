@@ -118,9 +118,10 @@ the resume slot. Thus files at lower slots are ignored directly, while a full sn
 only account changes after the resume slot. Full archives use a fast ClickHouse path: Agave excludes
 tombstones from full archives, so the importer does not perform any extra close-candidate pass for
 them. Incremental archives retain the tombstone path because it is needed to delete token accounts
-from the full base. Canonical empty accounts are appended directly as `is_deleted = 1` versions;
-the importer does not issue a `raw_token_account FINAL` lookup. After a successful write, the
-resume slot advances and the directory is scanned again. At startup, if no suitable archive can
+from the full base. Canonical empty accounts are looked up by pubkey in the current hot L2 state;
+only a recovered hot-token `mint/owner` pair receives an `is_deleted = 1` L2 version, so ordinary
+zero-lamport accounts do not pollute `hot_token_account_state`. The importer never scans a
+`raw_token_account` history table. After a successful write, the resume slot advances and the directory is scanned again. At startup, if no suitable archive can
 advance the initial resume slot (including a slot gap with no bridging full snapshot), the watcher
 reports the problem and exits. Once at least one archive has completed, it waits five seconds by
 default when the next archive is not yet available; change this with
@@ -143,15 +144,21 @@ column types, engines, and wallet-balance projections at startup before reading 
 schema error stops the process without starting a partial import. The dual-buffer lifecycle and
 stable table names are described in [`docs/hot-index-double-buffer.md`](docs/hot-index-double-buffer.md).
 
-In watch mode, normal incrementals update only the active (suffix-free) group. When a newer full
-snapshot is available, the importer resets `_bak`, cold-loads that snapshot there, and opens each
-following incremental independently for both groups. Once their slots and derived hot indexes
-match, it exchanges the seven table pairs, records the generation, keeps the old group for five
-minutes, and truncates `_bak` with `max_table_size_to_drop = 0`.
+To run only this read-only validation (no snapshot read and no ClickHouse write):
 
-If a full snapshot has already finished importing into the raw tables but the derived hot-table
-refresh failed (for example because an older build ran out of memory during `FINAL` or a large
-raw-table Join), repair only the active hot tables without reading or re-importing the snapshot:
+```shell
+solana-snapshot-etl --clickhouse-validate-schema
+```
+
+In watch mode, normal incrementals update only the active (suffix-free) group. When a newer full
+snapshot is available, the importer resets `_bak`, freezes a new hot-mint set there, cold-loads
+that snapshot, and opens each following incremental independently for both groups. Each group
+keeps its own slot watermark and frozen mint set. Once their slots match and staging passes its
+self-check, the importer exchanges the seven table pairs, records the generation, keeps the old
+group for five minutes, and truncates `_bak` with `max_table_size_to_drop = 0`.
+
+If direct L2 import has succeeded but the derived L3/token-info refresh failed, rebuild those
+derived active tables without reading or re-importing the snapshot:
 
 ```shell
 solana-snapshot-etl --clickhouse-rebuild-hot
@@ -159,18 +166,23 @@ solana-snapshot-etl --clickhouse-rebuild-hot
 ./run.sh --clickhouse-rebuild-hot
 ```
 
-This action requires `CLICKHOUSE_URL`, validates the schema first, pauses active raw-table Merge,
-rebuilds `hot_token_account_state`, `hot_wallet_token_balance`, and `hot_token_info` from the
-existing raw data, and restores Merge only after all three succeed. A full raw baseline is copied
-to L2 without `FINAL`; token information is built in ordered mint batches, and the wallet
-aggregation can spill after 1 GiB of intermediate state. On failure it exits with raw Merge still
-paused so the operator can retry after adjusting ClickHouse memory or temporary-disk capacity.
+This action requires `CLICKHOUSE_URL`, validates the schema first, pauses active group Merge,
+rebuilds `hot_wallet_token_balance` and `hot_token_info` from existing direct-write L2 and the
+frozen filter, then restores Merge. It cannot reconstruct a missing/corrupt
+`hot_token_account_state`; rebuild L2 with a new full snapshot in that case. Token information is
+built in ordered mint batches, and the full wallet aggregation can spill after 1 GiB of
+intermediate state.
 
 Run the importer with `--clickhouse`:
 
 ```shell
 solana-snapshot-etl snapshot-139240745-*.tar.zst --clickhouse
 ```
+
+When that source is a full snapshot, this single-shot command treats it as a
+fresh active baseline: it pauses active merges and resets the seven active
+tables before import. Use watch mode with `--bootstrap` for the same explicit
+first-load behavior.
 
 By default logs are written to stderr. Pass `--log-file` to write timestamped ETL logs to a file;
 the file is truncated when the process starts, and the terminal remains available for progress bars:
@@ -219,8 +231,10 @@ ClickHouse, start with `2` and do not exceed `4`; more streams can cause MergeTr
 consume all disk I/O. Set it to `1` for the single-threaded path when diagnosing a problematic
 server.
 
-The importer leaves ClickHouse MergeTree background merges enabled for both full and incremental
-snapshots; merge state does not change when switching between snapshot types.
+The importer pauses Merge only for the target group while it cold-loads a full snapshot. It starts
+Merge after the full L2/L3 build completes and waits for each target table partition to fall below
+20 active parts before dispatching that group's incrementals. Normal active incrementals do not
+pause Merge.
 
 If a snapshot was already imported but the CloseAccount tombstone pass failed, run only that pass:
 
@@ -228,7 +242,6 @@ If a snapshot was already imported but the CloseAccount tombstone pass failed, r
 solana-snapshot-etl snapshot-139240745-*.tar.zst --clickhouse-close-tombstones
 ```
 
-This scans the snapshot's canonical empty accounts and appends `raw_token_account` rows with
-`is_deleted = 1`; it does not re-insert raw or parsed account rows. Since a canonical empty
-account does not contain the previous mint/owner, those fields are neutral empty values in the
-tombstone row.
+This scans the snapshot's canonical empty accounts and appends `is_deleted = 1` versions only to
+`hot_token_account_state` rows whose previous live mint/owner can be recovered by pubkey. It does
+not re-insert raw or parsed account rows; non-token empty accounts are skipped.
