@@ -232,9 +232,9 @@ consume all disk I/O. Set it to `1` for the single-threaded path when diagnosing
 server.
 
 The importer pauses Merge only for the target group while it cold-loads a full snapshot. It starts
-Merge after the full L2/L3 build completes and waits for each target table partition to fall below
-20 active parts before dispatching that group's incrementals. Normal active incrementals do not
-pause Merge.
+Merge after the full L2/L3 build completes and waits for each target table's active-part count to
+remain unchanged across two checks five minutes apart before dispatching that group's incrementals.
+Normal active incrementals do not pause Merge.
 
 If a snapshot was already imported but the CloseAccount tombstone pass failed, run only that pass:
 

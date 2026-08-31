@@ -46,7 +46,7 @@ hot_wallet_token_balance    <->            hot_wallet_token_balance_bak
 3. 解析 archive：所有账户元信息进入 `raw_account`；只有 frozen hot mint 的 mint、metadata 和 Token Account 进入对应表。
 4. Token Account 直接写入 `hot_token_account_state`，带 `delegate`、`delegated_amount` 和 `close_authority`。
 5. 从 L2 构建整个 `hot_wallet_token_balance`；从 filter 和本组 hot-only raw mint/metadata 构建 `hot_token_info`。
-6. 重启 Merge，并等待该组每张表每个 partition 的活动 part 少于 20，再接受它的增量。
+6. 重启 Merge，并等待前后间隔 5 分钟的检测中该组每张表的活动 parts 数量保持不变，再接受它的增量。
 
 Full archive 排除了历史 tombstone，因此它是新的当前态基线，不做 CloseAccount 候选扫描。
 

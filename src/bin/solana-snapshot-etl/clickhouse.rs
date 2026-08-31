@@ -48,15 +48,13 @@ const HOT_TOKEN_INFO_BATCH_SIZE: u64 = 10_000;
 // cap.  ClickHouse spills intermediate GROUP BY / sort state to its temporary
 // disk once either limit is reached.
 const HOT_BALANCE_EXTERNAL_AGGREGATION_BYTES: &str = "1073741824";
-// A cold full import deliberately leaves a bounded number of large parts in
-// each group table. Once background merges are restarted, let that backlog
-// shrink before accepting the next incremental INSERT: otherwise the merge
-// burst and another set of HTTP RowBinary INSERTs compete for the same disk.
-// The condition is strict: every active partition must have fewer than this
-// many active parts.
-pub(crate) const RAW_MERGE_READY_PARTS_PER_PARTITION_LIMIT: u64 = 20;
-const RAW_MERGE_READY_POLL_INTERVAL: Duration = Duration::from_secs(10);
-const RAW_MERGE_READY_LOG_EVERY_POLLS: u64 = 3;
+// A cold full import deliberately leaves a backlog of parts in each group
+// table. Once background merges are restarted, wait for the active-part count
+// of every table to stop changing before accepting the next incremental
+// INSERT. The five-minute window avoids treating a temporarily idle merger as
+// settled while allowing the final part count to grow with table size.
+const RAW_MERGE_STABILITY_WINDOW: Duration = Duration::from_secs(5 * 60);
+const RAW_MERGE_PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Physical table group used by the dual-buffer importer.  `Active` always
 /// maps to the stable query-facing names; `Backup` maps to the `_bak` staging
@@ -1135,10 +1133,8 @@ struct RawMergePartCount {
     total_size: String,
 }
 
-fn raw_merge_backlog_is_ready(parts: &[RawMergePartCount]) -> bool {
-    parts
-        .iter()
-        .all(|part| part.parts_count < RAW_MERGE_READY_PARTS_PER_PARTITION_LIMIT)
+fn raw_merge_part_total(parts: &[RawMergePartCount]) -> u64 {
+    parts.iter().map(|part| part.parts_count).sum()
 }
 
 fn raw_merge_backlog_summary(table: &str, parts: &[RawMergePartCount]) -> String {
@@ -1177,11 +1173,10 @@ async fn raw_merge_part_counts(client: &Client, table: &str) -> Result<Vec<RawMe
 }
 
 /// After a successful full import starts raw and derived-table Merge again,
-/// wait until every partition in every group table has a modest active-part
-/// backlog. This is a write barrier for the next incremental snapshot, not a
-/// request for a single fully merged part; keeping fewer than 20 parts per
-/// partition still gives ClickHouse room to finish the remaining background
-/// work naturally.
+/// wait until the active-part count of every group table is unchanged across a
+/// five-minute window. This is a write barrier for the next incremental
+/// snapshot; the final count is intentionally not compared with a fixed
+/// threshold because it naturally grows with table size.
 ///
 /// The probe retries transient ClickHouse failures.  At this point the full
 /// generation is already valid and MERGE has already been resumed, so a brief
@@ -1197,23 +1192,23 @@ pub(crate) async fn wait_for_group_merges_to_settle(
         .map(|base| group.table(base))
         .collect::<Vec<_>>();
     let started_at = Instant::now();
-    let mut polls = 0_u64;
+    let mut previous_part_totals: Option<Vec<u64>> = None;
 
     info!(
-        "[clickhouse] group MERGE 已恢复；等待 group={} 的每张 raw+hot 表每个 partition 活跃分片数 < {}，期间不派发该组后续增量 INSERT",
+        "[clickhouse] group MERGE 已恢复；等待 group={} 的每张 raw+hot 表活跃 parts 数量在前后 {} 分钟检测中保持不变，期间不派发该组后续增量 INSERT",
         group.as_str(),
-        RAW_MERGE_READY_PARTS_PER_PARTITION_LIMIT
+        RAW_MERGE_STABILITY_WINDOW.as_secs() / 60
     );
 
     loop {
         let mut summaries = Vec::with_capacity(tables.len());
-        let mut ready = true;
+        let mut part_totals = Vec::with_capacity(tables.len());
         let mut probe_error = None;
 
         for table in &tables {
             match raw_merge_part_counts(&client, table).await {
                 Ok(parts) => {
-                    ready &= raw_merge_backlog_is_ready(&parts);
+                    part_totals.push(raw_merge_part_total(&parts));
                     summaries.push(raw_merge_backlog_summary(table, &parts));
                 }
                 Err(err) => {
@@ -1227,37 +1222,52 @@ pub(crate) async fn wait_for_group_merges_to_settle(
             warn!(
                 "[clickhouse] group MERGE 收敛检查失败 group={}；全量数据保持有效、不会清理，{} 秒后重试：{}",
                 group.as_str(),
-                RAW_MERGE_READY_POLL_INTERVAL.as_secs(),
+                RAW_MERGE_PROBE_RETRY_INTERVAL.as_secs(),
                 err
             );
-            tokio::time::sleep(RAW_MERGE_READY_POLL_INTERVAL).await;
+            tokio::time::sleep(RAW_MERGE_PROBE_RETRY_INTERVAL).await;
             continue;
         }
 
         let elapsed_secs = started_at.elapsed().as_secs();
-        if ready {
+        let unchanged = match previous_part_totals.as_ref() {
+            Some(previous) => previous == &part_totals,
+            None => false,
+        };
+        if unchanged {
             info!(
-                "[clickhouse] group MERGE 收敛完成 group={} elapsed={}s condition=all_tables_all_partitions_parts<{}；允许该组后续增量 INSERT：{}",
+                "[clickhouse] group MERGE 收敛完成 group={} elapsed={}s condition=all_tables_parts_unchanged_for_{}s parts={:?}；允许该组后续增量 INSERT：{}",
                 group.as_str(),
                 elapsed_secs,
-                RAW_MERGE_READY_PARTS_PER_PARTITION_LIMIT,
+                RAW_MERGE_STABILITY_WINDOW.as_secs(),
+                part_totals,
                 summaries.join("; ")
             );
             return Ok(());
         }
 
-        if polls % RAW_MERGE_READY_LOG_EVERY_POLLS == 0 {
+        if let Some(previous) = previous_part_totals.as_ref() {
             info!(
-                "[clickhouse] 等待 group MERGE 收敛 group={} elapsed={}s condition=all_tables_all_partitions_parts<{}；{} 秒后复查：{}",
+                "[clickhouse] 等待 group MERGE 收敛 group={} elapsed={}s；parts 数量已变化 previous={:?} current={:?}，{} 分钟后复查：{}",
                 group.as_str(),
                 elapsed_secs,
-                RAW_MERGE_READY_PARTS_PER_PARTITION_LIMIT,
-                RAW_MERGE_READY_POLL_INTERVAL.as_secs(),
+                previous,
+                part_totals,
+                RAW_MERGE_STABILITY_WINDOW.as_secs() / 60,
+                summaries.join("; ")
+            );
+        } else {
+            info!(
+                "[clickhouse] 等待 group MERGE 收敛 group={} elapsed={}s；首次 parts 检测 current={:?}，{} 分钟后复查：{}",
+                group.as_str(),
+                elapsed_secs,
+                part_totals,
+                RAW_MERGE_STABILITY_WINDOW.as_secs() / 60,
                 summaries.join("; ")
             );
         }
-        polls += 1;
-        tokio::time::sleep(RAW_MERGE_READY_POLL_INTERVAL).await;
+        previous_part_totals = Some(part_totals);
+        tokio::time::sleep(RAW_MERGE_STABILITY_WINDOW).await;
     }
 }
 
@@ -3487,22 +3497,23 @@ mod tests {
     }
 
     #[test]
-    fn raw_merge_backlog_requires_strictly_fewer_than_twenty_parts() {
-        let below_limit = vec![RawMergePartCount {
-            partition: "all".to_owned(),
-            parts_count: RAW_MERGE_READY_PARTS_PER_PARTITION_LIMIT - 1,
-            total_rows: 1,
-            total_size: "1 B".to_owned(),
-        }];
-        assert!(raw_merge_backlog_is_ready(&below_limit));
+    fn raw_merge_part_total_sums_all_partitions_without_a_fixed_threshold() {
+        let parts = vec![
+            RawMergePartCount {
+                partition: "2025-01".to_owned(),
+                parts_count: 20,
+                total_rows: 1,
+                total_size: "1 B".to_owned(),
+            },
+            RawMergePartCount {
+                partition: "2025-02".to_owned(),
+                parts_count: 21,
+                total_rows: 1,
+                total_size: "1 B".to_owned(),
+            },
+        ];
 
-        let at_limit = vec![RawMergePartCount {
-            partition: "all".to_owned(),
-            parts_count: RAW_MERGE_READY_PARTS_PER_PARTITION_LIMIT,
-            total_rows: 1,
-            total_size: "1 B".to_owned(),
-        }];
-        assert!(!raw_merge_backlog_is_ready(&at_limit));
+        assert_eq!(raw_merge_part_total(&parts), 41);
     }
 
     #[test]
