@@ -9,7 +9,7 @@ use solana_sdk::program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
 use solana_snapshot_etl::append_vec::{AppendVec, StoredAccountMeta};
 use solana_snapshot_etl::{append_vec_accounts, AppendVecIterator};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -25,21 +25,27 @@ const ACCOUNT_TABLE: &str = "raw_account";
 const TOKEN_MINT_TABLE: &str = "raw_token_mint";
 const TOKEN_METADATA_TABLE: &str = "raw_token_metadata";
 const RAW_TABLES: [&str; 3] = [ACCOUNT_TABLE, TOKEN_MINT_TABLE, TOKEN_METADATA_TABLE];
-const GROUP_HOT_TABLES: [&str; 4] = [
-    "hot_token_filter",
+const GROUP_HOT_TABLES: [&str; 3] = [
     "hot_token_account_state",
     "hot_token_info",
     "hot_wallet_token_balance",
 ];
-const GROUP_MERGE_TABLES: [&str; 7] = [
+const GROUP_MERGE_TABLES: [&str; 6] = [
     ACCOUNT_TABLE,
     TOKEN_MINT_TABLE,
     TOKEN_METADATA_TABLE,
-    "hot_token_filter",
     "hot_token_account_state",
     "hot_token_info",
     "hot_wallet_token_balance",
 ];
+
+/// Stable physical identities of the six tables in one logical generation.
+/// Table UUIDs survive `EXCHANGE TABLES`, letting a restarted watcher finish a
+/// partially completed multi-pair exchange without ever swapping a pair back.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct TableGroupIdentity {
+    tables: BTreeMap<String, String>,
+}
 // `hot_token_info` is built in ordered mint ranges.  The full source mint and
 // metadata tables are sorted by mint, so a bounded range keeps the right side
 // of each JOIN small without repeatedly scanning overlapping key ranges.
@@ -51,9 +57,9 @@ const HOT_BALANCE_EXTERNAL_AGGREGATION_BYTES: &str = "1073741824";
 // A cold full import deliberately leaves a backlog of parts in each group
 // table. Once background merges are restarted, wait for the active-part count
 // of every table to stop changing before accepting the next incremental
-// INSERT. The five-minute window avoids treating a temporarily idle merger as
+// INSERT. The two-minute window avoids treating a temporarily idle merger as
 // settled while allowing the final part count to grow with table size.
-const RAW_MERGE_STABILITY_WINDOW: Duration = Duration::from_secs(5 * 60);
+const RAW_MERGE_STABILITY_WINDOW: Duration = Duration::from_secs(2 * 60);
 const RAW_MERGE_PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Physical table group used by the dual-buffer importer.  `Active` always
@@ -499,6 +505,7 @@ impl ClickhouseIndexer {
         refresh_hot_indexes(
             &self.client,
             self.group,
+            &self.hot_mints,
             snapshot_kind,
             self.snapshot_slot,
             &affected_pairs,
@@ -804,6 +811,7 @@ impl ClickhouseIndexer {
         refresh_hot_indexes(
             &self.client,
             self.group,
+            &self.hot_mints,
             snapshot_kind,
             self.snapshot_slot,
             &affected_pairs,
@@ -885,6 +893,7 @@ impl ClickhouseIndexer {
             refresh_hot_indexes(
                 &self.client,
                 self.group,
+                &self.hot_mints,
                 SnapshotKind::Incremental,
                 self.snapshot_slot,
                 &tombstone_result.affected_pairs,
@@ -994,74 +1003,33 @@ pub(crate) async fn max_raw_account_updated_slot(
         .map_err(Into::into)
 }
 
-/// Return the current global hot-token configuration version for control-table
-/// audit records. It is never used to alter an already-built table group's
-/// frozen mint set.
-pub(crate) async fn hot_token_version(connection_url: &str) -> Result<u64> {
-    new_clickhouse_client(connection_url)?
-        .query("SELECT coalesce(max(version), toUInt64(0)) FROM hot_token_enabled")
-        .fetch_one::<u64>()
-        .await
-        .map_err(Into::into)
-}
-
-/// Freeze the global hot-token selection into one physical table group. This
-/// is called only while building a new full generation; active incrementals
-/// receive the resulting in-memory set and never query `hot_token_enabled`.
-pub(crate) async fn snapshot_group_hot_mints(
-    connection_url: &str,
-    group: TableGroup,
-) -> Result<HotMintSet> {
+/// Snapshot the mutable global hot-token configuration into memory. The
+/// watcher persists this set locally beside its JSON state file, so it stays
+/// frozen across restart without ClickHouse filter tables.
+pub(crate) async fn snapshot_hot_mints(connection_url: &str) -> Result<HotMintSet> {
     let client = new_clickhouse_client(connection_url)?;
-    let table = group.table("hot_token_filter");
-    client
-        .query(&format!(
-            "TRUNCATE TABLE {table} SETTINGS max_table_size_to_drop = 0"
-        ))
-        .execute()
-        .await
-        .map_err(|err| format!("failed to reset frozen hot-token filter {table}: {err}"))?;
-    client
-        .query(&format!(
-            "INSERT INTO {table} (mint) SELECT mint FROM hot_token_enabled"
-        ))
-        .execute()
-        .await
-        .map_err(|err| format!("failed to snapshot hot_token_enabled into {table}: {err}"))?;
-    load_group_hot_mints_with_client(&client, group).await
+    load_enabled_hot_mints_with_client(&client).await
 }
 
-/// Restore the frozen mint set for an already-built active/staging group. It
-/// is used only on process start (or by an independently spawned worker), not
-/// for each incremental archive in the long-running active watcher.
-pub(crate) async fn load_group_hot_mints(
-    connection_url: &str,
-    group: TableGroup,
-) -> Result<HotMintSet> {
+/// Read the current global hot-token configuration for standalone operations
+/// that do not have a watcher state file with a frozen mint set.
+pub(crate) async fn load_enabled_hot_mints(connection_url: &str) -> Result<HotMintSet> {
     let client = new_clickhouse_client(connection_url)?;
-    load_group_hot_mints_with_client(&client, group).await
+    load_enabled_hot_mints_with_client(&client).await
 }
 
-async fn load_group_hot_mints_with_client(
-    client: &Client,
-    group: TableGroup,
-) -> Result<HotMintSet> {
-    let table = group.table("hot_token_filter");
+async fn load_enabled_hot_mints_with_client(client: &Client) -> Result<HotMintSet> {
     let rows = client
-        .query(&format!("SELECT mint FROM {table}"))
+        .query("SELECT mint FROM hot_token_enabled")
         .fetch_all::<HotMintRow>()
         .await
-        .map_err(|err| format!("failed to load frozen hot-token filter {table}: {err}"))?;
+        .map_err(|err| format!("failed to load hot_token_enabled: {err}"))?;
     if rows.is_empty() {
-        return Err(format!(
-            "frozen hot-token filter {table} is empty; build this table group from a full snapshot first"
-        )
-        .into());
+        return Err("hot_token_enabled is empty".into());
     }
     let mints = rows.into_iter().map(|row| row.mint).collect::<HashSet<_>>();
     info!(
-        "[clickhouse] loaded frozen hot-token filter group={} mint_count={}",
-        group.as_str(),
+        "[clickhouse] loaded hot-token configuration into memory mint_count={}",
         mints.len()
     );
     Ok(Arc::new(mints))
@@ -1082,7 +1050,7 @@ pub(crate) async fn reset_table_group(connection_url: &str, group: TableGroup) -
     Ok(())
 }
 
-/// Enable or disable ClickHouse's background merges for all seven tables in
+/// Enable or disable ClickHouse's background merges for all six tables in
 /// one physical table group. Full snapshot loading is append-heavy and does
 /// not need background ReplacingMergeTree deduplication while rows are
 /// arriving; deferring raw and derived-table merges keeps CPU/IO available
@@ -1174,7 +1142,7 @@ async fn raw_merge_part_counts(client: &Client, table: &str) -> Result<Vec<RawMe
 
 /// After a successful full import starts raw and derived-table Merge again,
 /// wait until the active-part count of every group table is unchanged across a
-/// five-minute window. This is a write barrier for the next incremental
+/// two-minute window. This is a write barrier for the next incremental
 /// snapshot; the final count is intentionally not compared with a fixed
 /// threshold because it naturally grows with table size.
 ///
@@ -1272,12 +1240,12 @@ pub(crate) async fn wait_for_group_merges_to_settle(
 }
 
 /// Refresh the derived serving indexes after the parser has directly inserted
-/// hot token-account versions into L2. The hot-mint filter is frozen for the
-/// lifetime of a table group, so incrementals only recompute their affected
-/// L3 pairs and never consult the global hot-token configuration.
+/// hot token-account versions into L2. The caller supplies the frozen
+/// in-memory mint set, so incrementals never consult the global configuration.
 pub(crate) async fn refresh_hot_indexes(
     client: &Client,
     group: TableGroup,
+    hot_mints: &HotMintSet,
     snapshot_kind: SnapshotKind,
     snapshot_slot: u64,
     affected_pairs: &HashSet<TokenPair>,
@@ -1291,12 +1259,7 @@ pub(crate) async fn refresh_hot_indexes(
     let state = group.table("hot_token_account_state");
     let info = group.table("hot_token_info");
     let balance = group.table("hot_wallet_token_balance");
-    let filter = group.table("hot_token_filter");
-    let enabled_hot_tokens = client
-        .query(&format!("SELECT count() FROM {filter}"))
-        .fetch_one::<u64>()
-        .await
-        .map_err(|err| format!("failed to count {filter}: {err}"))?;
+    let enabled_hot_tokens = hot_mints.len();
     info!(
         "[clickhouse] hot state committed; starting derived-index refresh group={} kind={} frozen_hot_tokens={}",
         group.as_str(),
@@ -1336,7 +1299,7 @@ pub(crate) async fn refresh_hot_indexes(
                 "existing hot-only raw tables with FINAL"
             }
         );
-        rebuild_token_info_table(client, group, &info, state_is_full_baseline).await?;
+        rebuild_token_info_table(client, group, &info, state_is_full_baseline, hot_mints).await?;
         client
             .query(&format!("SELECT count() FROM {info}"))
             .fetch_one::<u64>()
@@ -1379,6 +1342,7 @@ pub(crate) async fn rebuild_derived_indexes_from_state(
     group: TableGroup,
 ) -> Result<()> {
     let client = new_clickhouse_client(connection_url)?;
+    let hot_mints = load_enabled_hot_mints_with_client(&client).await?;
     info!(
         "[clickhouse] rebuilding L3/token-info from existing hot state group={} without snapshot import",
         group.as_str()
@@ -1386,6 +1350,7 @@ pub(crate) async fn rebuild_derived_indexes_from_state(
     refresh_hot_indexes(
         &client,
         group,
+        &hot_mints,
         SnapshotKind::Full,
         0,
         &HashSet::new(),
@@ -1561,15 +1526,16 @@ struct HotMintRow {
     mint: String,
 }
 
-/// Rebuild token display information from the group's frozen mint filter and
-/// the corresponding hot-only raw mint/metadata tables. The filter is read
-/// in sorted batches so each JOIN remains bounded; the temporary table is
+/// Rebuild token display information from the frozen in-memory mint set and
+/// the corresponding hot-only raw mint/metadata tables. Mint strings are
+/// sorted and sent to ClickHouse in bounded batches; the temporary table is
 /// exchanged only once all batches have succeeded.
 async fn rebuild_token_info_table(
     client: &Client,
     group: TableGroup,
     target: &str,
     raw_is_full_baseline: bool,
+    hot_mints: &HotMintSet,
 ) -> Result<()> {
     let nonce = format!(
         "{}_{}",
@@ -1588,7 +1554,6 @@ async fn rebuild_token_info_table(
 
     let mint_table = group.table(TOKEN_MINT_TABLE);
     let metadata_table = group.table(TOKEN_METADATA_TABLE);
-    let filter_table = group.table("hot_token_filter");
     // A cold full load has one canonical source row per mint, so it avoids
     // FINAL. The manual derived-table rebuild can run after incrementals, in
     // which case the hot-only raw tables may have multiple versions and need
@@ -1605,40 +1570,30 @@ async fn rebuild_token_info_table(
     };
 
     let result = async {
-        let mut previous_last_mint: Option<String> = None;
+        let mut mints = hot_mints.iter().collect::<Vec<_>>();
+        mints.sort_unstable();
         let mut batch_count = 0_u64;
         let mut inserted_tokens = 0_u64;
-        loop {
-            let resume_predicate = previous_last_mint.as_ref().map_or_else(String::new, |mint| {
-                format!("WHERE mint > {}", sql_string_literal(mint))
-            });
-            let mint_batch_sql = format!(
-                "SELECT mint FROM {filter_table} {resume_predicate} ORDER BY mint LIMIT {HOT_TOKEN_INFO_BATCH_SIZE}"
-            );
-            let mints = client
-                .query(&mint_batch_sql)
-                .fetch_all::<HotMintRow>()
-                .await
-                .map_err(|err| format!("failed to read hot-token info batch: {err}"))?;
-            let Some(first) = mints.first() else {
-                break;
-            };
-            let last = mints
-                .last()
-                .expect("nonempty hot-token batch has a last mint");
-            let lower = sql_string_literal(&first.mint);
-            let upper = sql_string_literal(&last.mint);
-            let range = format!("mint >= {lower} AND mint <= {upper}");
+        for mint_batch in mints.chunks(HOT_TOKEN_INFO_BATCH_SIZE as usize) {
+            let mint_values = mint_batch
+                .iter()
+                .map(|mint| sql_string_literal(mint))
+                .collect::<Vec<_>>()
+                .join(", ");
             let insert_sql = format!(
                 "INSERT INTO {temporary} \
                  SELECT h.mint, ifNull(m.decimals, 0), ifNull(m.supply, 0), ifNull(md.name, ''), ifNull(md.symbol, ''), ifNull(md.uri, ''), md.token_standard, \
                         ifNull(m.updated_slot, 0), ifNull(md.updated_slot, 0), greatest(ifNull(m.updated_slot, 0), ifNull(md.updated_slot, 0)) \
-                 FROM (SELECT mint FROM {filter_table} WHERE {range}) AS h \
-                 LEFT ANY JOIN (SELECT mint, decimals, supply, updated_slot FROM {mint_source} WHERE {range}) AS m USING (mint) \
-                 LEFT ANY JOIN (SELECT mint, name, symbol, uri, token_standard, updated_slot FROM {metadata_source} WHERE {range}) AS md USING (mint)"
+                 FROM (SELECT arrayJoin([{mint_values}]) AS mint) AS h \
+                 LEFT ANY JOIN (SELECT mint, decimals, supply, updated_slot FROM {mint_source} WHERE mint IN ({mint_values})) AS m USING (mint) \
+                 LEFT ANY JOIN (SELECT mint, name, symbol, uri, token_standard, updated_slot FROM {metadata_source} WHERE mint IN ({mint_values})) AS md USING (mint)"
             );
             client
                 .query(&insert_sql)
+                // `mint_values` appears three times in this query. A 10,000
+                // mint batch is roughly 1.5 MiB of SQL text, above
+                // ClickHouse's 256 KiB default parser limit.
+                .with_setting("max_query_size", HOT_PAIR_QUERY_MAX_QUERY_SIZE)
                 .with_setting("max_threads", "1")
                 .execute()
                 .await
@@ -1646,20 +1601,19 @@ async fn rebuild_token_info_table(
                     format!(
                         "failed to populate temporary table {temporary} in hot-token info batch {} (range {} .. {}): {err}",
                         batch_count + 1,
-                        first.mint,
-                        last.mint
+                        mint_batch.first().expect("nonempty mint batch"),
+                        mint_batch.last().expect("nonempty mint batch")
                     )
                 })?;
-            previous_last_mint = Some(last.mint.clone());
             batch_count += 1;
-            inserted_tokens += mints.len() as u64;
+            inserted_tokens += mint_batch.len() as u64;
             if batch_count == 1 || batch_count % 25 == 0 {
                 info!(
                     "[clickhouse] hot_token_info build group={} batches={} tokens={} last_mint={}",
                     group.as_str(),
                     batch_count,
                     inserted_tokens,
-                    last.mint
+                    mint_batch.last().expect("nonempty mint batch")
                 );
             }
         }
@@ -1695,35 +1649,115 @@ async fn rebuild_token_info_table(
     result
 }
 
-pub(crate) async fn exchange_table_groups(connection_url: &str) -> Result<()> {
+#[derive(Row, Deserialize)]
+struct TableUuidRow {
+    name: String,
+    uuid: String,
+}
+
+async fn table_group_identity_with_client(
+    client: &Client,
+    group: TableGroup,
+) -> Result<TableGroupIdentity> {
+    let table_names = GROUP_MERGE_TABLES
+        .iter()
+        .map(|base| group.table(base))
+        .collect::<Vec<_>>();
+    let rows = client
+        .query(&format!(
+            "SELECT name, toString(uuid) AS uuid FROM system.tables \
+             WHERE database = {database} AND name IN ({table_names})",
+            database = sql_string_literal(DATABASE),
+            table_names = sql_string_list(&table_names),
+        ))
+        .fetch_all::<TableUuidRow>()
+        .await
+        .map_err(|err| format!("failed to read {group:?} table UUIDs: {err}"))?;
+    let tables = rows
+        .into_iter()
+        .map(|row| (row.name, row.uuid))
+        .collect::<BTreeMap<_, _>>();
+    if tables.len() != GROUP_MERGE_TABLES.len() {
+        return Err(format!(
+            "expected {} tables in {group:?} group when capturing UUIDs, found {}",
+            GROUP_MERGE_TABLES.len(),
+            tables.len()
+        )
+        .into());
+    }
+    Ok(TableGroupIdentity { tables })
+}
+
+pub(crate) async fn table_group_identity(
+    connection_url: &str,
+    group: TableGroup,
+) -> Result<TableGroupIdentity> {
     let client = new_clickhouse_client(connection_url)?;
-    let pairs = [
-        ("raw_account", "raw_account_bak"),
-        ("raw_token_mint", "raw_token_mint_bak"),
-        ("raw_token_metadata", "raw_token_metadata_bak"),
-        ("hot_token_filter", "hot_token_filter_bak"),
-        ("hot_token_account_state", "hot_token_account_state_bak"),
-        ("hot_token_info", "hot_token_info_bak"),
-        ("hot_wallet_token_balance", "hot_wallet_token_balance_bak"),
-    ];
-    for (left, right) in pairs {
+    table_group_identity_with_client(&client, group).await
+}
+
+/// Finish a table-group exchange without ever toggling a pair that was already
+/// exchanged before a process crash.  `EXCHANGE TABLES` is atomic per pair,
+/// not across all six pairs; the UUIDs checkpointed before the first pair make
+/// this operation idempotent across restarts.
+pub(crate) async fn exchange_table_groups(
+    connection_url: &str,
+    expected_active: &TableGroupIdentity,
+    expected_backup: &TableGroupIdentity,
+) -> Result<()> {
+    let client = new_clickhouse_client(connection_url)?;
+    let active_now = table_group_identity_with_client(&client, TableGroup::Active).await?;
+    let backup_now = table_group_identity_with_client(&client, TableGroup::Backup).await?;
+
+    for base in GROUP_MERGE_TABLES {
+        let active_table = TableGroup::Active.table(base);
+        let backup_table = TableGroup::Backup.table(base);
+        let expected_active_uuid = expected_active.tables.get(&active_table).ok_or_else(|| {
+            format!("cutover checkpoint is missing active UUID for {active_table}")
+        })?;
+        let expected_backup_uuid = expected_backup.tables.get(&backup_table).ok_or_else(|| {
+            format!("cutover checkpoint is missing staging UUID for {backup_table}")
+        })?;
+        let actual_active_uuid = active_now
+            .tables
+            .get(&active_table)
+            .ok_or_else(|| format!("current active group is missing {active_table}"))?;
+        let actual_backup_uuid = backup_now
+            .tables
+            .get(&backup_table)
+            .ok_or_else(|| format!("current backup group is missing {backup_table}"))?;
+
+        if actual_active_uuid == expected_backup_uuid && actual_backup_uuid == expected_active_uuid
+        {
+            continue;
+        }
+        if actual_active_uuid != expected_active_uuid || actual_backup_uuid != expected_backup_uuid
+        {
+            return Err(format!(
+                "cannot safely resume cutover for {base}: expected active/bak UUIDs {expected_active_uuid}/{expected_backup_uuid}, found {actual_active_uuid}/{actual_backup_uuid}"
+            )
+            .into());
+        }
         client
-            .query(&format!("EXCHANGE TABLES {left} AND {right}"))
+            .query(&format!(
+                "EXCHANGE TABLES {active_table} AND {backup_table}"
+            ))
             .execute()
             .await
-            .map_err(|err| format!("failed to exchange {left} and {right}: {err}"))?;
+            .map_err(|err| {
+                format!("failed to exchange {active_table} and {backup_table}: {err}")
+            })?;
     }
     Ok(())
 }
 
-/// Validate that the staging generation contains a self-consistent frozen
-/// mint set and token-info cache before it becomes the serving group.
-///
-/// The active and staging groups deliberately may use different frozen mint
-/// sets, because a new full snapshot is the only point at which configuration
-/// changes take effect. Comparing their L2/L3 row counts or balances would
-/// therefore reject a valid switch.
-pub(crate) async fn validate_staging_group(connection_url: &str) -> Result<()> {
+/// Validate that staging's token-info cache represents the frozen in-memory
+/// mint set before it becomes the serving group. Active and staging may use
+/// different frozen sets, so L2/L3 row counts and balances are not compared.
+pub(crate) async fn validate_staging_group(
+    connection_url: &str,
+    frozen_hot_mint_count: usize,
+) -> Result<()> {
     let client = new_clickhouse_client(connection_url)?;
     let metric = async |table: &str, expression: &str| -> Result<u64> {
         client
@@ -1733,14 +1767,13 @@ pub(crate) async fn validate_staging_group(connection_url: &str) -> Result<()> {
             .map_err(Into::into)
     };
 
-    let filter_rows = metric("hot_token_filter_bak", "count()").await?;
-    if filter_rows == 0 {
-        return Err("staging validation failed: hot_token_filter_bak is empty".into());
+    if frozen_hot_mint_count == 0 {
+        return Err("staging validation failed: frozen hot-mint set is empty".into());
     }
     let info_rows = metric("hot_token_info_bak", "count()").await?;
-    if info_rows != filter_rows {
+    if info_rows != frozen_hot_mint_count as u64 {
         return Err(format!(
-            "staging validation failed: hot_token_info_bak rows={info_rows}, but frozen filter rows={filter_rows}"
+            "staging validation failed: hot_token_info_bak rows={info_rows}, but frozen hot-mint count={frozen_hot_mint_count}"
         )
         .into());
     }
@@ -1749,42 +1782,9 @@ pub(crate) async fn validate_staging_group(connection_url: &str) -> Result<()> {
     let balance_rows = metric("hot_wallet_token_balance_bak", "count()").await?;
     info!(
         "[clickhouse] staging generation validation passed frozen_hot_tokens={} token_info_rows={} state_rows={} wallet_rows={}",
-        filter_rows, info_rows, state_rows, balance_rows
+        frozen_hot_mint_count, info_rows, state_rows, balance_rows
     );
     Ok(())
-}
-
-pub(crate) async fn record_index_control(
-    connection_url: &str,
-    active_group: u8,
-    ready_slot: u64,
-    hot_token_version: u64,
-) -> Result<()> {
-    let client = new_clickhouse_client(connection_url)?;
-    let generation = client
-        .query("SELECT coalesce(max(generation), toUInt64(0)) + 1 FROM hot_index_control FINAL")
-        .fetch_one::<u64>()
-        .await
-        .map_err(|err| format!("failed to read hot_index_control generation: {err}"))?;
-    let sql = format!(
-        "INSERT INTO hot_index_control (control_key, active_group, generation, ready_slot, hot_token_version) VALUES ('default', {active_group}, {generation}, {ready_slot}, {hot_token_version})"
-    );
-    client
-        .query(&sql)
-        .execute()
-        .await
-        .map_err(|err| format!("failed to record hot_index_control: {err}"))?;
-    Ok(())
-}
-
-pub(crate) async fn active_group_id(connection_url: &str) -> Result<u8> {
-    new_clickhouse_client(connection_url)?
-        .query(
-            "SELECT if(count() = 0, toUInt8(1), argMax(active_group, generation)) FROM hot_index_control FINAL",
-        )
-        .fetch_one::<u8>()
-        .await
-        .map_err(Into::into)
 }
 
 #[derive(Row, Deserialize)]
@@ -1914,6 +1914,23 @@ pub(crate) async fn validate_clickhouse_schema(connection_url: &str) -> Result<(
         .into_iter()
         .map(|row| ((row.table, row.name), row.sorting_key))
         .collect::<HashMap<_, _>>();
+    for table in ["hot_token_account_state", "hot_token_account_state_bak"] {
+        let projection = "proj_by_pair";
+        let expected_sorting_key = "mint, owner, pubkey";
+        let key = (table.to_owned(), projection.to_owned());
+        match projections.get(&key) {
+            None => errors.push(format!("missing projection solana.{table}.{projection}")),
+            Some(actual_sorting_key)
+                if normalize_sorting_key(actual_sorting_key)
+                    != normalize_sorting_key(expected_sorting_key) =>
+            {
+                errors.push(format!(
+                    "projection solana.{table}.{projection} uses sorting key {actual_sorting_key}, expected {expected_sorting_key}"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
     for table in ["hot_wallet_token_balance", "hot_wallet_token_balance_bak"] {
         for (projection, expected_sorting_key) in [
             ("proj_by_mint_amount", "mint, amount_raw, owner"),
@@ -1937,11 +1954,11 @@ pub(crate) async fn validate_clickhouse_schema(connection_url: &str) -> Result<(
 
     if errors.is_empty() {
         info!(
-            "[clickhouse] schema validation passed: {} tables, required columns, wallet projections, and projection merge settings",
+            "[clickhouse] schema validation passed: {} tables, required columns, required projections, and projection merge settings",
             required_tables.len()
         );
         debug!(
-            "[clickhouse] Schema validation passed: {} tables, required columns, wallet projections, and projection merge settings",
+            "[clickhouse] Schema validation passed: {} tables, required columns, required projections, and projection merge settings",
             required_tables.len()
         );
         Ok(())
@@ -1977,7 +1994,10 @@ struct RequiredTableSpec {
 fn requires_rebuild_projection_mode(table: &str) -> bool {
     matches!(
         table,
-        "hot_wallet_token_balance" | "hot_wallet_token_balance_bak"
+        "hot_token_account_state"
+            | "hot_token_account_state_bak"
+            | "hot_wallet_token_balance"
+            | "hot_wallet_token_balance_bak"
     )
 }
 
@@ -2057,24 +2077,6 @@ fn required_table_specs() -> Vec<RequiredTableSpec> {
             sorting_key: "",
         },
         RequiredTableSpec {
-            name: "hot_token_filter",
-            engine: "MergeTree",
-            engine_full_prefix: "",
-            sorting_key: "mint",
-        },
-        RequiredTableSpec {
-            name: "hot_token_filter_bak",
-            engine: "MergeTree",
-            engine_full_prefix: "",
-            sorting_key: "mint",
-        },
-        RequiredTableSpec {
-            name: "hot_index_control",
-            engine: "ReplacingMergeTree",
-            engine_full_prefix: "ReplacingMergeTree(generation)",
-            sorting_key: "control_key",
-        },
-        RequiredTableSpec {
             name: "hot_token_account_state",
             engine: "ReplacingMergeTree",
             engine_full_prefix: "ReplacingMergeTree(updated_slot, is_deleted)",
@@ -2148,14 +2150,6 @@ fn required_columns() -> Vec<(&'static str, &'static str, &'static str)> {
         ("enable", "UInt8"),
         ("version", "UInt64"),
     ];
-    const HOT_INDEX_CONTROL: &[(&str, &str)] = &[
-        ("control_key", "LowCardinality(String)"),
-        ("active_group", "UInt8"),
-        ("generation", "UInt64"),
-        ("ready_slot", "UInt64"),
-        ("hot_token_version", "UInt64"),
-        ("updated_at", "DateTime64"),
-    ];
     const HOT_TOKEN_ACCOUNT_STATE: &[(&str, &str)] = &[
         ("pubkey", "String"),
         ("mint", "String"),
@@ -2214,20 +2208,12 @@ fn required_columns() -> Vec<(&'static str, &'static str, &'static str)> {
             .iter()
             .map(|(column, expected)| ("hot_token", *column, *expected)),
     );
-    required.extend(
-        HOT_INDEX_CONTROL
-            .iter()
-            .map(|(column, expected)| ("hot_index_control", *column, *expected)),
-    );
     for table in ["hot_token_account_state", "hot_token_account_state_bak"] {
         required.extend(
             HOT_TOKEN_ACCOUNT_STATE
                 .iter()
                 .map(|(column, expected)| (table, *column, *expected)),
         );
-    }
-    for table in ["hot_token_filter", "hot_token_filter_bak"] {
-        required.push((table, "mint", "String"));
     }
     for table in ["hot_wallet_token_balance", "hot_wallet_token_balance_bak"] {
         required.extend(
@@ -3537,11 +3523,12 @@ mod tests {
     }
 
     #[test]
-    fn direct_write_schema_has_a_frozen_filter_but_no_raw_token_account_table() {
+    fn direct_write_schema_has_no_filter_or_raw_token_account_table() {
         let names = required_table_names();
-        assert!(names.iter().any(|name| name == "hot_token_filter"));
-        assert!(names.iter().any(|name| name == "hot_token_filter_bak"));
+        assert!(!names.iter().any(|name| name == "hot_token_filter"));
+        assert!(!names.iter().any(|name| name == "hot_token_filter_bak"));
         assert!(!names.iter().any(|name| name == "raw_token_account"));
         assert!(!names.iter().any(|name| name == "raw_token_account_bak"));
+        assert!(!names.iter().any(|name| name == "hot_index_control"));
     }
 }

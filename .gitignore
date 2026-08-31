@@ -7,6 +7,8 @@ unpacked_snapshot/
 *.tar
 *.zst
 *.log
+solana-snapshot-etl-state.json
+solana-snapshot-etl-hot-mints-*.txt
 .env
 agave/
 .vscode/

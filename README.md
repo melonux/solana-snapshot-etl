@@ -150,12 +150,21 @@ To run only this read-only validation (no snapshot read and no ClickHouse write)
 solana-snapshot-etl --clickhouse-validate-schema
 ```
 
-In watch mode, normal incrementals update only the active (suffix-free) group. When a newer full
-snapshot is available, the importer resets `_bak`, freezes a new hot-mint set there, cold-loads
-that snapshot, and opens each following incremental independently for both groups. Each group
-keeps its own slot watermark and frozen mint set. Once their slots match and staging passes its
-self-check, the importer exchanges the seven table pairs, records the generation, keeps the old
-group for five minutes, and truncates `_bak` with `max_table_size_to_drop = 0`.
+In watch mode, normal incrementals update only the active (suffix-free) group. Each group records
+an immutable `full_slot` generation and a separately advancing `max_slot`. A newly discovered
+full is newer when its slot exceeds `active.full_slot` (not necessarily `active.max_slot`): active
+uses its unseen tail as an incremental bridge while `_bak` is cleared, assigned that full, and
+cold-loaded. After `_bak` commits its first eligible incremental, the watcher stops dispatching
+new active work, waits for the preceding active import to commit, self-checks staging, and exchanges
+the six table pairs. The promoted generation is written to local state immediately; the old active
+generation remains as disabled `_bak` until a later full arrives and reuses it.
+
+The frozen mint sets live in process memory and durable local state files, not ClickHouse filter
+tables. `solana-snapshot-etl-state.json` in the working directory records each lane's phase,
+`full_slot`, `max_slot`, and in-flight archive. `--bootstrap` resets that file before it starts
+clearing/loading active; a non-bootstrap restart resumes the recorded work. For an interrupted
+six-pair exchange, the state also records table UUIDs, so restart exchanges only pairs that did
+not already complete.
 
 If direct L2 import has succeeded but the derived L3/token-info refresh failed, rebuild those
 derived active tables without reading or re-importing the snapshot:
@@ -180,7 +189,7 @@ solana-snapshot-etl snapshot-139240745-*.tar.zst --clickhouse
 ```
 
 When that source is a full snapshot, this single-shot command treats it as a
-fresh active baseline: it pauses active merges and resets the seven active
+fresh active baseline: it pauses active merges and resets the six active
 tables before import. Use watch mode with `--bootstrap` for the same explicit
 first-load behavior.
 
@@ -233,7 +242,7 @@ server.
 
 The importer pauses Merge only for the target group while it cold-loads a full snapshot. It starts
 Merge after the full L2/L3 build completes and waits for each target table's active-part count to
-remain unchanged across two checks five minutes apart before dispatching that group's incrementals.
+remain unchanged across two checks two minutes apart before dispatching that group's incrementals.
 Normal active incrementals do not pause Merge.
 
 If a snapshot was already imported but the CloseAccount tombstone pass failed, run only that pass:

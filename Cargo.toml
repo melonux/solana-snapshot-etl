@@ -16,6 +16,7 @@ solana-runtime = "1.11.3"
 thiserror = "1.0.31"
 bincode = "1.3.3"
 serde = { version = "1.0.139", features = ["derive"] }
+serde_json = { version = "1.0.145", optional = true }
 solana-sdk = "1.11.3"
 memmap2 = "0.5.5"
 itertools = "0.10.3"
@@ -49,6 +50,7 @@ standalone = [
     "env_logger",
     "indicatif",
     "percent-encoding",
+    "serde_json",
     "solana-program",
     "spl-token",
     "spl-token-2022",
