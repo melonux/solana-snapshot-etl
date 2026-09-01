@@ -152,19 +152,25 @@ solana-snapshot-etl --clickhouse-validate-schema
 
 In watch mode, normal incrementals update only the active (suffix-free) group. Each group records
 an immutable `full_slot` generation and a separately advancing `max_slot`. A newly discovered
-full is newer when its slot exceeds `active.full_slot` (not necessarily `active.max_slot`): active
-uses its unseen tail as an incremental bridge while `_bak` is cleared, assigned that full, and
-cold-loaded. After `_bak` commits its first eligible incremental, the watcher stops dispatching
+full is newer when its slot exceeds `active.full_slot` (not necessarily `active.max_slot`). The
+archive is decompressed once: every AppendVec cold-loads `_bak`, while only AppendVecs newer than
+active's captured `max_slot` are also written to active as its incremental bridge. The two groups
+retain independent frozen hot-mint sets during that fanout. After `_bak` commits its first eligible
+incremental, the watcher stops dispatching
 new active work, waits for the preceding active import to commit, self-checks staging, and exchanges
 the six table pairs. The promoted generation is written to local state immediately; the old active
-generation remains as disabled `_bak` until a later full arrives and reuses it.
+generation remains as disabled `_bak` until a later full arrives and reuses it, while its no-longer-
+needed frozen hot-mint file is removed.
 
 The frozen mint sets live in process memory and durable local state files, not ClickHouse filter
 tables. `solana-snapshot-etl-state.json` in the working directory records each lane's phase,
-`full_slot`, `max_slot`, and in-flight archive. `--bootstrap` resets that file before it starts
-clearing/loading active; a non-bootstrap restart resumes the recorded work. For an interrupted
-six-pair exchange, the state also records table UUIDs, so restart exchanges only pairs that did
-not already complete.
+`full_slot`, `max_slot`, and the kind of in-flight work. It intentionally does not retain an
+in-flight incremental archive path or slot: after a restart, the watcher selects the currently
+available highest-slot archive that can continue from `max_slot`. A shared full fanout still records
+its fixed full archive and captured active watermark. `--bootstrap` resets that file and removes all
+generated local frozen hot-mint files before it starts clearing/loading active; a non-bootstrap
+restart resumes the recorded work. For an interrupted six-pair exchange, the state also records
+table UUIDs, so restart exchanges only pairs that did not already complete.
 
 If direct L2 import has succeeded but the derived L3/token-info refresh failed, rebuild those
 derived active tables without reading or re-importing the snapshot:
@@ -177,7 +183,7 @@ solana-snapshot-etl --clickhouse-rebuild-hot
 
 This action requires `CLICKHOUSE_URL`, validates the schema first, pauses active group Merge,
 rebuilds `hot_wallet_token_balance` and `hot_token_info` from existing direct-write L2 and the
-frozen filter, then restores Merge. It cannot reconstruct a missing/corrupt
+currently enabled hot-mint set, then restores Merge. It cannot reconstruct a missing/corrupt
 `hot_token_account_state`; rebuild L2 with a new full snapshot in that case. Token information is
 built in ordered mint batches, and the full wallet aggregation can spill after 1 GiB of
 intermediate state.

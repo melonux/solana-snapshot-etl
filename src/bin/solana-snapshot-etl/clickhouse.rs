@@ -215,6 +215,51 @@ impl Progress {
     }
 }
 
+fn new_import_progress(append_vec_count: Option<u64>) -> Result<(MultiProgress, Arc<Progress>)> {
+    let spinner_style = ProgressStyle::with_template(
+        "{prefix:>13.bold.dim} {spinner} rate={per_sec:>13} total={human_pos:>11} elapsed={elapsed_precise} {msg}",
+    )?;
+    let multi_progress = MultiProgress::new();
+    let append_vec_style = ProgressStyle::with_template(
+        "{prefix:>13.bold.dim} [{bar:40.cyan/blue}] {pos:>7}/{len:>7} ({percent:>3}%) elapsed={elapsed_precise} {msg}",
+    )?;
+    let append_vecs = multi_progress.add(match append_vec_count {
+        Some(total) => ProgressBar::new(total)
+            .with_style(append_vec_style)
+            .with_prefix("append_vecs")
+            .with_message("avg_eta=calculating"),
+        None => ProgressBar::new_spinner()
+            .with_style(spinner_style.clone())
+            .with_prefix("append_vecs")
+            .with_message("avg_eta=unknown"),
+    });
+    let progress = Arc::new(Progress {
+        append_vecs,
+        accounts: ProgressCounter::new(
+            multi_progress.add(
+                ProgressBar::new_spinner()
+                    .with_style(spinner_style.clone())
+                    .with_prefix("accs"),
+            ),
+        ),
+        tokens: ProgressCounter::new(
+            multi_progress.add(
+                ProgressBar::new_spinner()
+                    .with_style(spinner_style.clone())
+                    .with_prefix("token_accs"),
+            ),
+        ),
+        metadata: ProgressCounter::new(
+            multi_progress.add(
+                ProgressBar::new_spinner()
+                    .with_style(spinner_style)
+                    .with_prefix("metaplex_accs"),
+            ),
+        ),
+    });
+    Ok((multi_progress, progress))
+}
+
 fn format_duration(seconds: f64) -> String {
     if !seconds.is_finite() || seconds < 0.0 {
         return "unknown".to_owned();
@@ -352,49 +397,7 @@ impl ClickhouseIndexer {
         group: TableGroup,
         hot_mints: HotMintSet,
     ) -> Result<Self> {
-        let spinner_style = ProgressStyle::with_template(
-            "{prefix:>13.bold.dim} {spinner} rate={per_sec:>13} total={human_pos:>11} elapsed={elapsed_precise} {msg}",
-        )?;
-        let multi_progress = MultiProgress::new();
-        let append_vec_style = ProgressStyle::with_template(
-            "{prefix:>13.bold.dim} [{bar:40.cyan/blue}] {pos:>7}/{len:>7} ({percent:>3}%) elapsed={elapsed_precise} {msg}",
-        )?;
-        let append_vecs = multi_progress.add(match append_vec_count {
-            Some(total) => ProgressBar::new(total)
-                .with_style(append_vec_style)
-                .with_prefix("append_vecs")
-                .with_message("avg_eta=calculating"),
-            None => ProgressBar::new_spinner()
-                .with_style(spinner_style.clone())
-                .with_prefix("append_vecs")
-                .with_message("avg_eta=unknown"),
-        });
-
-        let progress = Arc::new(Progress {
-            append_vecs,
-            accounts: ProgressCounter::new(
-                multi_progress.add(
-                    ProgressBar::new_spinner()
-                        .with_style(spinner_style.clone())
-                        .with_prefix("accs"),
-                ),
-            ),
-            tokens: ProgressCounter::new(
-                multi_progress.add(
-                    ProgressBar::new_spinner()
-                        .with_style(spinner_style.clone())
-                        .with_prefix("token_accs"),
-                ),
-            ),
-            metadata: ProgressCounter::new(
-                multi_progress.add(
-                    ProgressBar::new_spinner()
-                        .with_style(spinner_style)
-                        .with_prefix("metaplex_accs"),
-                ),
-            ),
-        });
-
+        let (multi_progress, progress) = new_import_progress(append_vec_count)?;
         let client = new_clickhouse_client(&connection_url)?;
 
         Ok(Self {
@@ -916,6 +919,274 @@ impl ClickhouseIndexer {
     }
 }
 
+/// Consume one full-snapshot archive stream and fan it out to two physical
+/// groups.  The backup group receives the complete full baseline; the active
+/// group receives only AppendVecs newer than `active_resume_slot`, exactly as
+/// if the same full archive had been opened through `new_full_snapshot` with
+/// that watermark.
+///
+/// This deliberately owns one archive iterator.  A full snapshot can be many
+/// hundreds of gigabytes compressed, so opening it independently for staging
+/// and active would decompress every tar entry twice.  Each worker parses an
+/// account once, then writes the resulting rows to one or both groups using
+/// their independently frozen hot-mint sets.
+pub(crate) async fn import_full_snapshot_fanout(
+    connection_url: String,
+    snapshot_slot: u64,
+    append_vec_count: Option<u64>,
+    iterator: AppendVecIterator<'_>,
+    workers: usize,
+    active_resume_slot: u64,
+    active_hot_mints: HotMintSet,
+    staging_hot_mints: HotMintSet,
+) -> Result<IndexStats> {
+    // One source archive needs one truthful AppendVec progress bar, even
+    // though its parsed rows go to two physical table groups.
+    let (multi_progress, progress) = new_import_progress(append_vec_count)?;
+    let staging_client = new_clickhouse_client(&connection_url)?;
+    let active_client = new_clickhouse_client(&connection_url)?;
+    let workers = workers.max(2);
+    let (tx, rx) = crossbeam::channel::bounded::<AppendVec>(workers);
+    let mut handles = Vec::with_capacity(workers);
+    let insert_concurrency = workers.min(MAX_INSERT_CONCURRENCY);
+    let insert_gate = Arc::new(Semaphore::new(insert_concurrency));
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    info!(
+        "[clickhouse] shared full fanout slot={} active_resume_slot={} workers={} INSERT finalization concurrency={}",
+        snapshot_slot,
+        active_resume_slot,
+        workers,
+        insert_concurrency
+    );
+
+    for worker_index in 0..workers {
+        let rx = rx.clone();
+        let connection_url = connection_url.clone();
+        let progress = Arc::clone(&progress);
+        let insert_gate = Arc::clone(&insert_gate);
+        let cancelled = Arc::clone(&cancelled);
+        let active_hot_mints = Arc::clone(&active_hot_mints);
+        let staging_hot_mints = Arc::clone(&staging_hot_mints);
+        handles.push(thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| err.to_string())?;
+            runtime.block_on(async move {
+                // Each worker needs its own transport because it runs on its
+                // own current-thread Tokio runtime.
+                let staging_client = new_clickhouse_client(&connection_url)
+                    .map_err(|err| err.to_string())?;
+                let active_client = new_clickhouse_client(&connection_url)
+                    .map_err(|err| err.to_string())?;
+                let mut worker = FullFanoutWorker {
+                    staging_sink: ClickhouseSink::new(
+                        &staging_client,
+                        format!("shared-full-staging-{worker_index}"),
+                        Some(Arc::clone(&insert_gate)),
+                        TableGroup::Backup,
+                    ),
+                    active_sink: ClickhouseSink::new(
+                        &active_client,
+                        format!("shared-full-active-{worker_index}"),
+                        Some(insert_gate),
+                        TableGroup::Active,
+                    ),
+                    snapshot_slot,
+                    active_resume_slot,
+                    progress,
+                    active_hot_mints,
+                    staging_hot_mints,
+                    stats: ParallelWorkerStats::default(),
+                };
+
+                loop {
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(
+                            "shared full fanout cancelled after another worker failed".to_owned(),
+                        );
+                    }
+                    let append_vec = match rx.recv_timeout(IDLE_INSERT_FLUSH_INTERVAL) {
+                        Ok(append_vec) => append_vec,
+                        Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                            if worker.staging_sink.has_pending_rows() {
+                                if let Err(err) = worker.staging_sink.force_commit_all().await {
+                                    cancelled.store(true, Ordering::Release);
+                                    return Err(err.to_string());
+                                }
+                            }
+                            if worker.active_sink.has_pending_rows() {
+                                if let Err(err) = worker.active_sink.force_commit_all().await {
+                                    cancelled.store(true, Ordering::Release);
+                                    return Err(err.to_string());
+                                }
+                            }
+                            continue;
+                        }
+                        Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
+                    };
+                    let append_vec_slot = append_vec.slot();
+                    let append_vec_id = append_vec.id();
+                    let process_started = Instant::now();
+                    match worker.on_append_vec_count(append_vec).await {
+                        Ok(parsed_accounts) => debug!(
+                            "[clickhouse] shared full worker={} parsed file=accounts/{}.{} accounts={} active_tail={} elapsed={:?}",
+                            worker_index,
+                            append_vec_slot,
+                            append_vec_id,
+                            parsed_accounts,
+                            append_vec_slot > active_resume_slot,
+                            process_started.elapsed(),
+                        ),
+                        Err(err) => {
+                            error!(
+                                "[clickhouse] shared full worker={} failed file=accounts/{}.{}: {}",
+                                worker_index, append_vec_slot, append_vec_id, err
+                            );
+                            cancelled.store(true, Ordering::Release);
+                            return Err(err.to_string());
+                        }
+                    }
+                }
+
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(
+                        "shared full fanout cancelled after another worker failed".to_owned(),
+                    );
+                }
+                worker.finish().await.map_err(|err| err.to_string())
+            })
+        }));
+    }
+    drop(rx);
+
+    let mut skipped_append_vecs = 0;
+    let mut producer_error: Option<String> = None;
+    'producer: for (append_vec_idx, append_vec) in iterator.enumerate() {
+        match append_vec {
+            Ok(append_vec) => {
+                if cancelled.load(Ordering::Acquire) {
+                    producer_error =
+                        Some("shared full fanout cancelled after a worker failure".to_owned());
+                    break;
+                }
+                let slot = append_vec.slot();
+                let id = append_vec.id();
+                let mut pending = append_vec;
+                loop {
+                    if cancelled.load(Ordering::Acquire) {
+                        producer_error =
+                            Some("shared full fanout cancelled after a worker failure".to_owned());
+                        break 'producer;
+                    }
+                    match tx.send_timeout(pending, Duration::from_millis(100)) {
+                        Ok(()) => break,
+                        Err(crossbeam::channel::SendTimeoutError::Timeout(value)) => {
+                            pending = value;
+                        }
+                        Err(crossbeam::channel::SendTimeoutError::Disconnected(_)) => {
+                            producer_error = Some(format!(
+                                "shared full fanout worker exited while dispatching AppendVec slot={slot} id={id}"
+                            ));
+                            break 'producer;
+                        }
+                    }
+                }
+                if append_vec_idx % 1_000 == 0 {
+                    debug!(
+                        "[clickhouse] shared full fanout dispatched AppendVec index={} slot={} id={} queue={}",
+                        append_vec_idx,
+                        slot,
+                        id,
+                        tx.len(),
+                    );
+                }
+            }
+            Err(err) => {
+                skipped_append_vecs += 1;
+                warn!(
+                    "[clickhouse] shared full fanout skipped append vec #{}: {}",
+                    append_vec_idx, err
+                );
+            }
+        }
+    }
+    drop(tx);
+
+    let mut totals = ParallelWorkerStats::default();
+    for handle in handles {
+        let stats = handle
+            .join()
+            .map_err(|_| "shared full fanout worker panicked")?
+            .map_err(|err| format!("shared full fanout worker failed: {err}"))?;
+        totals.merge(stats);
+    }
+    if let Some(err) = producer_error {
+        return Err(err.into());
+    }
+
+    // The active branch has incremental semantics even though its source is a
+    // full archive: it updates only the new tail and must refresh only the
+    // affected L3 pairs. Full archives normally have no close candidates, but
+    // retain the normal incremental tombstone safeguard for consistency.
+    let token_account_close_candidates = totals.closed_token_accounts.len() as u64;
+    let mut active_affected_pairs = totals.affected_pairs;
+    let active_tombstones = write_close_token_account_tombstones(
+        &active_client,
+        TableGroup::Active,
+        &totals.closed_token_accounts,
+    )
+    .await?;
+    active_affected_pairs.extend(active_tombstones.affected_pairs);
+    refresh_hot_indexes(
+        &active_client,
+        TableGroup::Active,
+        &active_hot_mints,
+        SnapshotKind::Incremental,
+        snapshot_slot,
+        &active_affected_pairs,
+        false,
+    )
+    .await?;
+
+    refresh_hot_indexes(
+        &staging_client,
+        TableGroup::Backup,
+        &staging_hot_mints,
+        SnapshotKind::Full,
+        snapshot_slot,
+        &HashSet::new(),
+        true,
+    )
+    .await?;
+
+    progress
+        .append_vecs
+        .finish_with_message("done (shared full fanout)");
+    progress.accounts.sync();
+    progress.tokens.sync();
+    progress.metadata.sync();
+    let _ = &multi_progress;
+
+    Ok(IndexStats {
+        accounts_total: progress.accounts.get(),
+        token_accounts_total: progress.tokens.get(),
+        skipped_append_vecs,
+        append_vecs_total: totals.append_vecs_total,
+        nonempty_zero_account_append_vecs: totals.nonempty_zero_account_append_vecs,
+        spl_token_owner_accounts_seen: totals.spl_token_owner_accounts_seen,
+        spl_token_accounts_parsed: totals.spl_token_accounts_parsed,
+        spl_token_unexpected_size: totals.spl_token_unexpected_size,
+        spl_token_unpack_failed: totals.spl_token_unpack_failed,
+        token_2022_owner_accounts_seen: totals.token_2022_owner_accounts_seen,
+        token_2022_accounts_parsed: totals.token_2022_accounts_parsed,
+        token_2022_unexpected_size: totals.token_2022_unexpected_size,
+        token_2022_unpack_failed: totals.token_2022_unpack_failed,
+        token_account_close_candidates,
+        token_accounts_marked_deleted: active_tombstones.marked_deleted,
+    })
+}
+
 struct ClickhouseConnection {
     endpoint: String,
     user: Option<String>,
@@ -1424,11 +1695,23 @@ async fn rebuild_wallet_balance_table(
     result
 }
 
-/// Recompute only wallet/mint pairs touched by an incremental snapshot. The
-/// aggregate must still read every current token account belonging to each
-/// touched pair; aggregating only the changed pubkeys would lose balances held
-/// by their unchanged sibling accounts. Zero rows are retained so a pair that
-/// lost its final live account supersedes the previous positive balance.
+/// Recompute only wallet/mint pairs touched by an incremental snapshot.
+///
+/// L2 is physically ordered by token-account pubkey, while `proj_by_pair` is
+/// ordered by `(mint, owner, pubkey)`. A `FINAL` read is exact but prevents
+/// ClickHouse from choosing that projection, turning even a small pair set
+/// into a whole-L2 scan. Instead, read the selected pair ranges from the
+/// projection and explicitly select the newest L2 version per pubkey with
+/// `argMax`.
+///
+/// This relies on the normal token-account lifecycle invariant that every
+/// version relevant to a pair retains that pair. Close tombstones preserve the
+/// recovered pair, so a close correctly removes the account. A deliberate
+/// reuse/reassignment of one pubkey to a different pair can leave the former
+/// pair stale until the next full rebuild; the watcher intentionally accepts
+/// that rare boundary rather than adding a per-update old-pair lookup here.
+/// Zero rows are retained so a pair that lost its final live account
+/// supersedes the previous positive balance.
 async fn refresh_wallet_balance_incremental(
     client: &Client,
     state: &str,
@@ -1459,23 +1742,20 @@ async fn refresh_wallet_balance_incremental(
             )
         })
         .collect::<Vec<_>>();
-    let aggregate_sql = format!(
-        "SELECT mint, owner, sum(amount) AS amount_raw \
-         FROM {state} FINAL \
-         WHERE is_deleted = 0 AND state != 0 \
-           AND (mint, owner) IN ({}) \
-         GROUP BY mint, owner",
-        pair_literals.join(", ")
-    );
+    let aggregate_sql = incremental_wallet_balance_aggregate_sql(state, &pair_literals);
     log_query_scan_estimate(
         client,
-        "incremental_wallet_pair_aggregation",
+        "incremental_wallet_pair_projection_aggregation",
         &aggregate_sql,
     )
     .await;
     let aggregate_rows = client
         .query(&aggregate_sql)
         .with_setting("max_query_size", HOT_PAIR_QUERY_MAX_QUERY_SIZE)
+        // The selected pair range can still contain many accounts (for
+        // example, a high-fanout mint). Keep its explicit argMax/group-by
+        // state bounded even while staging Merge is active.
+        .with_setting("max_threads", "1")
         .with_setting(
             "max_bytes_before_external_group_by",
             HOT_BALANCE_EXTERNAL_AGGREGATION_BYTES,
@@ -1519,6 +1799,34 @@ async fn refresh_wallet_balance_incremental(
         started.elapsed()
     );
     Ok(())
+}
+
+/// Construct the projection-friendly incremental L3 aggregation.
+///
+/// Use one `argMax(tuple(...), updated_slot)` rather than separate argMax
+/// calls so all fields are selected from the same physical L2 version. Source
+/// column references are qualified with `s.`: ClickHouse aliases are visible
+/// throughout a SELECT, and unqualified `mint`/`owner` would otherwise be
+/// rewritten to aggregate aliases before the pair predicate is analyzed.
+fn incremental_wallet_balance_aggregate_sql(state: &str, pair_literals: &[String]) -> String {
+    format!(
+        "SELECT tupleElement(latest, 1) AS mint, \
+                tupleElement(latest, 2) AS owner, \
+                sum(tupleElement(latest, 3)) AS amount_raw \
+         FROM ( \
+             SELECT argMax( \
+                        tuple(s.mint, s.owner, s.amount, s.state, s.is_deleted), \
+                        s.updated_slot \
+                    ) AS latest \
+             FROM {state} AS s \
+             WHERE (s.mint, s.owner) IN ({}) \
+             GROUP BY s.pubkey \
+             HAVING tupleElement(latest, 5) = 0 \
+                AND tupleElement(latest, 4) != 0 \
+         ) \
+         GROUP BY mint, owner",
+        pair_literals.join(", ")
+    )
 }
 
 #[derive(Row, Deserialize, Serialize)]
@@ -2820,6 +3128,392 @@ struct Worker<'a> {
     hot_mints: HotMintSet,
 }
 
+/// Per-parser state for the one-stream full-snapshot fanout.  Unlike two
+/// independent `Worker`s, this decodes each account payload only once and
+/// conditionally sends its owned row values to the active and staging sinks.
+struct FullFanoutWorker {
+    staging_sink: ClickhouseSink,
+    active_sink: ClickhouseSink,
+    snapshot_slot: u64,
+    active_resume_slot: u64,
+    progress: Arc<Progress>,
+    active_hot_mints: HotMintSet,
+    staging_hot_mints: HotMintSet,
+    stats: ParallelWorkerStats,
+}
+
+impl FullFanoutWorker {
+    async fn on_append_vec_count(&mut self, append_vec: AppendVec) -> Result<u64> {
+        let append_vec_len = append_vec.len();
+        let account_slot = append_vec.slot();
+        let write_active = account_slot > self.active_resume_slot;
+        self.stats.append_vecs_total += 1;
+        let mut parsed_accounts = 0;
+
+        for account in append_vec_accounts(&append_vec) {
+            self.insert_account(&account, account_slot, write_active)
+                .await?;
+            parsed_accounts += 1;
+        }
+
+        if append_vec_len > 0 && parsed_accounts == 0 {
+            self.stats.nonempty_zero_account_append_vecs += 1;
+            warn!(
+                "[clickhouse] Non-empty append vec produced 0 accounts during shared full fanout (len={})",
+                append_vec_len
+            );
+        }
+        self.progress.inc_append_vec();
+        Ok(parsed_accounts)
+    }
+
+    async fn insert_account(
+        &mut self,
+        account: &StoredAccountMeta<'_>,
+        account_slot: u64,
+        write_active: bool,
+    ) -> Result<()> {
+        // The full archive may continue to feed staging-only slots for a long
+        // time after active received its last tail row. Advance active's aged
+        // flush check on every parsed account nevertheless: an aged pending
+        // active INSERT must be cleanly finalized before a staging-only stream
+        // can keep its chunked HTTP body open indefinitely. Do it first,
+        // because staging's flush can itself spend several seconds building a
+        // large part.
+        self.active_sink.maybe_force_commit().await?;
+        self.staging_sink.maybe_force_commit().await?;
+
+        let row = AccountRow {
+            pubkey: pubkey_string(account.meta.pubkey),
+            owner: pubkey_string(account.account_meta.owner),
+            lamports: account.account_meta.lamports,
+            data_len: account.meta.data_len,
+            executable: account.account_meta.executable,
+            updated_slot: self.snapshot_slot,
+        };
+        self.staging_sink.write_account(&row).await?;
+        if write_active {
+            self.active_sink.write_account(&row).await?;
+        }
+
+        // A full archive normally contains no closed accounts. Keep the same
+        // defensive active-tail behavior as the previous `SnapshotKind::Incremental`
+        // bridge in case an archive contains a canonical empty record.
+        if write_active
+            && is_canonical_empty_account(
+                account.meta.data_len,
+                account.account_meta.lamports,
+                account.account_meta.owner,
+                account.account_meta.executable,
+            )
+        {
+            self.record_active_close_candidate(account, account_slot);
+        }
+
+        if account.account_meta.owner == spl_token::id() {
+            self.stats.spl_token_owner_accounts_seen += 1;
+            self.insert_spl_token(account, account_slot, write_active)
+                .await?;
+        } else if account.account_meta.owner == *token_2022_program_id() {
+            self.stats.token_2022_owner_accounts_seen += 1;
+            self.insert_token_2022(account, account_slot, write_active)
+                .await?;
+        }
+
+        if account.account_meta.owner == mpl_metadata::id() {
+            self.insert_token_metadata(account, write_active).await?;
+        }
+
+        self.progress.accounts.inc();
+        Ok(())
+    }
+
+    async fn insert_spl_token(
+        &mut self,
+        account: &StoredAccountMeta<'_>,
+        account_slot: u64,
+        write_active: bool,
+    ) -> Result<()> {
+        match account.meta.data_len as usize {
+            spl_token::state::Account::LEN => {
+                match spl_token::state::Account::unpack(account.data) {
+                    Ok(token_account) => {
+                        let mint = pubkey_string(token_account.mint);
+                        let owner = pubkey_string(token_account.owner);
+                        self.write_token_account_row(
+                            account,
+                            account_slot,
+                            write_active,
+                            mint,
+                            owner,
+                            token_account.amount,
+                            token_account.delegate.map(pubkey_string).into(),
+                            token_account.delegated_amount,
+                            token_account.state as u8,
+                            token_account.close_authority.map(pubkey_string).into(),
+                        )
+                        .await?;
+                        self.stats.spl_token_accounts_parsed += 1;
+                        self.progress.tokens.inc();
+                    }
+                    Err(_) => {
+                        self.stats.spl_token_unpack_failed += 1;
+                        if write_active {
+                            self.record_active_close_candidate(account, account_slot);
+                        }
+                    }
+                }
+            }
+            spl_token::state::Mint::LEN => match spl_token::state::Mint::unpack(account.data) {
+                Ok(token_mint) => {
+                    let mint = pubkey_string(account.meta.pubkey);
+                    self.write_token_mint_row(
+                        write_active,
+                        mint,
+                        token_mint.mint_authority.map(pubkey_string).into(),
+                        token_mint.supply,
+                        token_mint.decimals,
+                        token_mint.is_initialized,
+                        token_mint.freeze_authority.map(pubkey_string).into(),
+                    )
+                    .await?;
+                    self.stats.spl_token_accounts_parsed += 1;
+                    self.progress.tokens.inc();
+                }
+                Err(_) => self.stats.spl_token_unpack_failed += 1,
+            },
+            _ => self.stats.spl_token_unexpected_size += 1,
+        }
+        Ok(())
+    }
+
+    async fn insert_token_2022(
+        &mut self,
+        account: &StoredAccountMeta<'_>,
+        account_slot: u64,
+        write_active: bool,
+    ) -> Result<()> {
+        match account.meta.data_len as usize {
+            spl_token_2022::state::Account::LEN => {
+                match spl_token_2022::state::Account::unpack(account.data) {
+                    Ok(token_account) => {
+                        let mint = pubkey_string(token_account.mint);
+                        let owner = pubkey_string(token_account.owner);
+                        self.write_token_account_row(
+                            account,
+                            account_slot,
+                            write_active,
+                            mint,
+                            owner,
+                            token_account.amount,
+                            token_account.delegate.map(pubkey_string).into(),
+                            token_account.delegated_amount,
+                            token_account.state as u8,
+                            token_account.close_authority.map(pubkey_string).into(),
+                        )
+                        .await?;
+                        self.stats.token_2022_accounts_parsed += 1;
+                        self.progress.tokens.inc();
+                    }
+                    Err(_) => {
+                        self.stats.token_2022_unpack_failed += 1;
+                        if write_active {
+                            self.record_active_close_candidate(account, account_slot);
+                        }
+                    }
+                }
+            }
+            spl_token_2022::state::Mint::LEN => {
+                match spl_token_2022::state::Mint::unpack(account.data) {
+                    Ok(token_mint) => {
+                        let mint = pubkey_string(account.meta.pubkey);
+                        self.write_token_mint_row(
+                            write_active,
+                            mint,
+                            token_mint.mint_authority.map(pubkey_string).into(),
+                            token_mint.supply,
+                            token_mint.decimals,
+                            token_mint.is_initialized,
+                            token_mint.freeze_authority.map(pubkey_string).into(),
+                        )
+                        .await?;
+                        self.stats.token_2022_accounts_parsed += 1;
+                        self.progress.tokens.inc();
+                    }
+                    Err(_) => self.stats.token_2022_unpack_failed += 1,
+                }
+            }
+            _ => self.stats.token_2022_unexpected_size += 1,
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_token_account_row(
+        &mut self,
+        account: &StoredAccountMeta<'_>,
+        account_slot: u64,
+        write_active: bool,
+        mint: String,
+        owner: String,
+        amount: u64,
+        delegate: Option<String>,
+        delegated_amount: u64,
+        state: u8,
+        close_authority: Option<String>,
+    ) -> Result<()> {
+        let write_staging = self.staging_hot_mints.contains(&mint);
+        let write_active = write_active && self.active_hot_mints.contains(&mint);
+        if !write_staging && !write_active {
+            return Ok(());
+        }
+        if write_active {
+            self.stats
+                .affected_pairs
+                .insert((mint.clone(), owner.clone()));
+        }
+        let row = TokenAccountRow {
+            pubkey: pubkey_string(account.meta.pubkey),
+            mint,
+            owner,
+            amount,
+            delegate,
+            delegated_amount,
+            state,
+            close_authority,
+            is_deleted: 0,
+            updated_slot: account_slot,
+        };
+        if write_staging {
+            self.staging_sink.write_token_account(&row).await?;
+        }
+        if write_active {
+            self.active_sink.write_token_account(&row).await?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_token_mint_row(
+        &mut self,
+        write_active: bool,
+        mint: String,
+        mint_authority: Option<String>,
+        supply: u64,
+        decimals: u8,
+        is_initialized: bool,
+        freeze_authority: Option<String>,
+    ) -> Result<()> {
+        let write_staging = self.staging_hot_mints.contains(&mint);
+        let write_active = write_active && self.active_hot_mints.contains(&mint);
+        if !write_staging && !write_active {
+            return Ok(());
+        }
+        let row = TokenMintRow {
+            mint,
+            mint_authority,
+            supply,
+            decimals,
+            is_initialized,
+            freeze_authority,
+            updated_slot: self.snapshot_slot,
+        };
+        if write_staging {
+            self.staging_sink.write_token_mint(&row).await?;
+        }
+        if write_active {
+            self.active_sink.write_token_mint(&row).await?;
+        }
+        Ok(())
+    }
+
+    async fn insert_token_metadata(
+        &mut self,
+        account: &StoredAccountMeta<'_>,
+        write_active: bool,
+    ) -> Result<()> {
+        if account.data.is_empty() {
+            return Ok(());
+        }
+        let mut data = account.data;
+        let account_key = match mpl_metadata::AccountKey::deserialize(&mut data) {
+            Ok(account_key) => account_key,
+            Err(_) => return Ok(()),
+        };
+        if !matches!(account_key, mpl_metadata::AccountKey::MetadataV1) {
+            return Ok(());
+        }
+        let metadata = match mpl_metadata::Metadata::deserialize(&mut data) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                warn!(
+                    "Skipping invalid token-metadata v1 metadata account {}: {}",
+                    account.meta.pubkey, err
+                );
+                return Ok(());
+            }
+        };
+        let metadata_ext = mpl_metadata::MetadataExt::deserialize(&mut data).ok();
+        let metadata_ext_v1_2 = metadata_ext
+            .as_ref()
+            .and_then(|_| mpl_metadata::MetadataExtV1_2::deserialize(&mut data).ok());
+        let mint = pubkey_string(metadata.mint);
+        let write_staging = self.staging_hot_mints.contains(&mint);
+        let write_active = write_active && self.active_hot_mints.contains(&mint);
+        if !write_staging && !write_active {
+            return Ok(());
+        }
+        let row = TokenMetadataRow {
+            mint,
+            name: metadata.data.name,
+            symbol: metadata.data.symbol,
+            uri: metadata.data.uri,
+            update_authority: pubkey_string(metadata.update_authority),
+            is_mutable: metadata.is_mutable,
+            token_standard: metadata_ext_v1_2.and_then(|metadata| metadata.token_standard),
+            seller_fee_basis_points: metadata.data.seller_fee_basis_points,
+            creators: metadata
+                .data
+                .creators
+                .unwrap_or_default()
+                .into_iter()
+                .map(|creator| pubkey_string(creator.address))
+                .collect(),
+            updated_slot: self.snapshot_slot,
+        };
+        if write_staging {
+            self.staging_sink.write_token_metadata(&row).await?;
+        }
+        if write_active {
+            self.active_sink.write_token_metadata(&row).await?;
+        }
+        self.progress.metadata.inc();
+        Ok(())
+    }
+
+    fn record_active_close_candidate(
+        &mut self,
+        account: &StoredAccountMeta<'_>,
+        account_slot: u64,
+    ) {
+        if is_close_tombstone_candidate(account.account_meta.lamports) {
+            remember_close_candidate(&mut self.stats.closed_token_accounts, account, account_slot);
+        }
+    }
+
+    async fn finish(self) -> Result<ParallelWorkerStats> {
+        let Self {
+            staging_sink,
+            active_sink,
+            stats,
+            ..
+        } = self;
+        staging_sink.end().await?;
+        active_sink.end().await?;
+        Ok(stats)
+    }
+}
+
 #[derive(Default)]
 struct ParallelWorkerStats {
     append_vecs_total: u64,
@@ -3468,6 +4162,22 @@ mod tests {
     fn only_incremental_archives_collect_close_tombstones() {
         assert!(!SnapshotKind::Full.collect_close_tombstones());
         assert!(SnapshotKind::Incremental.collect_close_tombstones());
+    }
+
+    #[test]
+    fn incremental_wallet_aggregation_uses_pair_projection_without_final() {
+        let sql = incremental_wallet_balance_aggregate_sql(
+            "solana.hot_token_account_state",
+            &["('mint', 'owner')".to_owned()],
+        );
+
+        assert!(sql.contains("FROM solana.hot_token_account_state AS s"));
+        assert!(sql.contains("WHERE (s.mint, s.owner) IN (('mint', 'owner'))"));
+        assert!(sql.contains("GROUP BY s.pubkey"));
+        assert!(sql.contains("SELECT argMax("));
+        assert!(sql.contains("tuple(s.mint, s.owner, s.amount, s.state, s.is_deleted)"));
+        assert!(sql.contains("HAVING tupleElement(latest, 5) = 0"));
+        assert!(!sql.contains(" FINAL"));
     }
 
     #[test]

@@ -74,6 +74,16 @@ staging slot ─ staging eligible incremental ─> staging slot'
 
 首次 cold start 时，active 先绑定并灌入一个 full，staging 为 `disabled`。后续发现的“新 full”按 `new_full_slot > active.full_slot` 判断，而**不是**与 `active.max_slot` 比较：active 即使已经通过增量推进得更远，仍可把该 full 的新尾段当作增量处理；staging 则绑定该 full 并从 slot 0 冷启动。
 
+这个新 full archive 只解压一次。程序先停止/清空 `_bak`，冻结新的 staging mint 集合，并捕获当时的 `active.max_slot`，再从 slot 0 顺序读取 AppendVec：每个 AppendVec 都写入 staging；仅 `append_vec.slot > captured_active_max_slot` 的同一份已解压数据额外写入 active。账户和 Token/metadata payload 在 worker 内只解析一次，但两路仍各自按自己冻结的 mint 集合决定是否写入 hot 表。active 的这部分保持 incremental 语义（仅刷新受影响的 L3，不重建 `hot_token_info`）；staging 保持 full 语义（构建完整 L2/L3 与 `hot_token_info`）。
+
+### Shared fanout 的稀疏 active INSERT
+
+每个 worker 的每张表都是独立的 HTTP chunked RowBinary INSERT。新 full 通常绝大多数 AppendVec 的 slot 不高于捕获的 active 水位，因此会持续写 staging、却很久不再向 active 写行；但 active 先前留下的少量未提交行仍对应一个已打开的 HTTP 请求。
+
+为避免该请求在持续的 staging 流量中变成陈旧连接，**每解析一个账户都会推进 active 和 staging 两侧的 aged-INSERT 检查**（内部每 1,024 行实际判断一次），且先检查 active。任一侧有 pending 行且打开时间达到 5 秒，即正常 `force_commit`：结束当前 chunked 请求并等待 ClickHouse 成功确认；该侧下次有新行时由 inserter 创建新的请求。不会写入占位行或心跳数据。active 必须先检查，因为 staging 的大批提交本身可能占用数秒。
+
+`channel closed` 不是可安全原地重发的错误：客户端不能判断断开前服务端是否已经接受并提交该批行。发生这种错误时，共享 full 保留检查点、清空未完成的 staging、再从固定 full archive 重做一次分流；不尝试对同一个 HTTP 请求盲目重连和重发。运行时若在 ClickHouse 服务端看到 `Unexpected end of file while reading chunk header of HTTP chunked data`，表示服务端收到的是客户端未完成的请求体，应优先检查上述 aged-INSERT 刷新路径和客户端传输，而不是把它当作 Merge、内存或表交换失败。
+
 staging 完成 full 和首个适用增量后，active 不再派发新的增量；待此前 active 导入已提交，程序：
 
 1. 执行 staging 自检；
@@ -83,19 +93,21 @@ staging 完成 full 和首个适用增量后，active 不再派发新的增量�
 
 旧 `_bak` 不按时间自动清空；它保留到下一次更高 `full_slot` 的 full 到来，届时才清空并灌入新 staging full。
 
-工作目录中的 `solana-snapshot-etl-state.json`（v3）为 active/staging 分别记录 `phase`、`full_snapshot`、`max_slot`、冻结 mint 文件和正在执行的增量。`phase` 的含义如下；其中「已提交」指相应 INSERT 和派生索引刷新均已成功返回，并已把该结果写入 JSON。
+工作目录中的 `solana-snapshot-etl-state.json`（v5）为 active/staging 分别记录 `phase`、`full_snapshot`、`max_slot`、冻结 mint 文件和正在执行的工作类型。`inflight_incremental` 不保存增量 archive 的路径、base slot 或结束 slot：增量文件可滚动删除，恢复时只以已提交的 `max_slot` 从当前目录选择可衔接且结束 slot 最高的文件。`phase` 的含义如下；其中「已提交」指相应 INSERT 和派生索引刷新均已成功返回，并已把该结果写入 JSON。
 
 | `phase` | 可出现在哪一路 | 已经提交的状态 | 当前允许/禁止的工作 | 停止后再次启动 |
 | --- | --- | --- | --- | --- |
-| `disabled` | 通常是 staging；bootstrap 前的 staging，以及切换后的旧 active 都在此状态 | 对一个从未使用的 staging，`full_snapshot`、`max_slot`、mint 文件均为空。切换后的旧 active 则会保留其原有的 full、`max_slot` 和 mint 文件，便于审计，但它已经不再是工作代际。 | 不给此路派发增量。旧 `_bak` 表不清理、不更新；只有发现比 `active.full_slot` 更新的 full 时，才会清空此物理组并把它转为 `full_loading`。 | 保持禁用；不会因为重启而误把旧 `_bak` 当作 staging 继续更新。 |
+| `disabled` | 通常是 staging；bootstrap 前的 staging，以及切换后的旧 active 都在此状态 | 对一个从未使用的 staging，`full_snapshot`、`max_slot`、mint 文件均为空。切换后的旧 active 会保留其原有的 full 和 `max_slot` 以便审计，但冻结 mint 文件会立即删除，因为该代际已不再工作。 | 不给此路派发增量。旧 `_bak` 表不清理、不更新；只有发现比 `active.full_slot` 更新的 full 时，才会清空此物理组并把它转为 `full_loading`。 | 保持禁用；不会因为重启而误把旧 `_bak` 当作 staging 继续更新。 |
 | `waiting_for_full` | 仅 active | `--bootstrap` 已原子重置 journal；尚未选定任何 full，故没有有效 `full_snapshot` 或 `max_slot`。 | 只扫描并选择可用的 full；不会从旧 active 水位继续增量，也不会写 staging。 | 继续等待/选择 full。选定后先写入 `full_loading`，再进行清表和导入。 |
 | `full_loading` | active 或 staging | 已固定写入这一路要使用的 `full_snapshot`（路径与不可变的 `full_slot`）；full 数据和 `max_slot` 还不能视为完成。 | 该物理组正在或即将停止 Merge、清空并导入此 full；这一路不接收增量。另一条 active 路若处于正常服务状态，仍可独立做增量。 | 使用 JSON 中**同一个** full archive 重做该路 full；不会改选较新的 full，也不会以未完成的数据开始增量。 |
 | `full_merging` | active 或 staging | full 原始数据、L2/L3 派生索引和冻结 mint 文件均已提交；`max_slot` 已置为该 `full_slot`。Merge 已恢复，但尚未通过稳定屏障。 | 只等待该组六张表的活动 parts 数连续两次、间隔 2 分钟保持不变；在此之前禁止向该路派发增量。 | 只重新启动/继续等待 Merge 稳定，**绝不重清表或重灌 full**。稳定后转为 `ready`。 |
 | `ready` | active 或 staging | 已绑定 full 且已经完成 full 与此前所有记录的增量；`max_slot` 是该路最后成功导入的 slot。 | 可以选择一个 `base_slot <= max_slot < slot` 的增量。active 按自己的水位继续服务；staging 的第一个成功增量会触发切换准备。 | 读取冻结 mint 文件，以保存的 `max_slot` 继续选择下一份适用增量；不重放已经完成的工作。 |
-| `incremental_loading` | active 或 staging | 此前 full 及所有早先增量已经提交；JSON 已在本次增量开始**之前**记录 `inflight_incremental`，但该增量尚未被标记为完成，因此 `max_slot` 仍是上一个成功水位。 | 该路不再接收另一份增量。active 的写入是同步的；staging 的首增量在后台执行，期间 active 可完成手头已经开始的工作，但不会在 staging 首增量完成后再获派发新任务。 | 按 JSON 记录的同一份 archive 重做这次增量；成功后更新 `max_slot` 并转入 `ready`（active）或 `cutover_pending`（staging）。重复写入依靠按 slot 的版本语义保持结果正确。 |
+| `incremental_loading` | active 或 staging | 此前 full 及所有早先增量已经提交；JSON 已在本次增量开始**之前**记录 `inflight_incremental.kind`，但具体 archive 未被标记为完成，因此 `max_slot` 仍是上一个成功水位。新 full 的共享导入期间，active 也使用此状态，且其 kind 为 `full`。 | 该路不再接收另一份增量。普通 active 写入是同步的；staging 的首增量在后台执行，期间 active 可完成手头已经开始的工作，但不会在 staging 首增量完成后再获派发新任务。共享 full 期间 active 不派发新增量，直到 bridge 已提交。 | 普通增量从当前目录重新选择一个 `base_slot <= max_slot < slot` 的最高结束 slot archive；若尚无可衔接文件则转回 `ready` 等待。共享 full 则由顶层共享检查点接管，和 staging 一起重走**一次**解压。成功后更新 `max_slot` 并转入 `ready`（active）或 `cutover_pending`（staging）。重复写入依靠按 slot 的版本语义保持结果正确。 |
 | `cutover_pending` | 同时出现在 active 和 staging | staging 的 full 和**第一份适用增量**已提交，且 staging `max_slot` 已更新；active 此前正在进行的增量也已经提交，之后不再给 active 派新任务。切换前还会将两组六张表的 UUID 写入 `cutover` checkpoint。 | 不再向任何一路派发增量。先做 staging 自检（冻结 mint 集合非空，且 `hot_token_info_bak` 行数等于该集合大小），随后逐对 `EXCHANGE TABLES`。不要求 `staging.max_slot == active.max_slot`。 | 重做自检并根据 UUID checkpoint 仅交换尚未交换的表对；已交换的表对不会被换回。交换完成后立即将 staging 提升为 `active/ready`，并将旧 active 写成 `staging/disabled`。 |
 
-`--bootstrap` 一启动就原子重置为“active 等待/灌入 full、staging disabled”；非 `--bootstrap` 重启会从该状态继续，而不会重新读取可变的 `hot_token_enabled`。
+新 full 导入中，JSON 顶层还会暂存 `shared_full_load`：其中含固定 archive、其 slot 和导入开始时捕获的 `active_resume_slot`。该检查点写入后才停止 Merge/清空 `_bak`；两个组的 raw 写入和派生刷新全部成功后才清除。因而中断重启会使用相同 mint 文件、相同 active 水位，把该 archive 再解压一次并同时分流两路，绝不会退化成各解压一次。
+
+`--bootstrap` 一启动就原子重置为“active 等待/灌入 full、staging disabled”，并删除工作目录中此前生成的所有 `solana-snapshot-etl-hot-mints-*.txt`；非 `--bootstrap` 重启会从该状态继续，而不会重新读取可变的 `hot_token_enabled`。v2/v3/v4 JSON 会自动迁移到 v5；已经在旧版本中开始的 staging full 按旧的单路恢复完成，之后的新 full 使用共享导入。
 
 `EXCHANGE TABLES` 的多对交换不是全局单事务。短窗口中的跨表查询可能读到不同代际；单表查询和只读 L3 的 Top-N 查询不受影响。切换前 JSON 会保存六对表的 ClickHouse UUID；若进程在任一对交换后中断，重启会检查 UUID，只交换尚未完成的对，绝不会把已交换的对换回去。
 

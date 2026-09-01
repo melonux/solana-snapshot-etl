@@ -1,9 +1,9 @@
 use crate::clickhouse::{
-    exchange_table_groups, load_enabled_hot_mints, max_raw_account_updated_slot,
-    rebuild_derived_indexes_from_state, reset_table_group, set_group_table_merges,
-    snapshot_hot_mints, table_group_identity, validate_clickhouse_schema, validate_staging_group,
-    wait_for_group_merges_to_settle, ClickhouseIndexer, CloseTombstoneStats, HotMintSet,
-    SnapshotKind, TableGroup, TableGroupIdentity,
+    exchange_table_groups, import_full_snapshot_fanout, load_enabled_hot_mints,
+    max_raw_account_updated_slot, rebuild_derived_indexes_from_state, reset_table_group,
+    set_group_table_merges, snapshot_hot_mints, table_group_identity, validate_clickhouse_schema,
+    validate_staging_group, wait_for_group_merges_to_settle, ClickhouseIndexer,
+    CloseTombstoneStats, HotMintSet, SnapshotKind, TableGroup, TableGroupIdentity,
 };
 use clap::{ArgGroup, Parser};
 use env_logger::{Builder, Env, Target};
@@ -600,9 +600,9 @@ impl IncrementalOutput {
     }
 
     /// Full builds take a new snapshot of the mutable global configuration;
-    /// incrementals reuse this process-local group snapshot. After a watcher
-    /// restart the snapshot is restored once from the group's swapped filter
-    /// table, never from `hot_token_enabled`.
+    /// incrementals reuse this process-local group snapshot. Watch mode
+    /// restores that snapshot from its persisted local mint file before this
+    /// method is used for an incremental.
     fn hot_mints_for(
         &mut self,
         snapshot_kind: SnapshotKind,
@@ -665,6 +665,21 @@ impl IncrementalOutput {
                 ..
             } => runtime
                 .block_on(load_enabled_hot_mints(clickhouse_url))
+                .map_err(Into::into),
+        }
+    }
+
+    /// Capture the mutable global selection for a newly bound staging full.
+    /// The caller persists this set before destructive `_bak` work so a retry
+    /// keeps the same generation definition.
+    fn snapshot_hot_mints(&self) -> Result<HotMintSet, Box<dyn std::error::Error>> {
+        match self {
+            Self::Clickhouse {
+                clickhouse_url,
+                runtime,
+                ..
+            } => runtime
+                .block_on(snapshot_hot_mints(clickhouse_url))
                 .map_err(Into::into),
         }
     }
@@ -802,6 +817,55 @@ impl IncrementalOutput {
                     snapshot_kind.as_str(),
                     snapshot_slot,
                     group.as_str(),
+                    stats.accounts_total,
+                    stats.token_accounts_total
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Import one full archive into staging and the active tail without
+    /// opening/decompressing the archive twice.  `self` deliberately keeps
+    /// its existing active frozen mint set; `staging_hot_mints` is the new
+    /// generation's separately frozen configuration.
+    fn process_shared_full_fanout(
+        &mut self,
+        loader: &mut SupportedLoader,
+        active_resume_slot: u64,
+        staging_hot_mints: HotMintSet,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let active_hot_mints = self.frozen_hot_mints()?;
+        match self {
+            Self::Clickhouse {
+                clickhouse_url,
+                runtime,
+                workers,
+                ..
+            } => {
+                let snapshot_slot = loader.snapshot_slot();
+                let append_vec_count = loader.append_vec_count_hint();
+                info!(
+                    "[clickhouse] processing shared full fanout slot={} staging=all active_tail_after_slot={} append_vecs={:?}",
+                    snapshot_slot,
+                    active_resume_slot,
+                    append_vec_count
+                );
+                let stats = runtime.block_on(import_full_snapshot_fanout(
+                    clickhouse_url.clone(),
+                    snapshot_slot,
+                    append_vec_count,
+                    loader.iter(),
+                    *workers,
+                    active_resume_slot,
+                    active_hot_mints,
+                    staging_hot_mints,
+                ))?;
+                log_clickhouse_index_stats(&stats);
+                info!(
+                    "[clickhouse] completed shared full fanout slot={} staging=full active_tail_after_slot={} accounts={} token_accounts={}",
+                    snapshot_slot,
+                    active_resume_slot,
                     stats.accounts_total,
                     stats.token_accounts_total
                 );
@@ -953,7 +1017,9 @@ fn spawn_staging_incremental(
 }
 
 const WATCHER_STATE_FILENAME: &str = "solana-snapshot-etl-state.json";
-const WATCHER_STATE_VERSION: u32 = 3;
+const WATCHER_STATE_VERSION: u32 = 5;
+const HOT_MINTS_FILE_PREFIX: &str = "solana-snapshot-etl-hot-mints-";
+const HOT_MINTS_FILE_SUFFIX: &str = ".txt";
 
 /// The watcher state is deliberately local to the process working directory.
 /// ClickHouse holds the data generations, while this file is the durable
@@ -965,6 +1031,10 @@ struct WatcherState {
     staging: LaneWatcherState,
     #[serde(default)]
     cutover: Option<CutoverWatcherState>,
+    /// Present only while one full archive is being decoded once and fanned
+    /// out into staging plus the active generation's unseen tail.
+    #[serde(default)]
+    shared_full_load: Option<SharedFullLoadWatcherState>,
 }
 
 /// A full snapshot identifies a generation. Its `slot` is deliberately
@@ -1017,10 +1087,6 @@ enum PersistedSnapshotKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct InflightSnapshotWatcherState {
     kind: PersistedSnapshotKind,
-    path: PathBuf,
-    #[serde(default)]
-    base_slot: Option<u64>,
-    slot: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1043,6 +1109,15 @@ struct LaneWatcherState {
 struct CutoverWatcherState {
     active_tables: TableGroupIdentity,
     staging_tables: TableGroupIdentity,
+}
+
+/// Durable identity of the coordinated full import. `active_resume_slot` is
+/// captured before the archive starts and must not drift while the active
+/// bridge is in flight, otherwise a restart could skip a different tail.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct SharedFullLoadWatcherState {
+    snapshot: FullSnapshotWatcherState,
+    active_resume_slot: u64,
 }
 
 impl LaneWatcherState {
@@ -1079,6 +1154,7 @@ impl WatcherState {
             active: LaneWatcherState::waiting_for_full(),
             staging: LaneWatcherState::disabled(),
             cutover: None,
+            shared_full_load: None,
         }
     }
 
@@ -1094,6 +1170,7 @@ impl WatcherState {
             },
             staging: LaneWatcherState::disabled(),
             cutover: None,
+            shared_full_load: None,
         }
     }
 }
@@ -1124,11 +1201,7 @@ struct LegacyStagingWatcherStateV2 {
 }
 
 #[derive(Deserialize)]
-struct LegacyIncrementalWatcherStateV2 {
-    path: PathBuf,
-    base_slot: u64,
-    slot: u64,
-}
+struct LegacyIncrementalWatcherStateV2 {}
 
 fn migrate_v2_state(legacy: LegacyWatcherStateV2) -> WatcherState {
     let active = LaneWatcherState {
@@ -1148,11 +1221,8 @@ fn migrate_v2_state(legacy: LegacyWatcherStateV2) -> WatcherState {
             let inflight_incremental =
                 legacy_staging
                     .first_incremental
-                    .map(|snapshot| InflightSnapshotWatcherState {
+                    .map(|_| InflightSnapshotWatcherState {
                         kind: PersistedSnapshotKind::Incremental,
-                        path: snapshot.path,
-                        base_slot: Some(snapshot.base_slot),
-                        slot: snapshot.slot,
                     });
             let phase = if legacy_staging.ready_slot.is_none() {
                 LanePhase::FullLoading
@@ -1180,6 +1250,7 @@ fn migrate_v2_state(legacy: LegacyWatcherStateV2) -> WatcherState {
         active,
         staging,
         cutover: None,
+        shared_full_load: None,
     }
 }
 
@@ -1209,13 +1280,28 @@ fn load_watcher_state(path: &Path) -> Result<Option<WatcherState>, Box<dyn std::
                 path.display()
             )
         })?
+    } else if version == 4 {
+        let mut migrated: WatcherState = serde_json::from_value(value)
+            .map_err(|err| format!("failed to parse v4 watcher state {}: {err}", path.display()))?;
+        migrated.version = WATCHER_STATE_VERSION;
+        persist_watcher_state(path, &migrated)?;
+        warn!("[watcher] 已将 v4 状态迁移到 v5；中断增量将按已提交水位重新选择当前可用 archive");
+        migrated
+    } else if version == 3 {
+        let mut migrated: WatcherState = serde_json::from_value(value)
+            .map_err(|err| format!("failed to parse v3 watcher state {}: {err}", path.display()))?;
+        migrated.version = WATCHER_STATE_VERSION;
+        migrated.shared_full_load = None;
+        persist_watcher_state(path, &migrated)?;
+        warn!("[watcher] 已将 v3 状态迁移到 v5；后续新 full 将使用单次解压的双路分流，中断增量将重新选择当前可用 archive");
+        migrated
     } else if version == 2 {
         let migrated = migrate_v2_state(serde_json::from_value(value).map_err(|err| {
             format!("failed to parse v2 watcher state {}: {err}", path.display())
         })?);
         persist_watcher_state(path, &migrated)?;
         warn!(
-            "[watcher] 已将 v2 状态迁移到 v3；旧 active 的 full_slot 无法反推，下一次可用 full 会建立新的 staging 代际"
+            "[watcher] 已将 v2 状态迁移到 v5；旧 active 的 full_slot 无法反推，下一次可用 full 会建立新的 staging 代际"
         );
         migrated
     } else {
@@ -1277,7 +1363,7 @@ fn persist_frozen_hot_mints(
     let directory = state_path.parent().unwrap_or_else(|| Path::new("."));
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let path = directory.join(format!(
-        "solana-snapshot-etl-hot-mints-{}.{}.txt",
+        "{HOT_MINTS_FILE_PREFIX}{}.{}{HOT_MINTS_FILE_SUFFIX}",
         std::process::id(),
         nonce
     ));
@@ -1312,6 +1398,82 @@ fn persist_frozen_hot_mints(
         hot_mints.len()
     );
     Ok(path)
+}
+
+fn is_managed_hot_mints_file(path: &Path, directory: &Path) -> bool {
+    path.parent() == Some(directory)
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with(HOT_MINTS_FILE_PREFIX) && name.ends_with(HOT_MINTS_FILE_SUFFIX)
+            })
+}
+
+/// Remove generated frozen-mint files that are no longer referenced by a
+/// working lane.  Do not follow paths from the state file outside its own
+/// directory: only files created by `persist_frozen_hot_mints` are managed.
+fn cleanup_unused_frozen_hot_mints(
+    state_path: &Path,
+    state: &WatcherState,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let directory = state_path.parent().unwrap_or_else(|| Path::new("."));
+    let referenced = [
+        (state.active.phase, state.active.hot_mints_path.as_ref()),
+        (state.staging.phase, state.staging.hot_mints_path.as_ref()),
+    ];
+    let mut removed = 0;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !is_managed_hot_mints_file(&path, directory)
+            || referenced.iter().any(|(phase, candidate)| {
+                *phase != LanePhase::Disabled
+                    && candidate.is_some_and(|candidate| candidate == &path)
+            })
+        {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                info!(
+                    "[watcher] 已清理不再使用的 hot-mint 文件 file={}",
+                    path.display()
+                );
+                removed += 1;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "failed to remove unused hot-mint file {}: {err}",
+                    path.display()
+                )
+                .into())
+            }
+        }
+    }
+    if removed > 0 {
+        File::open(directory)?.sync_all()?;
+    }
+    Ok(removed)
+}
+
+fn cleanup_unused_frozen_hot_mints_or_warn(state_path: &Path, state: &WatcherState) {
+    if let Err(err) = cleanup_unused_frozen_hot_mints(state_path, state) {
+        warn!("[watcher] 清理不再使用的 hot-mint 文件失败：{err}");
+    }
+}
+
+/// A disabled lane keeps its table-generation watermark for diagnostics, but
+/// no longer needs its potentially very large frozen mint file.
+fn clear_disabled_hot_mints_paths(state: &mut WatcherState) -> bool {
+    let mut changed = false;
+    for lane in [&mut state.active, &mut state.staging] {
+        if lane.phase == LanePhase::Disabled && lane.hot_mints_path.take().is_some() {
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn load_frozen_hot_mints(path: &Path) -> Result<HotMintSet, Box<dyn std::error::Error>> {
@@ -1374,46 +1536,25 @@ fn find_recorded_full(
         })
 }
 
-fn find_recorded_incremental(
-    incrementals: &[IncrementalSnapshot],
-    recorded: &InflightSnapshotWatcherState,
-) -> Result<IncrementalSnapshot, Box<dyn std::error::Error>> {
-    let base_slot = recorded
-        .base_slot
-        .ok_or("recorded incremental has no base_slot")?;
-    incrementals
-        .iter()
-        .find(|snapshot| {
-            snapshot.slot() == recorded.slot
-                && snapshot.base_slot() == base_slot
-                && snapshot.path() == recorded.path
-        })
-        .cloned()
-        .ok_or_else(|| {
-            format!(
-                "cannot resume incremental snapshot slot={}: archive {} is missing",
-                recorded.slot,
-                recorded.path.display()
-            )
-            .into()
-        })
+fn inflight_snapshot(snapshot: &WatchedSnapshot) -> InflightSnapshotWatcherState {
+    let kind = match snapshot {
+        WatchedSnapshot::Full(_) => PersistedSnapshotKind::Full,
+        WatchedSnapshot::Incremental(_) => PersistedSnapshotKind::Incremental,
+    };
+    InflightSnapshotWatcherState { kind }
 }
 
-fn inflight_snapshot(snapshot: &WatchedSnapshot) -> InflightSnapshotWatcherState {
-    match snapshot {
-        WatchedSnapshot::Full(snapshot) => InflightSnapshotWatcherState {
-            kind: PersistedSnapshotKind::Full,
-            path: snapshot.path().to_path_buf(),
-            base_slot: None,
-            slot: snapshot.slot(),
-        },
-        WatchedSnapshot::Incremental(snapshot) => InflightSnapshotWatcherState {
-            kind: PersistedSnapshotKind::Incremental,
-            path: snapshot.path().to_path_buf(),
-            base_slot: Some(snapshot.base_slot()),
-            slot: snapshot.slot(),
-        },
-    }
+/// Pick the current archive with the highest ending slot that can continue
+/// from the committed watermark.  Archive names are intentionally not kept in
+/// the state journal because an interrupted archive may have been rolled away
+/// before the next process starts.
+fn newest_eligible_incremental(
+    incrementals: &[IncrementalSnapshot],
+    committed_slot: u64,
+) -> Option<IncrementalSnapshot> {
+    eligible_candidates(incrementals.to_vec(), committed_slot)
+        .into_iter()
+        .next()
 }
 
 /// Apply a full archive's new tail or a normal incremental to active. This
@@ -1551,34 +1692,120 @@ fn spawn_staging_merge_wait(
     })
 }
 
-fn start_staging_full(
-    output: &IncrementalOutput,
+/// Checkpoint and prepare a newly observed full generation for a single
+/// archive read that feeds both physical groups.  This is deliberately done
+/// before STOP MERGES/TRUNCATE, so a restart knows that `_bak` must be rebuilt
+/// from this exact archive and that active's bridge must use the captured
+/// watermark.
+fn begin_shared_full_load(
+    output: &mut IncrementalOutput,
+    state_path: &Path,
+    watcher_state: &mut WatcherState,
+    snapshot: &FullSnapshot,
+) -> Result<HotMintSet, Box<dyn std::error::Error>> {
+    if watcher_state.staging.phase != LanePhase::Disabled {
+        return Err("cannot begin shared full load while staging is not disabled".into());
+    }
+    if watcher_state.active.phase != LanePhase::Ready {
+        return Err("cannot begin shared full load while active is not ready".into());
+    }
+    let active_resume_slot = watcher_state
+        .active
+        .max_slot
+        .ok_or("ready active has no committed max_slot")?;
+    let staging_hot_mints = output.snapshot_hot_mints()?;
+    let staging_hot_mints_path = persist_frozen_hot_mints(state_path, &staging_hot_mints)?;
+    let snapshot_state = full_snapshot_state(snapshot);
+    let active_candidate = WatchedSnapshot::Full(snapshot.clone());
+
+    watcher_state.staging = LaneWatcherState::full_loading(snapshot_state.clone());
+    watcher_state.staging.hot_mints_path = Some(staging_hot_mints_path);
+    watcher_state.active.phase = LanePhase::IncrementalLoading;
+    watcher_state.active.inflight_incremental = Some(inflight_snapshot(&active_candidate));
+    watcher_state.cutover = None;
+    watcher_state.shared_full_load = Some(SharedFullLoadWatcherState {
+        snapshot: snapshot_state,
+        active_resume_slot,
+    });
+    persist_watcher_state(state_path, watcher_state)?;
+    cleanup_unused_frozen_hot_mints_or_warn(state_path, watcher_state);
+    info!(
+        "[switch] 新 full 到达：绑定 staging full_slot={}，捕获 active max_slot={}；准备停止并清空 _bak 后单次解压分流",
+        snapshot.slot(),
+        active_resume_slot
+    );
+    Ok(staging_hot_mints)
+}
+
+/// Execute or resume the checkpointed one-stream full fanout.  Both lanes
+/// remain in their pre-completion phases until every raw/derived write has
+/// committed, so retrying an interrupted attempt replays one deterministic
+/// shared stream rather than falling back to two independent decompressions.
+fn complete_shared_full_load(
+    output: &mut IncrementalOutput,
     state_path: &Path,
     watcher_state: &mut WatcherState,
     snapshot: FullSnapshot,
-) -> Result<StagingBuild, Box<dyn std::error::Error>> {
-    let previous_hot_mints = watcher_state.staging.hot_mints_path.clone();
-    watcher_state.staging = LaneWatcherState::full_loading(full_snapshot_state(&snapshot));
-    persist_watcher_state(state_path, watcher_state)?;
-    if let Some(path) = previous_hot_mints {
-        match fs::remove_file(&path) {
-            Ok(()) => info!(
-                "[switch] 已清理待复用 staging 的旧 mint 文件 file={}",
-                path.display()
-            ),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => warn!(
-                "[switch] 清理旧 staging mint 文件 {} 失败：{}",
-                path.display(),
-                err
-            ),
-        }
+    staging_hot_mints: HotMintSet,
+) -> Result<Option<StagingBuild>, Box<dyn std::error::Error>> {
+    let shared = watcher_state
+        .shared_full_load
+        .clone()
+        .ok_or("shared full completion without a shared-full checkpoint")?;
+    if watcher_state.staging.phase != LanePhase::FullLoading
+        || watcher_state.active.phase != LanePhase::IncrementalLoading
+    {
+        return Err("shared full checkpoint has incompatible lane phases".into());
     }
+    let active_inflight = watcher_state
+        .active
+        .inflight_incremental
+        .as_ref()
+        .ok_or("shared full checkpoint has no active inflight archive")?;
+    if active_inflight.kind != PersistedSnapshotKind::Full
+        || snapshot.path() != shared.snapshot.path
+        || snapshot.slot() != shared.snapshot.slot
+    {
+        return Err("shared full checkpoint does not match the recorded archive".into());
+    }
+    if watcher_state.active.max_slot != Some(shared.active_resume_slot) {
+        return Err(format!(
+            "shared full checkpoint expected active max_slot={}, found {:?}",
+            shared.active_resume_slot, watcher_state.active.max_slot
+        )
+        .into());
+    }
+    let mut loader = WatchedSnapshot::Full(snapshot.clone()).new_loader(0)?;
+    output.process_shared_full_fanout(&mut loader, shared.active_resume_slot, staging_hot_mints)?;
+
+    watcher_state.active.max_slot = Some(snapshot.slot());
+    watcher_state.active.phase = LanePhase::Ready;
+    watcher_state.active.inflight_incremental = None;
+    watcher_state.staging.max_slot = Some(snapshot.slot());
+    watcher_state.staging.phase = LanePhase::FullMerging;
+    watcher_state.staging.inflight_incremental = None;
+    watcher_state.shared_full_load = None;
+    persist_watcher_state(state_path, watcher_state)?;
     info!(
-        "[switch] 新 full 到达：绑定 staging full_slot={}，清空旧 _bak 后后台灌入",
+        "[switch] 单次解压双路导入已提交：active bridge max_slot={}；staging full_slot={} max_slot={}，后台等待 MERGE 稳定",
+        snapshot.slot(),
+        snapshot.slot(),
         snapshot.slot()
     );
-    spawn_staging_full(output, snapshot)
+
+    match spawn_staging_merge_wait(output, shared.snapshot) {
+        Ok(build) => Ok(Some(build)),
+        Err(err) => {
+            // The durable `full_merging` checkpoint is already in place; the
+            // normal recovery branch below can safely start the wait worker on
+            // the next loop without replaying the full archive.
+            warn!(
+                "[switch] staging full 已提交但无法立即启动 MERGE 等待线程；将按 full_merging 恢复：{}",
+                err
+            );
+            Ok(None)
+        }
+    }
 }
 
 fn finish_cutover(
@@ -1622,12 +1849,15 @@ fn finish_cutover(
     promoted.inflight_incremental = None;
     old_active.phase = LanePhase::Disabled;
     old_active.inflight_incremental = None;
+    old_active.hot_mints_path = None;
     watcher_state.active = promoted;
     watcher_state.staging = old_active;
     watcher_state.cutover = None;
+    watcher_state.shared_full_load = None;
     persist_watcher_state(state_path, watcher_state)?;
+    cleanup_unused_frozen_hot_mints_or_warn(state_path, watcher_state);
     info!(
-        "[switch] 表组切换完成：active full_slot={:?} max_slot={:?}；旧 active 保留在 disabled staging，等待下一个新 full 才清理",
+        "[switch] 表组切换完成：active full_slot={:?} max_slot={:?}；旧 active 保留在 disabled staging，冻结 mint 文件已清理",
         watcher_state.active.full_snapshot.as_ref().map(|snapshot| snapshot.slot),
         watcher_state.active.max_slot
     );
@@ -1661,9 +1891,11 @@ fn run_incremental_snapshots(
         // `--bootstrap` is an explicit reset. Commit that fact before the
         // first destructive ClickHouse action, not after the full succeeds.
         persist_watcher_state(&state_path, &state)?;
+        let removed_hot_mints = cleanup_unused_frozen_hot_mints(&state_path, &state)?;
         info!(
-            "[watcher] bootstrap 已重置状态文件：旧 active max_slot={} 将被忽略，等待新的 active full",
-            existing_max_slot
+            "[watcher] bootstrap 已重置状态文件并清理 {} 个本地 hot-mint 文件：旧 active max_slot={} 将被忽略，等待新的 active full",
+            removed_hot_mints,
+            existing_max_slot,
         );
         state
     } else {
@@ -1684,6 +1916,11 @@ fn run_incremental_snapshots(
         }
     };
 
+    if clear_disabled_hot_mints_paths(&mut watcher_state) {
+        persist_watcher_state(&state_path, &watcher_state)?;
+    }
+    cleanup_unused_frozen_hot_mints_or_warn(&state_path, &watcher_state);
+
     let mut bootstrap_pending = matches!(
         watcher_state.active.phase,
         LanePhase::WaitingForFull | LanePhase::FullLoading
@@ -1703,7 +1940,7 @@ fn run_incremental_snapshots(
         output.set_hot_mints(active_hot_mints);
     }
     let mut staging_hot_mints = match watcher_state.staging.hot_mints_path.as_ref() {
-        Some(path) if watcher_state.staging.max_slot.is_some() => {
+        Some(path) if watcher_state.staging.phase != LanePhase::Disabled => {
             Some(load_frozen_hot_mints(path)?)
         }
         _ => None,
@@ -1739,6 +1976,7 @@ fn run_incremental_snapshots(
                             watcher_state.staging.hot_mints_path = Some(hot_mints_path);
                             watcher_state.staging.inflight_incremental = None;
                             persist_watcher_state(&state_path, &watcher_state)?;
+                            cleanup_unused_frozen_hot_mints_or_warn(&state_path, &watcher_state);
                             staging_hot_mints = Some(hot_mints);
                             build
                                 .full_import_ack
@@ -1872,6 +2110,77 @@ fn run_incremental_snapshots(
         let incrementals = discover_incremental_snapshots(directory)?;
         let fulls = discover_full_snapshots(directory)?;
 
+        // This takes precedence over the ordinary per-lane recovery paths.
+        // The checkpoint means `_bak` and active's bridge are one operation;
+        // recovering them separately would reopen and decompress the same full
+        // archive twice.
+        if let Some(shared) = watcher_state.shared_full_load.clone() {
+            if staging_build.is_some() || staging_incremental_handle.is_some() {
+                return Err("shared full checkpoint conflicts with a staging worker".into());
+            }
+            // This preparation is intentionally repeated on every shared
+            // attempt. The checkpoint is written before destructive work, so
+            // a crash between those operations must still never append the
+            // new full generation to retained `_bak` data.
+            if let Err(err) = output.stop_group_merges(TableGroup::Backup) {
+                warn!(
+                    "[switch] 单次解压前暂停 _bak MERGE 失败；保留共享检查点并重试：{}",
+                    err
+                );
+                reset_failed_staging(
+                    &mut output,
+                    &shared.snapshot,
+                    poll_interval,
+                    "单次解压前暂停 _bak MERGE 失败",
+                );
+                continue;
+            }
+            if let Err(err) = output.reset_group(TableGroup::Backup) {
+                warn!(
+                    "[switch] 单次解压前清理 _bak 失败；保留共享检查点并重试：{}",
+                    err
+                );
+                reset_failed_staging(
+                    &mut output,
+                    &shared.snapshot,
+                    poll_interval,
+                    "单次解压前清理 _bak 失败",
+                );
+                continue;
+            }
+            let snapshot = find_recorded_full(&fulls, &shared.snapshot)?;
+            let hot_mints = staging_hot_mints
+                .as_ref()
+                .map(std::sync::Arc::clone)
+                .ok_or("shared full checkpoint has no frozen staging hot-mint set")?;
+            match complete_shared_full_load(
+                &mut output,
+                &state_path,
+                &mut watcher_state,
+                snapshot,
+                hot_mints,
+            ) {
+                Ok(build) => {
+                    active_slot = watcher_state.active.max_slot.unwrap_or(0);
+                    staging_build = build;
+                    waiting_logged = false;
+                }
+                Err(err) => {
+                    warn!(
+                        "[switch] 单次解压双路 full 导入失败；保留共享检查点并重试：{}",
+                        err
+                    );
+                    reset_failed_staging(
+                        &mut output,
+                        &shared.snapshot,
+                        poll_interval,
+                        "单次解压双路全量导入或派生索引刷新失败",
+                    );
+                }
+            }
+            continue;
+        }
+
         if watcher_state.active.phase == LanePhase::FullMerging {
             let full_slot = watcher_state
                 .active
@@ -1913,16 +2222,24 @@ fn run_incremental_snapshots(
                 .clone()
                 .ok_or("active incremental_loading without inflight snapshot")?;
             let candidate = match recorded.kind {
-                PersistedSnapshotKind::Full => WatchedSnapshot::Full(find_recorded_full(
-                    &fulls,
-                    &FullSnapshotWatcherState {
-                        path: recorded.path,
-                        slot: recorded.slot,
-                    },
-                )?),
-                PersistedSnapshotKind::Incremental => WatchedSnapshot::Incremental(
-                    find_recorded_incremental(&incrementals, &recorded)?,
-                ),
+                PersistedSnapshotKind::Full => eligible_full_candidates(fulls.clone(), active_slot)
+                    .into_iter()
+                    .next()
+                    .map(WatchedSnapshot::Full),
+                PersistedSnapshotKind::Incremental => {
+                    newest_eligible_incremental(&incrementals, active_slot)
+                        .map(WatchedSnapshot::Incremental)
+                }
+            };
+            let Some(candidate) = candidate else {
+                watcher_state.active.phase = LanePhase::Ready;
+                watcher_state.active.inflight_incremental = None;
+                persist_watcher_state(&state_path, &watcher_state)?;
+                info!(
+                    "[watcher] 重启恢复：中断增量对应 archive 已滚动，active 从已提交 max_slot={} 重新等待可衔接快照",
+                    active_slot
+                );
+                continue;
             };
             if !apply_active_incremental(
                 &mut output,
@@ -1936,7 +2253,7 @@ fn run_incremental_snapshots(
                 persist_watcher_state(&state_path, &watcher_state)?;
             }
             info!(
-                "[watcher] 重启恢复：active 已完成中断的增量 slot={}",
+                "[watcher] 重启恢复：active 使用当前可衔接快照完成中断的增量 slot={}",
                 candidate.slot()
             );
             continue;
@@ -1977,16 +2294,29 @@ fn run_incremental_snapshots(
                 .inflight_incremental
                 .clone()
                 .ok_or("staging incremental_loading without inflight snapshot")?;
-            let snapshot = find_recorded_incremental(&incrementals, &recorded)?;
             let stage_slot = watcher_state
                 .staging
                 .max_slot
                 .ok_or("staging incremental_loading without a committed max_slot")?;
+            if recorded.kind != PersistedSnapshotKind::Incremental {
+                return Err("staging incremental_loading has a non-incremental marker".into());
+            }
+            let Some(snapshot) = newest_eligible_incremental(&incrementals, stage_slot) else {
+                watcher_state.staging.phase = LanePhase::Ready;
+                watcher_state.staging.inflight_incremental = None;
+                persist_watcher_state(&state_path, &watcher_state)?;
+                info!(
+                    "[switch] 重启恢复：中断 staging 增量对应 archive 已滚动，从已提交 max_slot={} 重新等待可衔接快照",
+                    stage_slot
+                );
+                continue;
+            };
             let hot_mints = staging_hot_mints
                 .as_ref()
                 .map(std::sync::Arc::clone)
                 .ok_or("staging restart requires frozen hot-mint set")?;
             let (clickhouse_url, workers) = output.clickhouse_config();
+            let snapshot_slot = snapshot.slot();
             staging_incremental_handle = Some(spawn_staging_incremental(
                 snapshot,
                 clickhouse_url,
@@ -1994,7 +2324,10 @@ fn run_incremental_snapshots(
                 stage_slot,
                 hot_mints,
             )?);
-            info!("[switch] 重启恢复：继续 staging 中断的首个增量");
+            info!(
+                "[switch] 重启恢复：staging 使用当前可衔接的首个增量 slot={}",
+                snapshot_slot
+            );
         }
 
         if bootstrap_pending || watcher_state.active.phase == LanePhase::WaitingForFull {
@@ -2019,23 +2352,18 @@ fn run_incremental_snapshots(
                     .as_ref()
                     .map(|full| full.slot),
             ) {
-                let active_candidate = WatchedSnapshot::Full(snapshot.clone());
-                // The disabled `_bak` may still retain the old generation's
-                // mint set in memory. It must never be used by the new full.
-                staging_hot_mints = None;
-                staging_build = Some(start_staging_full(
-                    &output,
-                    &state_path,
-                    &mut watcher_state,
-                    snapshot,
-                )?);
-                let _ = apply_active_incremental(
+                // Both target groups consume this archive through one loader:
+                // staging receives the full baseline while active receives
+                // only AppendVecs newer than its captured watermark. The
+                // shared checkpoint also prevents a restart from falling back
+                // to two independent decompressions.
+                let hot_mints = begin_shared_full_load(
                     &mut output,
                     &state_path,
                     &mut watcher_state,
-                    &mut active_slot,
-                    &active_candidate,
+                    &snapshot,
                 )?;
+                staging_hot_mints = Some(hot_mints);
                 waiting_logged = false;
                 continue;
             }
@@ -2044,7 +2372,8 @@ fn run_incremental_snapshots(
         let active_candidate = if watcher_state.active.phase == LanePhase::Ready {
             eligible_candidates(incrementals.clone(), active_slot)
                 .into_iter()
-                .find(|snapshot| !invalid_archives.contains(snapshot.path()))
+                .filter(|snapshot| !invalid_archives.contains(snapshot.path()))
+                .next()
         } else {
             None
         };
@@ -2057,7 +2386,8 @@ fn run_incremental_snapshots(
                 .ok_or("ready staging without max_slot")?;
             eligible_candidates(incrementals.clone(), stage_slot)
                 .into_iter()
-                .find(|snapshot| !invalid_archives.contains(snapshot.path()))
+                .filter(|snapshot| !invalid_archives.contains(snapshot.path()))
+                .next()
         } else {
             None
         };
@@ -2374,11 +2704,11 @@ impl SnapshotExtractor for SupportedLoader {
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_full_snapshots, discover_incremental_snapshots, load_frozen_hot_mints,
-        load_watcher_state, persist_frozen_hot_mints, persist_watcher_state,
+        cleanup_unused_frozen_hot_mints, discover_full_snapshots, discover_incremental_snapshots,
+        load_frozen_hot_mints, load_watcher_state, persist_frozen_hot_mints, persist_watcher_state,
         resume_slot_from_max_updated_slot, watched_snapshot_candidates, FullSnapshotWatcherState,
         InflightSnapshotWatcherState, LanePhase, LaneWatcherState, PersistedSnapshotKind,
-        WatchedSnapshot, WatcherState,
+        SharedFullLoadWatcherState, WatchedSnapshot, WatcherState, WATCHER_STATE_VERSION,
     };
     use std::collections::HashSet;
     use std::fs;
@@ -2438,7 +2768,7 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let path = directory.join("state.json");
         let state = WatcherState {
-            version: 3,
+            version: WATCHER_STATE_VERSION,
             active: LaneWatcherState {
                 phase: LanePhase::FullMerging,
                 full_snapshot: Some(FullSnapshotWatcherState {
@@ -2459,22 +2789,126 @@ mod tests {
                 hot_mints_path: Some(PathBuf::from("/state/hot-mints-staging.txt")),
                 inflight_incremental: Some(InflightSnapshotWatcherState {
                     kind: PersistedSnapshotKind::Incremental,
-                    path: PathBuf::from(
-                        "/snapshots/incremental-snapshot-443052286-443084494.tar.zst",
-                    ),
-                    base_slot: Some(443_052_286),
-                    slot: 443_084_494,
                 }),
             },
             cutover: None,
+            shared_full_load: None,
         };
 
         persist_watcher_state(&path, &state).unwrap();
         assert_eq!(load_watcher_state(&path).unwrap(), Some(state));
+        let persisted: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            persisted["staging"]["inflight_incremental"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["kind"]
+        );
 
         let hot_mints = Arc::new(HashSet::from(["mint-a".to_owned(), "mint-b".to_owned()]));
         let hot_mints_path = persist_frozen_hot_mints(&path, &hot_mints).unwrap();
         assert_eq!(load_frozen_hot_mints(&hot_mints_path).unwrap(), hot_mints);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn shared_full_checkpoint_round_trips_with_its_captured_active_watermark() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "solana-snapshot-etl-shared-full-state-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("state.json");
+        let shared_snapshot = FullSnapshotWatcherState {
+            path: PathBuf::from("/snapshots/snapshot-443200000.tar.zst"),
+            slot: 443_200_000,
+        };
+        let state = WatcherState {
+            version: WATCHER_STATE_VERSION,
+            active: LaneWatcherState {
+                phase: LanePhase::IncrementalLoading,
+                full_snapshot: Some(FullSnapshotWatcherState {
+                    path: PathBuf::from("/snapshots/snapshot-443000000.tar.zst"),
+                    slot: 443_000_000,
+                }),
+                max_slot: Some(443_150_000),
+                hot_mints_path: Some(PathBuf::from("/state/hot-mints-active.txt")),
+                inflight_incremental: Some(InflightSnapshotWatcherState {
+                    kind: PersistedSnapshotKind::Full,
+                }),
+            },
+            staging: LaneWatcherState {
+                phase: LanePhase::FullLoading,
+                full_snapshot: Some(shared_snapshot.clone()),
+                max_slot: None,
+                hot_mints_path: Some(PathBuf::from("/state/hot-mints-staging.txt")),
+                inflight_incremental: None,
+            },
+            cutover: None,
+            shared_full_load: Some(SharedFullLoadWatcherState {
+                snapshot: shared_snapshot,
+                active_resume_slot: 443_150_000,
+            }),
+        };
+
+        persist_watcher_state(&path, &state).unwrap();
+        assert_eq!(load_watcher_state(&path).unwrap(), Some(state));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn v3_state_migrates_to_v5_without_a_shared_full_checkpoint() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "solana-snapshot-etl-v3-state-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("state.json");
+        fs::write(
+            &path,
+            r#"{
+  "version": 3,
+  "active": {
+    "phase": "ready",
+    "full_snapshot": {
+      "path": "/snapshots/snapshot-443000000.tar.zst",
+      "slot": 443000000
+    },
+    "max_slot": 443150000,
+    "hot_mints_path": "/state/hot-mints-active.txt",
+    "inflight_incremental": null
+  },
+  "staging": {
+    "phase": "disabled",
+    "full_snapshot": null,
+    "max_slot": null,
+    "hot_mints_path": null,
+    "inflight_incremental": null
+  },
+  "cutover": null
+}"#,
+        )
+        .unwrap();
+
+        let state = load_watcher_state(&path).unwrap().unwrap();
+        assert_eq!(state.version, WATCHER_STATE_VERSION);
+        assert_eq!(state.shared_full_load, None);
+        assert_eq!(state.active.max_slot, Some(443_150_000));
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("\"version\": 5"));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2511,7 +2945,7 @@ mod tests {
         .unwrap();
 
         let state = load_watcher_state(&path).unwrap().unwrap();
-        assert_eq!(state.version, 3);
+        assert_eq!(state.version, WATCHER_STATE_VERSION);
         assert_eq!(state.active.max_slot, Some(443_089_098));
         assert_eq!(state.active.full_snapshot, None);
         assert_eq!(state.staging.phase, LanePhase::Ready);
@@ -2525,7 +2959,100 @@ mod tests {
         );
         assert!(fs::read_to_string(&path)
             .unwrap()
-            .contains("\"version\": 3"));
+            .contains("\"version\": 5"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn v4_migration_removes_recorded_incremental_archive_details() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "solana-snapshot-etl-v4-state-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("state.json");
+        fs::write(
+            &path,
+            r#"{
+  "version": 4,
+  "active": {
+    "phase": "incremental_loading",
+    "full_snapshot": null,
+    "max_slot": 443150000,
+    "hot_mints_path": null,
+    "inflight_incremental": {
+      "kind": "incremental",
+      "path": "/snapshots/incremental-snapshot-443150000-443160000.tar.zst",
+      "base_slot": 443150000,
+      "slot": 443160000
+    }
+  },
+  "staging": {
+    "phase": "disabled",
+    "full_snapshot": null,
+    "max_slot": null,
+    "hot_mints_path": null,
+    "inflight_incremental": null
+  },
+  "cutover": null,
+  "shared_full_load": null
+}"#,
+        )
+        .unwrap();
+
+        let state = load_watcher_state(&path).unwrap().unwrap();
+        assert_eq!(state.version, WATCHER_STATE_VERSION);
+        assert_eq!(
+            state.active.inflight_incremental,
+            Some(InflightSnapshotWatcherState {
+                kind: PersistedSnapshotKind::Incremental,
+            })
+        );
+        let persisted: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            persisted["active"]["inflight_incremental"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["kind"]
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_state_cleanup_removes_all_generated_hot_mint_files() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "solana-snapshot-etl-hot-mints-cleanup-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let state_path = directory.join("state.json");
+        let hot_mints = Arc::new(HashSet::from(["mint-a".to_owned()]));
+        let old_active = persist_frozen_hot_mints(&state_path, &hot_mints).unwrap();
+        let old_staging = persist_frozen_hot_mints(&state_path, &hot_mints).unwrap();
+        let unrelated = directory.join("keep-me.txt");
+        fs::write(&unrelated, []).unwrap();
+
+        let bootstrap = WatcherState::bootstrap_waiting_for_full();
+        persist_watcher_state(&state_path, &bootstrap).unwrap();
+        assert_eq!(
+            cleanup_unused_frozen_hot_mints(&state_path, &bootstrap).unwrap(),
+            2
+        );
+        assert!(!old_active.exists());
+        assert!(!old_staging.exists());
+        assert!(unrelated.exists());
         fs::remove_dir_all(directory).unwrap();
     }
 }

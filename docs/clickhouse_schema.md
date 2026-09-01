@@ -97,8 +97,9 @@ SETTINGS storage_policy = 'hot_active_policy', deduplicate_merge_projection_mode
 COMMENT '冻结 hot mint 的 Token Account 最新态；is_deleted=1 为 CloseAccount 删除版本';
 
 -- L3 增量按 (mint, owner) 聚合。该 projection 按 pair 排序，避免每次
--- 从按 pubkey 排序的 L2 扫描全部 Token Account。pubkey/version 字段保留
--- 以支持 ReplacingMergeTree 的 FINAL 语义。
+-- 从按 pubkey 排序的 L2 扫描全部 Token Account。pubkey/version 字段保留，
+-- 让增量可在已裁剪的 pair 范围内以 argMax 选取每个账户的最新版本；不要
+-- 在这条热点路径上使用 FINAL，否则 ClickHouse 会回退为主表全扫描。
 ALTER TABLE solana.hot_token_account_state
     ADD PROJECTION IF NOT EXISTS proj_by_pair
     (
