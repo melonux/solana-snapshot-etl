@@ -192,13 +192,14 @@ owner == SPL Token Program
     -> spl_token::state::Account/Mint::unpack
 
 owner == Token-2022 Program
-    -> spl_token_2022::state::Account/Mint::unpack
+    -> StateWithExtensions<Account/Mint>::unpack
+    -> read base balance/mint fields and TokenMetadata TLV (if present)
 
 owner == Metaplex Metadata Program
     -> Borsh deserialize Metadata
 ~~~
 
-SPL Token 和 Token-2022 的账户 data 不是通用 AppendVec 元数据，而是各自程序定义的二进制结构。必须先通过对应 crate 的 `unpack` 解析，再写入 ClickHouse 的业务字段。
+SPL Token 和 Token-2022 的账户 data 不是通用 AppendVec 元数据，而是各自程序定义的二进制结构。必须先通过对应 crate 的 `unpack` 解析，再写入 ClickHouse 的业务字段。Token-2022 的 Mint 和 Account 可带 TLV extension，不能以基础布局的固定长度（Mint 82 bytes、Account 165 bytes）作为是否解析的条件；基础字段应由 `StateWithExtensions` 的 `base` 读取。Mint 内嵌的 `TokenMetadata` extension 会填充同一份 raw metadata / hot token-info 链路。
 
 同理，Metaplex metadata 账户要按照其 Borsh 结构反序列化，不能把 data bytes 当成 SPL Token 数据。
 
