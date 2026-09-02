@@ -93,7 +93,7 @@ CREATE TABLE solana.hot_token_account_state
 )
 ENGINE = ReplacingMergeTree(updated_slot, is_deleted)
 ORDER BY pubkey
-SETTINGS storage_policy = 'hot_active_policy', deduplicate_merge_projection_mode = 'rebuild'
+SETTINGS storage_policy = 'hot_active_policy', deduplicate_merge_projection_mode = 'rebuild',index_granularity = 512
 COMMENT '冻结 hot mint 的 Token Account 最新态；is_deleted=1 为 CloseAccount 删除版本';
 
 -- L3 增量按 (mint, owner) 聚合。该 projection 按 pair 排序，避免每次
@@ -215,7 +215,7 @@ CREATE TABLE solana.hot_token_account_state_bak
 )
 ENGINE = ReplacingMergeTree(updated_slot, is_deleted)
 ORDER BY pubkey
-SETTINGS storage_policy = 'hot_backup_policy', deduplicate_merge_projection_mode = 'rebuild';
+SETTINGS storage_policy = 'hot_backup_policy', deduplicate_merge_projection_mode = 'rebuild', index_granularity = 512;
 
 ALTER TABLE solana.hot_token_account_state_bak
     ADD PROJECTION IF NOT EXISTS proj_by_pair
