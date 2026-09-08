@@ -20,7 +20,7 @@ hot_wallet_token_balance    <->            hot_wallet_token_balance_bak
 
 - `raw_account`：所有账户的轻量元信息；它提供 watcher 的 `max(updated_slot)` watermark。
 - `raw_token_mint`、`raw_token_metadata`：只保存本表组冻结 hot mint 的解析结果，用于 full 阶段构建 `hot_token_info`。
-- `hot_token_account_state`：L2，唯一的 hot Token Account 状态表。解析器直接写入；没有 `raw_token_account` 中转表。
+- `hot_token_account_state`：L2，唯一的 hot Token Account 状态表。新 full 基线仅保留正余额账户；后续 delta 保留零额覆盖版本。没有 `raw_token_account` 中转表。
 - `hot_wallet_token_balance`：L3，按 `(mint, owner)` 的聚合余额。
 - `hot_token_info`：L2 展示缓存，仅在 full 阶段构建，直到下一次组切换前保持不变。
 
@@ -41,8 +41,8 @@ hot_wallet_token_balance    <->            hot_wallet_token_balance_bak
 
 1. 停止目标组六张表的后台 Merge，清空目标组。
 2. snapshot 全局 hot mint 到内存集合和本地状态文件。
-3. 解析 archive：所有账户元信息进入 `raw_account`；只有 frozen hot mint 的 mint、metadata 和 Token Account 进入对应表。
-4. Token Account 直接写入 `hot_token_account_state`，带 `delegate`、`delegated_amount` 和 `close_authority`。
+3. 解析 archive：所有账户元信息进入 `raw_account`；只有 frozen hot mint 的 mint、metadata 和 Token Account 进入对应表。新 full 基线的 `amount = 0` Token Account 不写入 L2。
+4. 正余额 Token Account 直接写入 `hot_token_account_state`，带 `delegate`、`delegated_amount` 和 `close_authority`。
 5. 从 L2 构建整个 `hot_wallet_token_balance`；按内存集合分批查询本组 hot-only raw mint/metadata，构建 `hot_token_info`。
 6. 重启 Merge，并等待前后间隔 2 分钟的检测中该组每张表的活动 parts 数量保持不变，再接受它的增量。
 
@@ -51,7 +51,7 @@ Full archive 排除了历史 tombstone，因此它是新的当前态基线，不
 ### Incremental
 
 1. 各组独立使用自己的 `slot` watermark 选择/过滤 archive；active 不受 staging 水位影响。
-2. 解析到 live Token Account 时，只有 mint 在本组 frozen `HashSet` 中才向 L2 写入一条版本，并记录其 `(mint, owner)`。
+2. 解析到 live Token Account 时，只有 mint 在本组 frozen `HashSet` 中才向 L2 写入一条版本，并记录其 `(mint, owner)`；包括 `amount = 0`，使其能覆盖旧的正余额版本。
 3. canonical empty account 仅作为 CloseAccount 候选。程序按 pubkey 从同组 L2 `FINAL` 查询旧的 live mint/owner；找得到才追加一条带该 pair 的 tombstone。普通零 lamport 账户不会写入 L2。
 4. 对本批 live 行和 tombstone 的去重 `(mint, owner)` 集合，查询 L2 `FINAL` 聚合该 pair 的所有当前 Token Account，并向 L3 写入覆盖版本。未受影响 pair 不扫描、不重建。
 5. `hot_token_info` 不在 incremental 中重建。
@@ -74,7 +74,7 @@ staging slot ─ staging eligible incremental ─> staging slot'
 
 首次 cold start 时，active 先绑定并灌入一个 full，staging 为 `disabled`。后续发现的“新 full”按 `new_full_slot > active.full_slot` 判断，而**不是**与 `active.max_slot` 比较：active 即使已经通过增量推进得更远，仍可把该 full 的新尾段当作增量处理；staging 则绑定该 full 并从 slot 0 冷启动。
 
-这个新 full archive 只解压一次。程序先停止/清空 `_bak`，冻结新的 staging mint 集合，并捕获当时的 `active.max_slot`，再从 slot 0 顺序读取 AppendVec：每个 AppendVec 都写入 staging；仅 `append_vec.slot > captured_active_max_slot` 的同一份已解压数据额外写入 active。账户和 Token/metadata payload 在 worker 内只解析一次，但两路仍各自按自己冻结的 mint 集合决定是否写入 hot 表。active 的这部分保持 incremental 语义（仅刷新受影响的 L3，不重建 `hot_token_info`）；staging 保持 full 语义（构建完整 L2/L3 与 `hot_token_info`）。
+这个新 full archive 只解压一次。程序先停止/清空 `_bak`，冻结新的 staging mint 集合，并捕获当时的 `active.max_slot`，再从 slot 0 顺序读取 AppendVec：每个 AppendVec 都写入 staging；仅 `append_vec.slot > captured_active_max_slot` 的同一份已解压数据额外写入 active。账户和 Token/metadata payload 在 worker 内只解析一次，但两路仍各自按自己冻结的 mint 集合决定是否写入 hot 表。staging 是新 full 基线，跳过 `amount = 0` 的 live Token Account；active 的这部分保持 incremental 语义，必须保留零额行以覆盖旧余额（仅刷新受影响的 L3，不重建 `hot_token_info`）。
 
 ### Shared fanout 的稀疏 active INSERT
 

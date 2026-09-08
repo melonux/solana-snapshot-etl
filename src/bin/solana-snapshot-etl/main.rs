@@ -2501,6 +2501,10 @@ fn log_clickhouse_index_stats(stats: &crate::clickhouse::IndexStats) {
         stats.token_accounts_total
     );
     debug!(
+        "[clickhouse] Zero-balance token accounts omitted from a fresh full baseline: {}",
+        stats.zero_balance_token_accounts_omitted_from_full_baseline
+    );
+    debug!(
         "[clickhouse] Skipped {} append vec files",
         stats.skipped_append_vecs
     );

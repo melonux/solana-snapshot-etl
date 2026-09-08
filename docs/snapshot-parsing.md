@@ -237,7 +237,8 @@ executable = false
 ### 5.3 ClickHouse 表的最终版本设计
 
 `hot_token_account_state` 是唯一的 Token Account 状态表；解析器仅对本组冻结 hot mint
-直接写入该表，不再使用 `raw_token_account` 中转：
+直接写入该表，不再使用 `raw_token_account` 中转。新 full 基线会省略 `amount = 0` 的 live
+Token Account；incremental 保留零额版本以覆盖先前正余额：
 
 ~~~sql
 is_deleted   UInt8 DEFAULT 0
@@ -303,11 +304,11 @@ incremental snapshot。这样新库一定以完整基线开始；不传该参数
 由于 Agave 在归档 full snapshot 时使用 `TombstonesFilter::Exclude`，full archive
 不会包含需要传播的 tombstone。项目因此按 snapshot 类型选择入库路径：
 
-- **full**：直接把 AppendVec 中的 canonical 账户写入 `raw_account`；只有本组冻结 hot mint
-  的 Token Account、Mint 与 metadata 写入 L2 或 hot-only raw 表；不建立关闭账户候选集合；
-- **incremental**：收集 canonical empty 账户，按 pubkey 去重后在 L2 做 point lookup。只有
-  已存在的 hot Token Account 才追加携带原 mint/owner 的 `is_deleted=1` tombstone；不做 raw
-  历史扫描。
+- **full**：直接把 AppendVec 中的 canonical 账户写入 `raw_account`；本组冻结 hot mint 的
+  Mint 与 metadata 写入 hot-only raw 表，只有 `amount > 0` 的 Token Account 写入 L2；不建立关闭账户候选集合；
+- **incremental**：live Token Account 无论余额是否为零都写入 L2；同时收集 canonical empty
+  账户，按 pubkey 去重后在 L2 做 point lookup。只有已存在的 hot Token Account 才追加携带原
+  mint/owner 的 `is_deleted=1` tombstone；不做 raw 历史扫描。
 
 这不改变版本语义：`hot_token_account_state` 仍使用
 `ReplacingMergeTree(updated_slot, is_deleted)`，后续增量仍可覆盖 full 写入的行。对于已经有

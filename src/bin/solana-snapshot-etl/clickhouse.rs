@@ -167,11 +167,40 @@ impl SnapshotKind {
         matches!(self, Self::Incremental)
     }
 
+    fn zero_balance_token_account_policy(self) -> ZeroBalanceTokenAccountPolicy {
+        match self {
+            // A full import starts from an empty physical table. A live token
+            // account with no balance cannot contribute to its L3 balance
+            // baseline, so retaining it only makes L2 and its projections
+            // larger.
+            Self::Full => ZeroBalanceTokenAccountPolicy::ExcludeFromFullBaseline,
+            // An incremental zero is a meaningful version: it may supersede a
+            // previously positive account and must therefore reach L2.
+            Self::Incremental => ZeroBalanceTokenAccountPolicy::Retain,
+        }
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Full => "full",
             Self::Incremental => "incremental",
         }
+    }
+}
+
+/// Whether a live token-account row with `amount = 0` belongs in an L2 write.
+/// Tombstones do not use this policy; they are always retained separately.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ZeroBalanceTokenAccountPolicy {
+    /// A freshly cleared full-snapshot baseline keeps only positive balances.
+    ExcludeFromFullBaseline,
+    /// A delta must retain zero balances to supersede older positive versions.
+    Retain,
+}
+
+impl ZeroBalanceTokenAccountPolicy {
+    fn writes_live_amount(self, amount: u64) -> bool {
+        amount > 0 || matches!(self, Self::Retain)
     }
 }
 
@@ -275,6 +304,7 @@ fn format_duration(seconds: f64) -> String {
 pub(crate) struct IndexStats {
     pub(crate) accounts_total: u64,
     pub(crate) token_accounts_total: u64,
+    pub(crate) zero_balance_token_accounts_omitted_from_full_baseline: u64,
     pub(crate) skipped_append_vecs: u64,
     pub(crate) append_vecs_total: u64,
     pub(crate) nonempty_zero_account_append_vecs: u64,
@@ -608,6 +638,7 @@ impl ClickhouseIndexer {
     ) -> Result<IndexStats> {
         let collect_close_tombstones = snapshot_kind.collect_close_tombstones();
         let collect_affected_pairs = matches!(snapshot_kind, SnapshotKind::Incremental);
+        let zero_balance_token_account_policy = snapshot_kind.zero_balance_token_account_policy();
         let mut worker = Worker {
             sink: &mut self.sink,
             snapshot_slot: self.snapshot_slot,
@@ -625,6 +656,8 @@ impl ClickhouseIndexer {
             collect_affected_pairs,
             affected_pairs: HashSet::new(),
             hot_mints: Arc::clone(&self.hot_mints),
+            zero_balance_token_account_policy,
+            zero_balance_token_accounts_omitted_from_full_baseline: 0,
         };
         let mut skipped_append_vecs = 0;
         let mut append_vecs_total = 0;
@@ -657,6 +690,8 @@ impl ClickhouseIndexer {
         let token_2022_accounts_parsed = worker.token_2022_accounts_parsed;
         let token_2022_unexpected_size = worker.token_2022_unexpected_size;
         let token_2022_unpack_failed = worker.token_2022_unpack_failed;
+        let zero_balance_token_accounts_omitted_from_full_baseline =
+            worker.zero_balance_token_accounts_omitted_from_full_baseline;
         let closed_token_accounts = std::mem::take(&mut worker.closed_token_accounts);
         let mut affected_pairs = std::mem::take(&mut worker.affected_pairs);
         let token_account_close_candidates = if collect_close_tombstones {
@@ -699,6 +734,7 @@ impl ClickhouseIndexer {
         Ok(IndexStats {
             accounts_total: self.progress.accounts.get(),
             token_accounts_total: self.progress.tokens.get(),
+            zero_balance_token_accounts_omitted_from_full_baseline,
             skipped_append_vecs,
             append_vecs_total,
             nonempty_zero_account_append_vecs,
@@ -730,6 +766,7 @@ impl ClickhouseIndexer {
         let workers = workers.max(2);
         let collect_close_tombstones = snapshot_kind.collect_close_tombstones();
         let collect_affected_pairs = matches!(snapshot_kind, SnapshotKind::Incremental);
+        let zero_balance_token_account_policy = snapshot_kind.zero_balance_token_account_policy();
         // Keep at most one queued AppendVec per worker.  AppendVecs are
         // memory-mapped buffers and can be large, so an unbounded or oversized
         // queue would trade the CPU win for avoidable memory pressure.
@@ -751,6 +788,7 @@ impl ClickhouseIndexer {
             let insert_gate = Arc::clone(&insert_gate);
             let cancelled = Arc::clone(&cancelled);
             let hot_mints = Arc::clone(&self.hot_mints);
+            let zero_balance_token_account_policy = zero_balance_token_account_policy;
             handles.push(thread::spawn(move || {
                 debug!("[clickhouse] Worker {worker_index} thread started");
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -788,6 +826,8 @@ impl ClickhouseIndexer {
                         collect_affected_pairs,
                         affected_pairs: HashSet::new(),
                         hot_mints,
+                        zero_balance_token_account_policy,
+                        zero_balance_token_accounts_omitted_from_full_baseline: 0,
                     };
                     let mut append_vecs_total = 0;
                     let mut nonempty_zero_account_append_vecs = 0;
@@ -863,6 +903,8 @@ impl ClickhouseIndexer {
                     let token_2022_accounts_parsed = worker.token_2022_accounts_parsed;
                     let token_2022_unexpected_size = worker.token_2022_unexpected_size;
                     let token_2022_unpack_failed = worker.token_2022_unpack_failed;
+                    let zero_balance_token_accounts_omitted_from_full_baseline =
+                        worker.zero_balance_token_accounts_omitted_from_full_baseline;
                     let closed_token_accounts = std::mem::take(&mut worker.closed_token_accounts);
                     let affected_pairs = std::mem::take(&mut worker.affected_pairs);
                     drop(worker);
@@ -880,6 +922,7 @@ impl ClickhouseIndexer {
                     Ok(ParallelWorkerStats {
                         append_vecs_total,
                         nonempty_zero_account_append_vecs,
+                        zero_balance_token_accounts_omitted_from_full_baseline,
                         spl_token_owner_accounts_seen,
                         spl_token_accounts_parsed,
                         spl_token_unexpected_size,
@@ -1004,6 +1047,8 @@ impl ClickhouseIndexer {
         Ok(IndexStats {
             accounts_total: self.progress.accounts.get(),
             token_accounts_total: self.progress.tokens.get(),
+            zero_balance_token_accounts_omitted_from_full_baseline: totals
+                .zero_balance_token_accounts_omitted_from_full_baseline,
             skipped_append_vecs,
             append_vecs_total: totals.append_vecs_total,
             nonempty_zero_account_append_vecs: totals.nonempty_zero_account_append_vecs,
@@ -1346,6 +1391,8 @@ pub(crate) async fn import_full_snapshot_fanout(
     Ok(IndexStats {
         accounts_total: progress.accounts.get(),
         token_accounts_total: progress.tokens.get(),
+        zero_balance_token_accounts_omitted_from_full_baseline: totals
+            .zero_balance_token_accounts_omitted_from_full_baseline,
         skipped_append_vecs,
         append_vecs_total: totals.append_vecs_total,
         nonempty_zero_account_append_vecs: totals.nonempty_zero_account_append_vecs,
@@ -3301,6 +3348,8 @@ struct Worker<'a> {
     collect_affected_pairs: bool,
     affected_pairs: HashSet<TokenPair>,
     hot_mints: HotMintSet,
+    zero_balance_token_account_policy: ZeroBalanceTokenAccountPolicy,
+    zero_balance_token_accounts_omitted_from_full_baseline: u64,
 }
 
 /// Per-parser state for the one-stream full-snapshot fanout.  Unlike two
@@ -3549,8 +3598,18 @@ impl FullFanoutWorker {
         state: u8,
         close_authority: Option<String>,
     ) -> Result<()> {
-        let write_staging = self.staging_hot_mints.contains(&mint);
+        let mut write_staging = self.staging_hot_mints.contains(&mint);
         let write_active = write_active && self.active_hot_mints.contains(&mint);
+        // Staging is a freshly cleared full baseline, so its L2 needs only
+        // positive balances. The active branch is a delta tail and must keep
+        // a zero version to supersede an older positive account.
+        if write_staging
+            && !ZeroBalanceTokenAccountPolicy::ExcludeFromFullBaseline.writes_live_amount(amount)
+        {
+            write_staging = false;
+            self.stats
+                .zero_balance_token_accounts_omitted_from_full_baseline += 1;
+        }
         if !write_staging && !write_active {
             return Ok(());
         }
@@ -3736,6 +3795,7 @@ impl FullFanoutWorker {
 struct ParallelWorkerStats {
     append_vecs_total: u64,
     nonempty_zero_account_append_vecs: u64,
+    zero_balance_token_accounts_omitted_from_full_baseline: u64,
     spl_token_owner_accounts_seen: u64,
     spl_token_accounts_parsed: u64,
     spl_token_unexpected_size: u64,
@@ -3752,6 +3812,8 @@ impl ParallelWorkerStats {
     fn merge(&mut self, other: Self) {
         self.append_vecs_total += other.append_vecs_total;
         self.nonempty_zero_account_append_vecs += other.nonempty_zero_account_append_vecs;
+        self.zero_balance_token_accounts_omitted_from_full_baseline +=
+            other.zero_balance_token_accounts_omitted_from_full_baseline;
         self.spl_token_owner_accounts_seen += other.spl_token_owner_accounts_seen;
         self.spl_token_accounts_parsed += other.spl_token_accounts_parsed;
         self.spl_token_unexpected_size += other.spl_token_unexpected_size;
@@ -3860,24 +3922,18 @@ impl<'a> Worker<'a> {
                         let mint = pubkey_string(token_account.mint);
                         let owner = pubkey_string(token_account.owner);
                         if self.hot_mints.contains(&mint) {
-                            self.remember_affected_pair(&mint, &owner);
-                            self.sink
-                                .write_token_account(&TokenAccountRow {
-                                    pubkey: pubkey_string(account.meta.pubkey),
-                                    mint,
-                                    owner,
-                                    amount: token_account.amount,
-                                    delegate: token_account.delegate.map(pubkey_string).into(),
-                                    delegated_amount: token_account.delegated_amount,
-                                    state: token_account.state as u8,
-                                    close_authority: token_account
-                                        .close_authority
-                                        .map(pubkey_string)
-                                        .into(),
-                                    is_deleted: 0,
-                                    updated_slot: account_slot,
-                                })
-                                .await?;
+                            self.write_hot_token_account_row(
+                                account,
+                                account_slot,
+                                mint,
+                                owner,
+                                token_account.amount,
+                                token_account.delegate.map(pubkey_string).into(),
+                                token_account.delegated_amount,
+                                token_account.state as u8,
+                                token_account.close_authority.map(pubkey_string).into(),
+                            )
+                            .await?;
                         }
                         self.spl_token_accounts_parsed += 1;
                         self.progress.tokens.inc();
@@ -3928,24 +3984,18 @@ impl<'a> Worker<'a> {
                 let mint = pubkey_string(token_account.mint);
                 let owner = pubkey_string(token_account.owner);
                 if self.hot_mints.contains(&mint) {
-                    self.remember_affected_pair(&mint, &owner);
-                    self.sink
-                        .write_token_account(&TokenAccountRow {
-                            pubkey: pubkey_string(account.meta.pubkey),
-                            mint,
-                            owner,
-                            amount: token_account.amount,
-                            delegate: token_account.delegate.map(pubkey_string).into(),
-                            delegated_amount: token_account.delegated_amount,
-                            state: token_account.state as u8,
-                            close_authority: token_account
-                                .close_authority
-                                .map(pubkey_string)
-                                .into(),
-                            is_deleted: 0,
-                            updated_slot: account_slot,
-                        })
-                        .await?;
+                    self.write_hot_token_account_row(
+                        account,
+                        account_slot,
+                        mint,
+                        owner,
+                        token_account.amount,
+                        token_account.delegate.map(pubkey_string).into(),
+                        token_account.delegated_amount,
+                        token_account.state as u8,
+                        token_account.close_authority.map(pubkey_string).into(),
+                    )
+                    .await?;
                 }
                 self.token_2022_accounts_parsed += 1;
                 self.progress.tokens.inc();
@@ -3991,6 +4041,45 @@ impl<'a> Worker<'a> {
             },
         }
 
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_hot_token_account_row(
+        &mut self,
+        account: &StoredAccountMeta<'_>,
+        account_slot: u64,
+        mint: String,
+        owner: String,
+        amount: u64,
+        delegate: Option<String>,
+        delegated_amount: u64,
+        state: u8,
+        close_authority: Option<String>,
+    ) -> Result<()> {
+        if !self
+            .zero_balance_token_account_policy
+            .writes_live_amount(amount)
+        {
+            self.zero_balance_token_accounts_omitted_from_full_baseline += 1;
+            return Ok(());
+        }
+
+        self.remember_affected_pair(&mint, &owner);
+        self.sink
+            .write_token_account(&TokenAccountRow {
+                pubkey: pubkey_string(account.meta.pubkey),
+                mint,
+                owner,
+                amount,
+                delegate,
+                delegated_amount,
+                state,
+                close_authority,
+                is_deleted: 0,
+                updated_slot: account_slot,
+            })
+            .await?;
         Ok(())
     }
 
@@ -4548,6 +4637,17 @@ mod tests {
     fn only_incremental_archives_collect_close_tombstones() {
         assert!(!SnapshotKind::Full.collect_close_tombstones());
         assert!(SnapshotKind::Incremental.collect_close_tombstones());
+    }
+
+    #[test]
+    fn full_baseline_omits_zero_balance_but_delta_retains_it() {
+        let full_policy = SnapshotKind::Full.zero_balance_token_account_policy();
+        let delta_policy = SnapshotKind::Incremental.zero_balance_token_account_policy();
+
+        assert!(!full_policy.writes_live_amount(0));
+        assert!(full_policy.writes_live_amount(1));
+        assert!(delta_policy.writes_live_amount(0));
+        assert!(delta_policy.writes_live_amount(1));
     }
 
     #[test]
