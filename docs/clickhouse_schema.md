@@ -93,7 +93,7 @@ CREATE TABLE solana.hot_token_account_state
 )
 ENGINE = ReplacingMergeTree(updated_slot, is_deleted)
 ORDER BY pubkey
-SETTINGS storage_policy = 'hot_active_policy', deduplicate_merge_projection_mode = 'rebuild',index_granularity = 512
+SETTINGS storage_policy = 'hot_active_policy', deduplicate_merge_projection_mode = 'rebuild'
 COMMENT '冻结 hot mint 的 Token Account 状态：full 基线仅正余额，delta 零额行覆盖旧余额；is_deleted=1 为 CloseAccount 删除版本';
 
 -- L3 增量按 (mint, owner) 聚合。该 projection 按 pair 排序，避免每次
@@ -215,7 +215,7 @@ CREATE TABLE solana.hot_token_account_state_bak
 )
 ENGINE = ReplacingMergeTree(updated_slot, is_deleted)
 ORDER BY pubkey
-SETTINGS storage_policy = 'hot_backup_policy', deduplicate_merge_projection_mode = 'rebuild', index_granularity = 512;
+SETTINGS storage_policy = 'hot_backup_policy', deduplicate_merge_projection_mode = 'rebuild';
 
 ALTER TABLE solana.hot_token_account_state_bak
     ADD PROJECTION IF NOT EXISTS proj_by_pair
@@ -265,32 +265,3 @@ CREATE TABLE solana.hot_token_info_bak
 ENGINE = ReplacingMergeTree(updated_slot)
 ORDER BY mint
 SETTINGS storage_policy = 'hot_backup_policy';
-
--- ============================================================
--- 从旧 raw_token_account 架构升级
--- ============================================================
--- 先停止所有旧/新 watcher。以下 ALTER 让现有 L2 接受新直写行；随后必须
--- 用 --bootstrap 导入一次 full snapshot，建立 filter、清理非-hot mint/meta
--- 并以新规则重建 active L2/L3。不要以普通续传模式跳过这一步。
-
-ALTER TABLE solana.hot_token_account_state
-    ADD COLUMN IF NOT EXISTS delegate Nullable(String) AFTER amount;
-ALTER TABLE solana.hot_token_account_state
-    ADD COLUMN IF NOT EXISTS delegated_amount UInt64 DEFAULT 0 AFTER delegate;
-ALTER TABLE solana.hot_token_account_state
-    ADD COLUMN IF NOT EXISTS close_authority Nullable(String) AFTER state;
-
-ALTER TABLE solana.hot_token_account_state_bak
-    ADD COLUMN IF NOT EXISTS delegate Nullable(String) AFTER amount;
-ALTER TABLE solana.hot_token_account_state_bak
-    ADD COLUMN IF NOT EXISTS delegated_amount UInt64 DEFAULT 0 AFTER delegate;
-ALTER TABLE solana.hot_token_account_state_bak
-    ADD COLUMN IF NOT EXISTS close_authority Nullable(String) AFTER state;
-
--- 新的 bootstrap 成功并确认不再运行旧程序时，删除原 L1 中转表以释放其磁盘空间：
--- DROP TABLE solana.raw_token_account SETTINGS max_table_size_to_drop = 0;
--- DROP TABLE solana.raw_token_account_bak SETTINGS max_table_size_to_drop = 0;
--- 新版本已稳定运行、且不再需要旧二进制回退时，也可删除废弃的控制/filter 表：
--- DROP TABLE solana.hot_token_filter SETTINGS max_table_size_to_drop = 0;
--- DROP TABLE solana.hot_token_filter_bak SETTINGS max_table_size_to_drop = 0;
--- DROP TABLE solana.hot_index_control SETTINGS max_table_size_to_drop = 0;
