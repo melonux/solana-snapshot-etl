@@ -39,8 +39,18 @@ CREATE TABLE solana.raw_account
 )
 ENGINE = ReplacingMergeTree(updated_slot)
 ORDER BY (owner, pubkey)
-SETTINGS storage_policy = 'hot_active_policy'
+SETTINGS storage_policy = 'hot_active_policy', deduplicate_merge_projection_mode = 'rebuild'
 COMMENT '账户元信息和 watcher watermark 来源；不保存 account data';
+
+ALTER TABLE raw_account
+ADD PROJECTION prj_by_pubkey
+(
+    SELECT *
+    ORDER BY pubkey
+);
+
+ALTER TABLE raw_account
+MATERIALIZE PROJECTION prj_by_pubkey;
 
 -- 只保存本组冻结 hot mint 的 Mint 账户。它不再是全链 token mint 历史表。
 CREATE TABLE solana.raw_token_mint
@@ -167,7 +177,18 @@ CREATE TABLE solana.raw_account_bak
 )
 ENGINE = ReplacingMergeTree(updated_slot)
 ORDER BY (owner, pubkey)
-SETTINGS storage_policy = 'hot_backup_policy';
+SETTINGS storage_policy = 'hot_backup_policy', deduplicate_merge_projection_mode = 'rebuild';
+
+ALTER TABLE raw_account_bak
+ADD PROJECTION prj_by_pubkey
+(
+    SELECT *
+    ORDER BY pubkey
+);
+
+ALTER TABLE raw_account_bak
+MATERIALIZE PROJECTION prj_by_pubkey;
+
 
 CREATE TABLE solana.raw_token_mint_bak
 (
