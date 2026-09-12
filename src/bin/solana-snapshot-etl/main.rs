@@ -58,7 +58,7 @@ struct Args {
     #[clap(
         long,
         action,
-        help = "Start from slot 0 and require a full snapshot before applying incremental snapshots"
+        help = "Build a fresh staging generation from slot 0, keep active serving, and require a full snapshot before cutover"
     )]
     bootstrap: bool,
     #[clap(
@@ -1148,6 +1148,14 @@ impl LaneWatcherState {
 }
 
 impl WatcherState {
+    /// Start a replacement generation while retaining the physical active
+    /// tables.  The old active generation has no trusted full-generation
+    /// boundary after an explicit bootstrap reset, so leave `full_snapshot`
+    /// empty: the next available full is deliberately eligible for staging.
+    fn bootstrap_preserving_active(max_slot: u64) -> Self {
+        Self::recovered_active_only(max_slot)
+    }
+
     fn bootstrap_waiting_for_full() -> Self {
         Self {
             version: WATCHER_STATE_VERSION,
@@ -1887,13 +1895,14 @@ fn run_incremental_snapshots(
     let state_path = watcher_state_path()?;
     let mut watcher_state = if args.bootstrap {
         let existing_max_slot = output.max_raw_account_updated_slot()?;
-        let state = WatcherState::bootstrap_waiting_for_full();
-        // `--bootstrap` is an explicit reset. Commit that fact before the
-        // first destructive ClickHouse action, not after the full succeeds.
+        let state = WatcherState::bootstrap_preserving_active(existing_max_slot);
+        // `--bootstrap` is an explicit generation reset. Commit it before
+        // staging is rebuilt, while deliberately leaving the active physical
+        // group available to readers until cutover succeeds.
         persist_watcher_state(&state_path, &state)?;
         let removed_hot_mints = cleanup_unused_frozen_hot_mints(&state_path, &state)?;
         info!(
-            "[watcher] bootstrap 已重置状态文件并清理 {} 个本地 hot-mint 文件：旧 active max_slot={} 将被忽略，等待新的 active full",
+            "[watcher] bootstrap 已重置状态文件并清理 {} 个本地 hot-mint 文件：保留 active max_slot={} 继续服务，等待新的 staging full",
             removed_hot_mints,
             existing_max_slot,
         );
@@ -2757,6 +2766,18 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert!(matches!(&candidates[0], WatchedSnapshot::Full(_)));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_keeps_active_ready_and_rebuilds_staging() {
+        let state = WatcherState::bootstrap_preserving_active(443_150_000);
+
+        assert_eq!(state.active.phase, LanePhase::Ready);
+        assert_eq!(state.active.max_slot, Some(443_150_000));
+        assert_eq!(state.active.full_snapshot, None);
+        assert_eq!(state.staging, LaneWatcherState::disabled());
+        assert_eq!(state.cutover, None);
+        assert_eq!(state.shared_full_load, None);
     }
 
     #[test]

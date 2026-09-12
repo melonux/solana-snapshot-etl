@@ -276,9 +276,10 @@ WHERE is_deleted = 0;
 append_vec.slot() > resume_slot
 ~~~
 
-传入 `--bootstrap` 时，恢复 slot 固定为 0，且必须先成功导入一个 full snapshot，之后才允许处理
-incremental snapshot。这样新库一定以完整基线开始；不传该参数时则使用数据库水位线回退后的结果，
-让回退范围内的 slot 数据可重复写入以覆盖可能的边界遗漏。
+传入 `--bootstrap` 时，新的 staging 组从 slot 0 导入一个 full snapshot；原 active 组保留其
+当前数据和水位，继续供下游查询。staging 完成 full、合并稳定及首个适用 incremental 后，才交换
+active/staging。这样既能用完整基线重建新代际，也不会让已有 active 查询短暂变为空；不传该参数时
+则使用数据库水位线回退后的结果，让回退范围内的 slot 数据可重复写入以覆盖可能的边界遗漏。
 
 首次启动时如果找不到能够推进恢复 slot 的合适快照，程序直接报错退出；如果最早的增量包
 `base_slot` 高于恢复 slot 且没有可桥接的 full snapshot，也视为 slot 断档。首次成功入库后，

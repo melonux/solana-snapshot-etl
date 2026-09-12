@@ -90,8 +90,10 @@ solana-snapshot-etl \
   --clickhouse
 ```
 
-For a new database, add `--bootstrap`. It starts at slot 0 and requires a usable full snapshot; no
-incremental snapshot is applied until that full snapshot has been imported.
+For a new database, add `--bootstrap`. It builds a staging (`_bak`) generation from slot 0 and
+requires a usable full snapshot. If active already contains data, it remains queryable while
+staging imports the full snapshot and its first eligible incremental; only then are the two groups
+exchanged.
 
 ```shell
 solana-snapshot-etl \
@@ -168,8 +170,9 @@ tables. `solana-snapshot-etl-state.json` in the working directory records each l
 in-flight incremental archive path or slot: after a restart, the watcher selects the currently
 available highest-slot archive that can continue from `max_slot`. A shared full fanout still records
 its fixed full archive and captured active watermark. `--bootstrap` resets that file and removes all
-generated local frozen hot-mint files before it starts clearing/loading active; a non-bootstrap
-restart resumes the recorded work. For an interrupted six-pair exchange, the state also records
+generated local frozen hot-mint files before it rebuilds staging; it leaves the active physical
+tables in place until the normal cutover completes. A non-bootstrap restart resumes the recorded
+work. For an interrupted six-pair exchange, the state also records
 table UUIDs, so restart exchanges only pairs that did not already complete.
 
 If direct L2 import has succeeded but the derived L3/token-info refresh failed, rebuild those
@@ -196,8 +199,8 @@ solana-snapshot-etl snapshot-139240745-*.tar.zst --clickhouse
 
 When that source is a full snapshot, this single-shot command treats it as a
 fresh active baseline: it pauses active merges and resets the six active
-tables before import. Use watch mode with `--bootstrap` for the same explicit
-first-load behavior.
+tables before import. Watch mode with `--bootstrap` instead uses the safer
+staging-and-cutover path, so existing active queries remain available.
 
 By default logs are written to stderr. Pass `--log-file` to write timestamped ETL logs to a file;
 the file is truncated when the process starts, and the terminal remains available for progress bars:
