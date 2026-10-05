@@ -18,7 +18,7 @@ The goal of this fork is to keep the ETL workflow usable with modern Solana/Agav
 ### Key changes in this fork
 
 - Updated AppendVec account layout parsing for modern snapshots.
-- Added Token-2022 account decoding support (account, mint, multisig) in ClickHouse output.
+- Added Token-2022 account decoding support, including selected Mint extensions as JSON in ClickHouse output.
 - Added parser diagnostics and compatibility counters in ClickHouse summary logs.
 - Added unpacked snapshot progress logging with total files and percentage processed.
 - Added parallel AppendVec parsing and ClickHouse insertion.

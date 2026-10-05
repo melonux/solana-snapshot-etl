@@ -67,7 +67,8 @@ ENGINE = ReplacingMergeTree(updated_slot)
 ORDER BY mint
 SETTINGS storage_policy = 'hot_active_policy';
 
--- 只保存本组冻结 hot mint 的 Metaplex metadata。
+-- 只保存本组冻结 hot mint 的 Metaplex / Token-2022 metadata；extensions
+-- 为 RPC 风格的 Token-2022 Mint extension JSON 数组，非 Token-2022 默认为 []。
 CREATE TABLE solana.raw_token_metadata
 (
     mint                    String,
@@ -79,6 +80,7 @@ CREATE TABLE solana.raw_token_metadata
     token_standard          Nullable(UInt8),
     seller_fee_basis_points UInt16,
     creators                Array(String),
+    extensions              String DEFAULT '[]',
     updated_slot            UInt64
 )
 ENGINE = ReplacingMergeTree(updated_slot)
@@ -152,6 +154,7 @@ CREATE TABLE solana.hot_token_info
     symbol                String,
     uri                   String,
     token_standard        Nullable(UInt8),
+    extensions            String DEFAULT '[]',
     mint_updated_slot     UInt64,
     metadata_updated_slot UInt64,
     updated_slot          UInt64
@@ -215,6 +218,7 @@ CREATE TABLE solana.raw_token_metadata_bak
     token_standard          Nullable(UInt8),
     seller_fee_basis_points UInt16,
     creators                Array(String),
+    extensions              String DEFAULT '[]',
     updated_slot            UInt64
 )
 ENGINE = ReplacingMergeTree(updated_slot)
@@ -279,6 +283,7 @@ CREATE TABLE solana.hot_token_info_bak
     symbol                String,
     uri                   String,
     token_standard        Nullable(UInt8),
+    extensions            String DEFAULT '[]',
     mint_updated_slot     UInt64,
     metadata_updated_slot UInt64,
     updated_slot          UInt64
@@ -286,3 +291,21 @@ CREATE TABLE solana.hot_token_info_bak
 ENGINE = ReplacingMergeTree(updated_slot)
 ORDER BY mint
 SETTINGS storage_policy = 'hot_backup_policy';
+
+-- ============================================================
+-- 已有部署升级：在启动要求新 schema 的程序前执行。
+-- 四张表必须一起升级，以保持 active/_bak 可安全 EXCHANGE。
+-- DEFAULT '[]' 会让历史行和非 Token-2022 metadata 自动读取为空数组。
+-- ============================================================
+
+ALTER TABLE solana.raw_token_metadata
+    ADD COLUMN IF NOT EXISTS extensions String DEFAULT '[]' AFTER creators;
+
+ALTER TABLE solana.raw_token_metadata_bak
+    ADD COLUMN IF NOT EXISTS extensions String DEFAULT '[]' AFTER creators;
+
+ALTER TABLE solana.hot_token_info
+    ADD COLUMN IF NOT EXISTS extensions String DEFAULT '[]' AFTER token_standard;
+
+ALTER TABLE solana.hot_token_info_bak
+    ADD COLUMN IF NOT EXISTS extensions String DEFAULT '[]' AFTER token_standard;

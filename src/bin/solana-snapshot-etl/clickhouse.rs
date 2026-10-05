@@ -5,6 +5,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::{debug, error, info, warn};
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use solana_sdk::program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
 use solana_snapshot_etl::append_vec::{AppendVec, StoredAccountMeta};
@@ -12,7 +13,7 @@ use solana_snapshot_etl::{append_vec_accounts, AppendVecIterator};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -405,7 +406,7 @@ struct TokenMintRow {
     updated_slot: u64,
 }
 
-#[derive(Row, Serialize)]
+#[derive(Clone, Deserialize, Row, Serialize)]
 struct TokenMetadataRow {
     mint: String,
     name: String,
@@ -416,6 +417,7 @@ struct TokenMetadataRow {
     token_standard: Option<u8>,
     seller_fee_basis_points: u16,
     creators: Vec<String>,
+    extensions: String,
     updated_slot: u64,
 }
 
@@ -426,6 +428,13 @@ struct TokenMetadataRow {
 // intentionally pinned to the Solana 1.11 dependency family, while modern
 // TokenMetadata crates use newer, incompatible Solana public-key types.
 const TOKEN_2022_TLV_START: usize = spl_token_2022::state::Account::LEN + 1;
+const TOKEN_2022_TRANSFER_FEE_CONFIG_EXTENSION_TYPE: u16 = 1;
+const TOKEN_2022_MINT_CLOSE_AUTHORITY_EXTENSION_TYPE: u16 = 3;
+const TOKEN_2022_DEFAULT_ACCOUNT_STATE_EXTENSION_TYPE: u16 = 6;
+const TOKEN_2022_NON_TRANSFERABLE_EXTENSION_TYPE: u16 = 9;
+const TOKEN_2022_PERMANENT_DELEGATE_EXTENSION_TYPE: u16 = 12;
+const TOKEN_2022_TRANSFER_HOOK_EXTENSION_TYPE: u16 = 14;
+const TOKEN_2022_METADATA_POINTER_EXTENSION_TYPE: u16 = 18;
 const TOKEN_2022_METADATA_EXTENSION_TYPE: u16 = 19;
 
 enum Token2022BaseState {
@@ -433,12 +442,129 @@ enum Token2022BaseState {
     Mint(spl_token_2022::state::Mint),
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct Token2022Metadata {
     update_authority: Option<Pubkey>,
     mint: Pubkey,
     name: String,
     symbol: String,
     uri: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+struct TokenMetadataFields {
+    name: String,
+    symbol: String,
+    uri: String,
+    update_authority: String,
+    is_mutable: bool,
+    token_standard: Option<u8>,
+    seller_fee_basis_points: u16,
+    creators: Vec<String>,
+}
+
+impl TokenMetadataFields {
+    fn from_row(row: &TokenMetadataRow) -> Self {
+        Self {
+            name: row.name.clone(),
+            symbol: row.symbol.clone(),
+            uri: row.uri.clone(),
+            update_authority: row.update_authority.clone(),
+            is_mutable: row.is_mutable,
+            token_standard: row.token_standard,
+            seller_fee_basis_points: row.seller_fee_basis_points,
+            creators: row.creators.clone(),
+        }
+    }
+
+    fn into_row(self, mint: String, extensions: String, updated_slot: u64) -> TokenMetadataRow {
+        TokenMetadataRow {
+            mint,
+            name: self.name,
+            symbol: self.symbol,
+            uri: self.uri,
+            update_authority: self.update_authority,
+            is_mutable: self.is_mutable,
+            token_standard: self.token_standard,
+            seller_fee_basis_points: self.seller_fee_basis_points,
+            creators: self.creators,
+            extensions,
+            updated_slot,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum MetadataSource {
+    Metaplex,
+    Token2022Standalone,
+    Token2022Embedded,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct VersionedMetadataFields {
+    account_slot: u64,
+    source: MetadataSource,
+    source_account: String,
+    fields: TokenMetadataFields,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct VersionedExtensions {
+    account_slot: u64,
+    json: String,
+}
+
+#[derive(Default)]
+struct MetadataPatch {
+    fields: Option<VersionedMetadataFields>,
+    extensions: Option<VersionedExtensions>,
+}
+
+type SharedMetadataPatches = Arc<Mutex<HashMap<String, MetadataPatch>>>;
+
+fn record_metadata_fields(
+    patches: &SharedMetadataPatches,
+    mint: String,
+    candidate: VersionedMetadataFields,
+) {
+    let mut patches = patches
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let patch = patches.entry(mint).or_default();
+    if patch
+        .fields
+        .as_ref()
+        .map(|current| candidate > *current)
+        .unwrap_or(true)
+    {
+        patch.fields = Some(candidate);
+    }
+}
+
+fn record_extensions(
+    patches: &SharedMetadataPatches,
+    mint: String,
+    candidate: VersionedExtensions,
+) {
+    let mut patches = patches
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let patch = patches.entry(mint).or_default();
+    if patch
+        .extensions
+        .as_ref()
+        .map(|current| candidate > *current)
+        .unwrap_or(true)
+    {
+        patch.extensions = Some(candidate);
+    }
+}
+
+struct ParsedToken2022MintExtensions {
+    json: String,
+    token_metadata: Option<Token2022Metadata>,
+    warnings: Vec<String>,
 }
 
 struct Token2022MetadataReader<'a> {
@@ -541,57 +667,245 @@ fn parse_token_2022_metadata_value(
     })
 }
 
-fn parse_token_2022_mint_metadata(
-    data: &[u8],
-) -> std::result::Result<Option<Token2022Metadata>, &'static str> {
-    if data.len() <= TOKEN_2022_TLV_START {
-        return Ok(None);
-    }
-
-    let mut offset = TOKEN_2022_TLV_START;
-    while offset < data.len() {
-        let header = data
-            .get(offset..offset.saturating_add(4))
-            .ok_or("truncated Token-2022 extension header")?;
-        let extension_type = u16::from_le_bytes([header[0], header[1]]);
-        if extension_type == 0 {
-            return Ok(None);
-        }
-        let value_len = usize::from(u16::from_le_bytes([header[2], header[3]]));
-        let value_start = offset
-            .checked_add(4)
-            .ok_or("Token-2022 extension offset overflow")?;
-        let value_end = value_start
-            .checked_add(value_len)
-            .ok_or("Token-2022 extension length overflow")?;
-        let value = data
-            .get(value_start..value_end)
-            .ok_or("truncated Token-2022 extension value")?;
-        if extension_type == TOKEN_2022_METADATA_EXTENSION_TYPE {
-            return parse_token_2022_metadata_value(value).map(Some);
-        }
-        offset = value_end;
-    }
-    Ok(None)
-}
-
-fn token_2022_metadata_row(metadata: Token2022Metadata, updated_slot: u64) -> TokenMetadataRow {
-    let is_mutable = metadata.update_authority.is_some();
-    TokenMetadataRow {
-        mint: pubkey_string(metadata.mint),
-        name: metadata.name,
-        symbol: metadata.symbol,
-        uri: metadata.uri,
+fn token_2022_metadata_fields(metadata: &Token2022Metadata) -> TokenMetadataFields {
+    TokenMetadataFields {
+        name: metadata.name.clone(),
+        symbol: metadata.symbol.clone(),
+        uri: metadata.uri.clone(),
         update_authority: metadata
             .update_authority
             .map(pubkey_string)
             .unwrap_or_default(),
-        is_mutable,
+        is_mutable: metadata.update_authority.is_some(),
         token_standard: None,
         seller_fee_basis_points: 0,
         creators: vec![],
-        updated_slot,
     }
+}
+
+fn extension_exact_len(value: &[u8], expected: usize) -> std::result::Result<&[u8], &'static str> {
+    if value.len() == expected {
+        Ok(value)
+    } else {
+        Err("invalid Token-2022 extension length")
+    }
+}
+
+fn extension_u64(value: &[u8], offset: usize) -> std::result::Result<u64, &'static str> {
+    let bytes: [u8; 8] = value
+        .get(offset..offset.saturating_add(8))
+        .ok_or("truncated Token-2022 extension integer")?
+        .try_into()
+        .map_err(|_| "invalid Token-2022 extension integer")?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn extension_u16(value: &[u8], offset: usize) -> std::result::Result<u16, &'static str> {
+    let bytes: [u8; 2] = value
+        .get(offset..offset.saturating_add(2))
+        .ok_or("truncated Token-2022 extension integer")?
+        .try_into()
+        .map_err(|_| "invalid Token-2022 extension integer")?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn extension_optional_pubkey(
+    value: &[u8],
+    offset: usize,
+) -> std::result::Result<Option<String>, &'static str> {
+    let bytes: [u8; 32] = value
+        .get(offset..offset.saturating_add(32))
+        .ok_or("truncated Token-2022 extension public key")?
+        .try_into()
+        .map_err(|_| "invalid Token-2022 extension public key")?;
+    if bytes == [0; 32] {
+        Ok(None)
+    } else {
+        Ok(Some(pubkey_string(Pubkey::new_from_array(bytes))))
+    }
+}
+
+fn parse_token_2022_extension(
+    extension_type: u16,
+    value: &[u8],
+) -> std::result::Result<(Value, Option<Token2022Metadata>), &'static str> {
+    match extension_type {
+        TOKEN_2022_TRANSFER_FEE_CONFIG_EXTENSION_TYPE => {
+            let value = extension_exact_len(value, 108)?;
+            let authority = extension_optional_pubkey(value, 0)?;
+            let older_epoch = extension_u64(value, 72)?;
+            let older_maximum_fee = extension_u64(value, 80)?;
+            let older_basis_points = extension_u16(value, 88)?;
+            let newer_maximum_fee = extension_u64(value, 98)?;
+            let newer_basis_points = extension_u16(value, 106)?;
+            Ok((
+                json!({
+                    "extension": "transferFeeConfig",
+                    "state": {
+                        "transferFeeConfigAuthority": authority,
+                        "newerTransferFee": {
+                            "transferFeeBasisPoints": newer_basis_points,
+                            "maximumFee": newer_maximum_fee
+                        },
+                        "olderTransferFee": {
+                            "epoch": older_epoch,
+                            "transferFeeBasisPoints": older_basis_points,
+                            "maximumFee": older_maximum_fee
+                        }
+                    }
+                }),
+                None,
+            ))
+        }
+        TOKEN_2022_DEFAULT_ACCOUNT_STATE_EXTENSION_TYPE => {
+            let value = extension_exact_len(value, 1)?;
+            let account_state = match value[0] {
+                0 => "uninitialized",
+                1 => "initialized",
+                2 => "frozen",
+                _ => return Err("invalid Token-2022 default account state"),
+            };
+            Ok((
+                json!({
+                    "extension": "defaultAccountState",
+                    "state": { "accountState": account_state }
+                }),
+                None,
+            ))
+        }
+        TOKEN_2022_NON_TRANSFERABLE_EXTENSION_TYPE => {
+            extension_exact_len(value, 0)?;
+            Ok((json!({ "extension": "nonTransferable", "state": {} }), None))
+        }
+        TOKEN_2022_TRANSFER_HOOK_EXTENSION_TYPE => {
+            let value = extension_exact_len(value, 64)?;
+            Ok((
+                json!({
+                    "extension": "transferHook",
+                    "state": {
+                        "authority": extension_optional_pubkey(value, 0)?,
+                        "programId": extension_optional_pubkey(value, 32)?
+                    }
+                }),
+                None,
+            ))
+        }
+        TOKEN_2022_PERMANENT_DELEGATE_EXTENSION_TYPE => {
+            let value = extension_exact_len(value, 32)?;
+            Ok((
+                json!({
+                    "extension": "permanentDelegate",
+                    "state": { "delegate": extension_optional_pubkey(value, 0)? }
+                }),
+                None,
+            ))
+        }
+        TOKEN_2022_MINT_CLOSE_AUTHORITY_EXTENSION_TYPE => {
+            let value = extension_exact_len(value, 32)?;
+            Ok((
+                json!({
+                    "extension": "mintCloseAuthority",
+                    "state": { "closeAuthority": extension_optional_pubkey(value, 0)? }
+                }),
+                None,
+            ))
+        }
+        TOKEN_2022_METADATA_POINTER_EXTENSION_TYPE => {
+            let value = extension_exact_len(value, 64)?;
+            Ok((
+                json!({
+                    "extension": "metadataPointer",
+                    "state": { "authority": extension_optional_pubkey(value, 0)? }
+                }),
+                None,
+            ))
+        }
+        TOKEN_2022_METADATA_EXTENSION_TYPE => {
+            let metadata = parse_token_2022_metadata_value(value)?;
+            let state = json!({
+                "name": metadata.name,
+                "symbol": metadata.symbol,
+                "uri": metadata.uri,
+                "updateAuthority": metadata.update_authority.map(pubkey_string)
+            });
+            Ok((
+                json!({ "extension": "tokenMetadata", "state": state }),
+                Some(metadata),
+            ))
+        }
+        _ => Err("unsupported Token-2022 extension"),
+    }
+}
+
+fn is_supported_token_2022_extension(extension_type: u16) -> bool {
+    matches!(
+        extension_type,
+        TOKEN_2022_TRANSFER_FEE_CONFIG_EXTENSION_TYPE
+            | TOKEN_2022_DEFAULT_ACCOUNT_STATE_EXTENSION_TYPE
+            | TOKEN_2022_NON_TRANSFERABLE_EXTENSION_TYPE
+            | TOKEN_2022_TRANSFER_HOOK_EXTENSION_TYPE
+            | TOKEN_2022_PERMANENT_DELEGATE_EXTENSION_TYPE
+            | TOKEN_2022_MINT_CLOSE_AUTHORITY_EXTENSION_TYPE
+            | TOKEN_2022_METADATA_POINTER_EXTENSION_TYPE
+            | TOKEN_2022_METADATA_EXTENSION_TYPE
+    )
+}
+
+fn parse_token_2022_mint_extensions(
+    data: &[u8],
+) -> std::result::Result<ParsedToken2022MintExtensions, &'static str> {
+    if data.len() <= TOKEN_2022_TLV_START {
+        return Ok(ParsedToken2022MintExtensions {
+            json: "[]".to_owned(),
+            token_metadata: None,
+            warnings: vec![],
+        });
+    }
+
+    let mut offset = TOKEN_2022_TLV_START;
+    let mut seen = HashSet::new();
+    let mut extensions = Vec::new();
+    let mut token_metadata = None;
+    let mut warnings = Vec::new();
+    while offset < data.len() {
+        let header_end = offset
+            .checked_add(4)
+            .ok_or("Token-2022 extension header overflow")?;
+        let header = data
+            .get(offset..header_end)
+            .ok_or("truncated Token-2022 extension header")?;
+        let extension_type = u16::from_le_bytes([header[0], header[1]]);
+        if extension_type == 0 {
+            break;
+        }
+        let value_len = usize::from(u16::from_le_bytes([header[2], header[3]]));
+        let value_end = header_end
+            .checked_add(value_len)
+            .ok_or("Token-2022 extension length overflow")?;
+        let value = data
+            .get(header_end..value_end)
+            .ok_or("truncated Token-2022 extension value")?;
+
+        if is_supported_token_2022_extension(extension_type) && seen.insert(extension_type) {
+            match parse_token_2022_extension(extension_type, value) {
+                Ok((extension, metadata)) => {
+                    extensions.push(extension);
+                    if metadata.is_some() {
+                        token_metadata = metadata;
+                    }
+                }
+                Err(err) => warnings.push(format!("extension type {extension_type}: {err}")),
+            }
+        }
+        offset = value_end;
+    }
+
+    Ok(ParsedToken2022MintExtensions {
+        json: serde_json::to_string(&extensions)
+            .map_err(|_| "failed to serialize Token-2022 extensions")?,
+        token_metadata,
+        warnings,
+    })
 }
 
 impl ClickhouseIndexer {
@@ -639,6 +953,7 @@ impl ClickhouseIndexer {
         let collect_close_tombstones = snapshot_kind.collect_close_tombstones();
         let collect_affected_pairs = matches!(snapshot_kind, SnapshotKind::Incremental);
         let zero_balance_token_account_policy = snapshot_kind.zero_balance_token_account_policy();
+        let metadata_patches = Arc::new(Mutex::new(HashMap::new()));
         let mut worker = Worker {
             sink: &mut self.sink,
             snapshot_slot: self.snapshot_slot,
@@ -656,6 +971,7 @@ impl ClickhouseIndexer {
             collect_affected_pairs,
             affected_pairs: HashSet::new(),
             hot_mints: Arc::clone(&self.hot_mints),
+            metadata_patches: Arc::clone(&metadata_patches),
             zero_balance_token_account_policy,
             zero_balance_token_accounts_omitted_from_full_baseline: 0,
         };
@@ -701,6 +1017,15 @@ impl ClickhouseIndexer {
         };
         drop(worker);
 
+        write_merged_metadata_patches(
+            &self.client,
+            &mut self.sink,
+            self.group,
+            &metadata_patches,
+            matches!(snapshot_kind, SnapshotKind::Incremental),
+            self.snapshot_slot,
+        )
+        .await?;
         self.sink.end().await?;
         let tombstone_result = if collect_close_tombstones {
             write_close_token_account_tombstones(&self.client, self.group, &closed_token_accounts)
@@ -758,7 +1083,7 @@ impl ClickhouseIndexer {
     /// other CPUs idle.  A bounded queue overlaps stream decompression,
     /// account parsing/base58 encoding, and multiple ClickHouse HTTP inserts.
     async fn insert_all_parallel(
-        self,
+        mut self,
         iterator: AppendVecIterator<'_>,
         snapshot_kind: SnapshotKind,
         workers: usize,
@@ -775,6 +1100,7 @@ impl ClickhouseIndexer {
         let insert_concurrency = workers.min(MAX_INSERT_CONCURRENCY);
         let insert_gate = Arc::new(Semaphore::new(insert_concurrency));
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let metadata_patches = Arc::new(Mutex::new(HashMap::new()));
         debug!(
             "[clickhouse] Parallel workers={workers}; INSERT finalization concurrency={insert_concurrency}"
         );
@@ -788,6 +1114,7 @@ impl ClickhouseIndexer {
             let insert_gate = Arc::clone(&insert_gate);
             let cancelled = Arc::clone(&cancelled);
             let hot_mints = Arc::clone(&self.hot_mints);
+            let metadata_patches = Arc::clone(&metadata_patches);
             let zero_balance_token_account_policy = zero_balance_token_account_policy;
             handles.push(thread::spawn(move || {
                 debug!("[clickhouse] Worker {worker_index} thread started");
@@ -826,6 +1153,7 @@ impl ClickhouseIndexer {
                         collect_affected_pairs,
                         affected_pairs: HashSet::new(),
                         hot_mints,
+                        metadata_patches,
                         zero_balance_token_account_policy,
                         zero_balance_token_accounts_omitted_from_full_baseline: 0,
                     };
@@ -1006,6 +1334,17 @@ impl ClickhouseIndexer {
             return Err(err.into());
         }
 
+        write_merged_metadata_patches(
+            &self.client,
+            &mut self.sink,
+            self.group,
+            &metadata_patches,
+            matches!(snapshot_kind, SnapshotKind::Incremental),
+            self.snapshot_slot,
+        )
+        .await?;
+        self.sink.end().await?;
+
         let token_account_close_candidates = if collect_close_tombstones {
             totals.closed_token_accounts.len() as u64
         } else {
@@ -1171,6 +1510,8 @@ pub(crate) async fn import_full_snapshot_fanout(
     let insert_concurrency = workers.min(MAX_INSERT_CONCURRENCY);
     let insert_gate = Arc::new(Semaphore::new(insert_concurrency));
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let active_metadata_patches = Arc::new(Mutex::new(HashMap::new()));
+    let staging_metadata_patches = Arc::new(Mutex::new(HashMap::new()));
     info!(
         "[clickhouse] shared full fanout slot={} active_resume_slot={} workers={} INSERT finalization concurrency={}",
         snapshot_slot,
@@ -1187,6 +1528,8 @@ pub(crate) async fn import_full_snapshot_fanout(
         let cancelled = Arc::clone(&cancelled);
         let active_hot_mints = Arc::clone(&active_hot_mints);
         let staging_hot_mints = Arc::clone(&staging_hot_mints);
+        let active_metadata_patches = Arc::clone(&active_metadata_patches);
+        let staging_metadata_patches = Arc::clone(&staging_metadata_patches);
         handles.push(thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1217,6 +1560,8 @@ pub(crate) async fn import_full_snapshot_fanout(
                     progress,
                     active_hot_mints,
                     staging_hot_mints,
+                    active_metadata_patches,
+                    staging_metadata_patches,
                     stats: ParallelWorkerStats::default(),
                 };
 
@@ -1344,6 +1689,40 @@ pub(crate) async fn import_full_snapshot_fanout(
     if let Some(err) = producer_error {
         return Err(err.into());
     }
+
+    let mut active_metadata_sink = ClickhouseSink::new(
+        &active_client,
+        "shared-full-active-metadata",
+        None,
+        TableGroup::Active,
+    );
+    write_merged_metadata_patches(
+        &active_client,
+        &mut active_metadata_sink,
+        TableGroup::Active,
+        &active_metadata_patches,
+        true,
+        snapshot_slot,
+    )
+    .await?;
+    active_metadata_sink.end().await?;
+
+    let mut staging_metadata_sink = ClickhouseSink::new(
+        &staging_client,
+        "shared-full-staging-metadata",
+        None,
+        TableGroup::Backup,
+    );
+    write_merged_metadata_patches(
+        &staging_client,
+        &mut staging_metadata_sink,
+        TableGroup::Backup,
+        &staging_metadata_patches,
+        false,
+        snapshot_slot,
+    )
+    .await?;
+    staging_metadata_sink.end().await?;
 
     // The active branch has incremental semantics even though its source is a
     // full archive: it updates only the new tail and must refresh only the
@@ -2110,13 +2489,11 @@ async fn rebuild_token_info_table(
                 .map(|mint| sql_string_literal(mint))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let insert_sql = format!(
-                "INSERT INTO {temporary} \
-                 SELECT h.mint, ifNull(m.decimals, 0), ifNull(m.supply, 0), ifNull(md.name, ''), ifNull(md.symbol, ''), ifNull(md.uri, ''), md.token_standard, \
-                        ifNull(m.updated_slot, 0), ifNull(md.updated_slot, 0), greatest(ifNull(m.updated_slot, 0), ifNull(md.updated_slot, 0)) \
-                 FROM (SELECT arrayJoin([{mint_values}]) AS mint) AS h \
-                 LEFT ANY JOIN (SELECT mint, decimals, supply, updated_slot FROM {mint_source} WHERE mint IN ({mint_values})) AS m USING (mint) \
-                 LEFT ANY JOIN (SELECT mint, name, symbol, uri, token_standard, updated_slot FROM {metadata_source} WHERE mint IN ({mint_values})) AS md USING (mint)"
+            let insert_sql = token_info_batch_insert_sql(
+                &temporary,
+                &mint_values,
+                &mint_source,
+                &metadata_source,
             );
             client
                 .query(&insert_sql)
@@ -2177,6 +2554,22 @@ async fn rebuild_token_info_table(
             .await;
     }
     result
+}
+
+fn token_info_batch_insert_sql(
+    temporary: &str,
+    mint_values: &str,
+    mint_source: &str,
+    metadata_source: &str,
+) -> String {
+    format!(
+        "INSERT INTO {temporary} (mint, decimals, supply_raw, name, symbol, uri, token_standard, extensions, mint_updated_slot, metadata_updated_slot, updated_slot) \
+         SELECT h.mint, ifNull(m.decimals, 0), ifNull(m.supply, 0), ifNull(md.name, ''), ifNull(md.symbol, ''), ifNull(md.uri, ''), md.token_standard, ifNull(nullIf(md.extensions, ''), '[]'), \
+                ifNull(m.updated_slot, 0), ifNull(md.updated_slot, 0), greatest(ifNull(m.updated_slot, 0), ifNull(md.updated_slot, 0)) \
+         FROM (SELECT arrayJoin([{mint_values}]) AS mint) AS h \
+         LEFT ANY JOIN (SELECT mint, decimals, supply, updated_slot FROM {mint_source} WHERE mint IN ({mint_values})) AS m USING (mint) \
+         LEFT ANY JOIN (SELECT mint, name, symbol, uri, token_standard, extensions, updated_slot FROM {metadata_source} WHERE mint IN ({mint_values})) AS md USING (mint)"
+    )
 }
 
 #[derive(Row, Deserialize)]
@@ -2673,6 +3066,7 @@ fn required_columns() -> Vec<(&'static str, &'static str, &'static str)> {
         ("token_standard", "Nullable(UInt8)"),
         ("seller_fee_basis_points", "UInt16"),
         ("creators", "Array(String)"),
+        ("extensions", "String"),
         ("updated_slot", "UInt64"),
     ];
     const HOT_TOKEN: &[(&str, &str)] = &[
@@ -2706,6 +3100,7 @@ fn required_columns() -> Vec<(&'static str, &'static str, &'static str)> {
         ("symbol", "String"),
         ("uri", "String"),
         ("token_standard", "Nullable(UInt8)"),
+        ("extensions", "String"),
         ("mint_updated_slot", "UInt64"),
         ("metadata_updated_slot", "UInt64"),
         ("updated_slot", "UInt64"),
@@ -3152,6 +3547,92 @@ impl ClickhouseSink {
     }
 }
 
+async fn write_merged_metadata_patches(
+    client: &Client,
+    sink: &mut ClickhouseSink,
+    group: TableGroup,
+    patches: &SharedMetadataPatches,
+    preserve_existing: bool,
+    snapshot_slot: u64,
+) -> Result<u64> {
+    let patches = {
+        let mut guard = patches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *guard)
+    };
+    if patches.is_empty() {
+        return Ok(0);
+    }
+
+    let mut mints = patches.keys().cloned().collect::<Vec<_>>();
+    mints.sort_unstable();
+    let metadata_table = group.table(TOKEN_METADATA_TABLE);
+    let mut existing = HashMap::new();
+    if preserve_existing {
+        for batch in mints.chunks(HOT_TOKEN_INFO_BATCH_SIZE as usize) {
+            let mint_values = batch
+                .iter()
+                .map(|mint| sql_string_literal(mint))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT mint, name, symbol, uri, update_authority, is_mutable, token_standard, seller_fee_basis_points, creators, extensions, updated_slot \
+                 FROM {metadata_table} FINAL WHERE mint IN ({mint_values})"
+            );
+            let rows = client
+                .query(&sql)
+                .with_setting("max_query_size", HOT_PAIR_QUERY_MAX_QUERY_SIZE)
+                .fetch_all::<TokenMetadataRow>()
+                .await
+                .map_err(|err| {
+                    format!(
+                        "failed to load existing metadata before merging Token-2022 extensions from {metadata_table}: {err}"
+                    )
+                })?;
+            existing.extend(rows.into_iter().map(|row| (row.mint.clone(), row)));
+        }
+    }
+
+    let row_count = mints.len() as u64;
+    for mint in mints {
+        let patch = patches
+            .get(&mint)
+            .expect("metadata patch key must remain present");
+        let previous = existing.remove(&mint);
+        let row = merge_metadata_patch(mint, patch, previous.as_ref(), snapshot_slot);
+        sink.write_token_metadata(&row).await?;
+    }
+    info!(
+        "[clickhouse] merged metadata/extensions group={} rows={} preserve_existing={}",
+        group.as_str(),
+        row_count,
+        preserve_existing
+    );
+    Ok(row_count)
+}
+
+fn merge_metadata_patch(
+    mint: String,
+    patch: &MetadataPatch,
+    previous: Option<&TokenMetadataRow>,
+    snapshot_slot: u64,
+) -> TokenMetadataRow {
+    let fields = patch
+        .fields
+        .as_ref()
+        .map(|versioned| versioned.fields.clone())
+        .or_else(|| previous.map(TokenMetadataFields::from_row))
+        .unwrap_or_default();
+    let extensions = patch
+        .extensions
+        .as_ref()
+        .map(|versioned| versioned.json.clone())
+        .or_else(|| previous.map(|row| row.extensions.clone()))
+        .unwrap_or_else(|| "[]".to_owned());
+    fields.into_row(mint, extensions, snapshot_slot)
+}
+
 async fn acquire_insert_permit(
     gate: Option<&Arc<Semaphore>>,
     worker_name: &str,
@@ -3348,6 +3829,7 @@ struct Worker<'a> {
     collect_affected_pairs: bool,
     affected_pairs: HashSet<TokenPair>,
     hot_mints: HotMintSet,
+    metadata_patches: SharedMetadataPatches,
     zero_balance_token_account_policy: ZeroBalanceTokenAccountPolicy,
     zero_balance_token_accounts_omitted_from_full_baseline: u64,
 }
@@ -3363,6 +3845,8 @@ struct FullFanoutWorker {
     progress: Arc<Progress>,
     active_hot_mints: HotMintSet,
     staging_hot_mints: HotMintSet,
+    active_metadata_patches: SharedMetadataPatches,
+    staging_metadata_patches: SharedMetadataPatches,
     stats: ParallelWorkerStats,
 }
 
@@ -3445,7 +3929,8 @@ impl FullFanoutWorker {
         }
 
         if account.account_meta.owner == mpl_metadata::id() {
-            self.insert_token_metadata(account, write_active).await?;
+            self.insert_token_metadata(account, account_slot, write_active)
+                .await?;
         }
 
         self.progress.accounts.inc();
@@ -3541,7 +4026,7 @@ impl FullFanoutWorker {
                 let mint = pubkey_string(account.meta.pubkey);
                 self.write_token_mint_row(
                     write_active,
-                    mint,
+                    mint.clone(),
                     token_mint.mint_authority.map(pubkey_string).into(),
                     token_mint.supply,
                     token_mint.decimals,
@@ -3549,28 +4034,68 @@ impl FullFanoutWorker {
                     token_mint.freeze_authority.map(pubkey_string).into(),
                 )
                 .await?;
-                match parse_token_2022_mint_metadata(account.data) {
-                    Ok(Some(metadata)) => {
-                        self.write_token_2022_metadata(
-                            metadata,
-                            Some(account.meta.pubkey),
-                            write_active,
-                        )
-                        .await?;
+                let write_staging_metadata = self.staging_hot_mints.contains(&mint);
+                let write_active_metadata = write_active && self.active_hot_mints.contains(&mint);
+                if write_staging_metadata || write_active_metadata {
+                    match parse_token_2022_mint_extensions(account.data) {
+                        Ok(parsed) => {
+                            for warning in parsed.warnings {
+                                warn!(
+                                    "Skipping invalid Token-2022 extension for {}: {}",
+                                    account.meta.pubkey, warning
+                                );
+                            }
+                            let extension_patch = VersionedExtensions {
+                                account_slot,
+                                json: parsed.json,
+                            };
+                            if write_staging_metadata {
+                                record_extensions(
+                                    &self.staging_metadata_patches,
+                                    mint.clone(),
+                                    extension_patch.clone(),
+                                );
+                            }
+                            if write_active_metadata {
+                                record_extensions(
+                                    &self.active_metadata_patches,
+                                    mint.clone(),
+                                    extension_patch,
+                                );
+                            }
+                            if let Some(metadata) = parsed.token_metadata {
+                                self.record_token_2022_metadata(
+                                    metadata,
+                                    Some(account.meta.pubkey),
+                                    account_slot,
+                                    MetadataSource::Token2022Embedded,
+                                    pubkey_string(account.meta.pubkey),
+                                    write_active,
+                                );
+                            }
+                            self.progress.metadata.inc();
+                        }
+                        Err(err) => warn!(
+                            "Skipping structurally invalid Token-2022 extensions for {}: {}",
+                            account.meta.pubkey, err
+                        ),
                     }
-                    Ok(None) => {}
-                    Err(err) => warn!(
-                        "Skipping invalid Token-2022 mint metadata for {}: {}",
-                        account.meta.pubkey, err
-                    ),
                 }
                 self.stats.token_2022_accounts_parsed += 1;
                 self.progress.tokens.inc();
             }
             None => match parse_token_2022_metadata_value(account.data) {
                 Ok(metadata) => {
-                    self.write_token_2022_metadata(metadata, None, write_active)
-                        .await?;
+                    if self.record_token_2022_metadata(
+                        metadata,
+                        None,
+                        account_slot,
+                        MetadataSource::Token2022Standalone,
+                        pubkey_string(account.meta.pubkey),
+                        write_active,
+                    ) {
+                        self.progress.metadata.inc();
+                    }
                     self.stats.token_2022_accounts_parsed += 1;
                 }
                 Err(_) => {
@@ -3673,40 +4198,54 @@ impl FullFanoutWorker {
         Ok(())
     }
 
-    async fn write_token_2022_metadata(
+    fn record_token_2022_metadata(
         &mut self,
         metadata: Token2022Metadata,
         expected_mint: Option<Pubkey>,
+        account_slot: u64,
+        source: MetadataSource,
+        source_account: String,
         write_active: bool,
-    ) -> Result<()> {
+    ) -> bool {
         if let Some(expected_mint) = expected_mint {
             if metadata.mint != expected_mint {
                 warn!(
                     "Skipping Token-2022 metadata in mint account {} because it names mint {}",
                     expected_mint, metadata.mint
                 );
-                return Ok(());
+                return false;
             }
         }
-        let row = token_2022_metadata_row(metadata, self.snapshot_slot);
-        let write_staging = self.staging_hot_mints.contains(&row.mint);
-        let write_active = write_active && self.active_hot_mints.contains(&row.mint);
+        let mint = pubkey_string(metadata.mint);
+        let fields = token_2022_metadata_fields(&metadata);
+        let write_staging = self.staging_hot_mints.contains(&mint);
+        let write_active = write_active && self.active_hot_mints.contains(&mint);
         if !write_staging && !write_active {
-            return Ok(());
+            return false;
         }
+        let candidate = VersionedMetadataFields {
+            account_slot,
+            source,
+            source_account,
+            fields,
+        };
         if write_staging {
-            self.staging_sink.write_token_metadata(&row).await?;
+            record_metadata_fields(
+                &self.staging_metadata_patches,
+                mint.clone(),
+                candidate.clone(),
+            );
         }
         if write_active {
-            self.active_sink.write_token_metadata(&row).await?;
+            record_metadata_fields(&self.active_metadata_patches, mint, candidate);
         }
-        self.progress.metadata.inc();
-        Ok(())
+        true
     }
 
     async fn insert_token_metadata(
         &mut self,
         account: &StoredAccountMeta<'_>,
+        account_slot: u64,
         write_active: bool,
     ) -> Result<()> {
         if account.data.is_empty() {
@@ -3740,8 +4279,7 @@ impl FullFanoutWorker {
         if !write_staging && !write_active {
             return Ok(());
         }
-        let row = TokenMetadataRow {
-            mint,
+        let fields = TokenMetadataFields {
             name: metadata.data.name,
             symbol: metadata.data.symbol,
             uri: metadata.data.uri,
@@ -3756,13 +4294,22 @@ impl FullFanoutWorker {
                 .into_iter()
                 .map(|creator| pubkey_string(creator.address))
                 .collect(),
-            updated_slot: self.snapshot_slot,
+        };
+        let candidate = VersionedMetadataFields {
+            account_slot,
+            source: MetadataSource::Metaplex,
+            source_account: pubkey_string(account.meta.pubkey),
+            fields,
         };
         if write_staging {
-            self.staging_sink.write_token_metadata(&row).await?;
+            record_metadata_fields(
+                &self.staging_metadata_patches,
+                mint.clone(),
+                candidate.clone(),
+            );
         }
         if write_active {
-            self.active_sink.write_token_metadata(&row).await?;
+            record_metadata_fields(&self.active_metadata_patches, mint, candidate);
         }
         self.progress.metadata.inc();
         Ok(())
@@ -3903,7 +4450,7 @@ impl<'a> Worker<'a> {
         }
 
         if account.account_meta.owner == mpl_metadata::id() {
-            self.insert_token_metadata(account).await?;
+            self.insert_token_metadata(account, account_slot).await?;
         }
 
         self.progress.accounts.inc();
@@ -4005,7 +4552,7 @@ impl<'a> Worker<'a> {
                 if self.hot_mints.contains(&mint) {
                     self.sink
                         .write_token_mint(&TokenMintRow {
-                            mint,
+                            mint: mint.clone(),
                             mint_authority: token_mint.mint_authority.map(pubkey_string).into(),
                             supply: token_mint.supply,
                             decimals: token_mint.decimals,
@@ -4014,24 +4561,53 @@ impl<'a> Worker<'a> {
                             updated_slot: self.snapshot_slot,
                         })
                         .await?;
-                }
-                match parse_token_2022_mint_metadata(account.data) {
-                    Ok(Some(metadata)) => {
-                        self.write_token_2022_metadata(metadata, Some(account.meta.pubkey))
-                            .await?;
+                    match parse_token_2022_mint_extensions(account.data) {
+                        Ok(parsed) => {
+                            for warning in parsed.warnings {
+                                warn!(
+                                    "Skipping invalid Token-2022 extension for {}: {}",
+                                    account.meta.pubkey, warning
+                                );
+                            }
+                            record_extensions(
+                                &self.metadata_patches,
+                                mint,
+                                VersionedExtensions {
+                                    account_slot,
+                                    json: parsed.json,
+                                },
+                            );
+                            if let Some(metadata) = parsed.token_metadata {
+                                self.record_token_2022_metadata(
+                                    metadata,
+                                    Some(account.meta.pubkey),
+                                    account_slot,
+                                    MetadataSource::Token2022Embedded,
+                                    pubkey_string(account.meta.pubkey),
+                                );
+                            }
+                            self.progress.metadata.inc();
+                        }
+                        Err(err) => warn!(
+                            "Skipping structurally invalid Token-2022 extensions for {}: {}",
+                            account.meta.pubkey, err
+                        ),
                     }
-                    Ok(None) => {}
-                    Err(err) => warn!(
-                        "Skipping invalid Token-2022 mint metadata for {}: {}",
-                        account.meta.pubkey, err
-                    ),
                 }
                 self.token_2022_accounts_parsed += 1;
                 self.progress.tokens.inc();
             }
             None => match parse_token_2022_metadata_value(account.data) {
                 Ok(metadata) => {
-                    self.write_token_2022_metadata(metadata, None).await?;
+                    if self.record_token_2022_metadata(
+                        metadata,
+                        None,
+                        account_slot,
+                        MetadataSource::Token2022Standalone,
+                        pubkey_string(account.meta.pubkey),
+                    ) {
+                        self.progress.metadata.inc();
+                    }
                     self.token_2022_accounts_parsed += 1;
                 }
                 Err(_) => {
@@ -4083,27 +4659,38 @@ impl<'a> Worker<'a> {
         Ok(())
     }
 
-    async fn write_token_2022_metadata(
+    fn record_token_2022_metadata(
         &mut self,
         metadata: Token2022Metadata,
         expected_mint: Option<Pubkey>,
-    ) -> Result<()> {
+        account_slot: u64,
+        source: MetadataSource,
+        source_account: String,
+    ) -> bool {
         if let Some(expected_mint) = expected_mint {
             if metadata.mint != expected_mint {
                 warn!(
                     "Skipping Token-2022 metadata in mint account {} because it names mint {}",
                     expected_mint, metadata.mint
                 );
-                return Ok(());
+                return false;
             }
         }
-        let row = token_2022_metadata_row(metadata, self.snapshot_slot);
-        if !self.hot_mints.contains(&row.mint) {
-            return Ok(());
+        let mint = pubkey_string(metadata.mint);
+        if !self.hot_mints.contains(&mint) {
+            return false;
         }
-        self.sink.write_token_metadata(&row).await?;
-        self.progress.metadata.inc();
-        Ok(())
+        record_metadata_fields(
+            &self.metadata_patches,
+            mint,
+            VersionedMetadataFields {
+                account_slot,
+                source,
+                source_account,
+                fields: token_2022_metadata_fields(&metadata),
+            },
+        );
+        true
     }
 
     fn remember_affected_pair(&mut self, mint: &str, owner: &str) {
@@ -4113,7 +4700,11 @@ impl<'a> Worker<'a> {
         }
     }
 
-    async fn insert_token_metadata(&mut self, account: &StoredAccountMeta<'_>) -> Result<()> {
+    async fn insert_token_metadata(
+        &mut self,
+        account: &StoredAccountMeta<'_>,
+        account_slot: u64,
+    ) -> Result<()> {
         if account.data.is_empty() {
             return Ok(());
         }
@@ -4147,26 +4738,31 @@ impl<'a> Worker<'a> {
             return Ok(());
         }
 
-        self.sink
-            .write_token_metadata(&TokenMetadataRow {
-                mint,
-                name: metadata.data.name,
-                symbol: metadata.data.symbol,
-                uri: metadata.data.uri,
-                update_authority: pubkey_string(metadata.update_authority),
-                is_mutable: metadata.is_mutable,
-                token_standard: metadata_ext_v1_2.and_then(|metadata| metadata.token_standard),
-                seller_fee_basis_points: metadata.data.seller_fee_basis_points,
-                creators: metadata
-                    .data
-                    .creators
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|creator| pubkey_string(creator.address))
-                    .collect(),
-                updated_slot: self.snapshot_slot,
-            })
-            .await?;
+        record_metadata_fields(
+            &self.metadata_patches,
+            mint,
+            VersionedMetadataFields {
+                account_slot,
+                source: MetadataSource::Metaplex,
+                source_account: pubkey_string(account.meta.pubkey),
+                fields: TokenMetadataFields {
+                    name: metadata.data.name,
+                    symbol: metadata.data.symbol,
+                    uri: metadata.data.uri,
+                    update_authority: pubkey_string(metadata.update_authority),
+                    is_mutable: metadata.is_mutable,
+                    token_standard: metadata_ext_v1_2.and_then(|metadata| metadata.token_standard),
+                    seller_fee_basis_points: metadata.data.seller_fee_basis_points,
+                    creators: metadata
+                        .data
+                        .creators
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|creator| pubkey_string(creator.address))
+                        .collect(),
+                },
+            },
+        );
         self.progress.metadata.inc();
         Ok(())
     }
@@ -4415,6 +5011,259 @@ mod tests {
         data
     }
 
+    fn append_token_2022_extension(data: &mut Vec<u8>, extension_type: u16, value: &[u8]) {
+        data.extend_from_slice(&extension_type.to_le_bytes());
+        data.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        data.extend_from_slice(value);
+    }
+
+    fn token_2022_tlv_data(extensions: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut data = vec![0; TOKEN_2022_TLV_START];
+        for (extension_type, value) in extensions {
+            append_token_2022_extension(&mut data, *extension_type, value);
+        }
+        data
+    }
+
+    fn metadata_fields(name: &str) -> TokenMetadataFields {
+        TokenMetadataFields {
+            name: name.to_owned(),
+            symbol: "SYM".to_owned(),
+            uri: "uri".to_owned(),
+            update_authority: "authority".to_owned(),
+            is_mutable: true,
+            token_standard: Some(2),
+            seller_fee_basis_points: 250,
+            creators: vec!["creator".to_owned()],
+        }
+    }
+
+    #[test]
+    fn parses_eight_token_2022_mint_extensions_in_physical_order() {
+        let mint = Pubkey::new_from_array([1; 32]);
+        let update_authority = Pubkey::new_from_array([2; 32]);
+        let transfer_fee_authority = Pubkey::new_from_array([3; 32]);
+        let hook_program = Pubkey::new_from_array([4; 32]);
+        let delegate = Pubkey::new_from_array([5; 32]);
+        let close_authority = Pubkey::new_from_array([6; 32]);
+
+        let mut transfer_fee = vec![0; 108];
+        transfer_fee[..32].copy_from_slice(transfer_fee_authority.as_ref());
+        transfer_fee[72..80].copy_from_slice(&7_u64.to_le_bytes());
+        transfer_fee[80..88].copy_from_slice(&u64::MAX.to_le_bytes());
+        transfer_fee[88..90].copy_from_slice(&25_u16.to_le_bytes());
+        transfer_fee[90..98].copy_from_slice(&8_u64.to_le_bytes());
+        transfer_fee[98..106].copy_from_slice(&9_999_u64.to_le_bytes());
+        transfer_fee[106..108].copy_from_slice(&100_u16.to_le_bytes());
+
+        let mut transfer_hook = vec![0; 64];
+        transfer_hook[32..].copy_from_slice(hook_program.as_ref());
+        let mut permanent_delegate = vec![0; 32];
+        permanent_delegate.copy_from_slice(delegate.as_ref());
+        let mut mint_close_authority = vec![0; 32];
+        mint_close_authority.copy_from_slice(close_authority.as_ref());
+        let mut metadata_pointer = vec![0; 64];
+        metadata_pointer[32..].copy_from_slice(mint.as_ref());
+        let metadata = token_2022_metadata_value(
+            Some(update_authority),
+            mint,
+            "Token 2022",
+            "T22",
+            "https://example.invalid/token.json",
+            &[],
+        );
+
+        let data = token_2022_tlv_data(&[
+            (TOKEN_2022_METADATA_POINTER_EXTENSION_TYPE, metadata_pointer),
+            (20, vec![1, 2, 3]), // unknown GroupPointer is deliberately ignored
+            (
+                TOKEN_2022_TRANSFER_FEE_CONFIG_EXTENSION_TYPE,
+                transfer_fee.clone(),
+            ),
+            (TOKEN_2022_DEFAULT_ACCOUNT_STATE_EXTENSION_TYPE, vec![2]),
+            (TOKEN_2022_NON_TRANSFERABLE_EXTENSION_TYPE, vec![]),
+            (TOKEN_2022_TRANSFER_HOOK_EXTENSION_TYPE, transfer_hook),
+            (
+                TOKEN_2022_PERMANENT_DELEGATE_EXTENSION_TYPE,
+                permanent_delegate,
+            ),
+            (
+                TOKEN_2022_MINT_CLOSE_AUTHORITY_EXTENSION_TYPE,
+                mint_close_authority,
+            ),
+            (TOKEN_2022_METADATA_EXTENSION_TYPE, metadata),
+            // The first matching extension wins.
+            (TOKEN_2022_TRANSFER_FEE_CONFIG_EXTENSION_TYPE, vec![0; 108]),
+        ]);
+
+        let parsed = parse_token_2022_mint_extensions(&data).unwrap();
+        assert!(parsed.warnings.is_empty());
+        assert_eq!(parsed.token_metadata.as_ref().unwrap().mint, mint);
+        let extensions: Value = serde_json::from_str(&parsed.json).unwrap();
+        let extensions = extensions.as_array().unwrap();
+        assert_eq!(extensions.len(), 8);
+        assert_eq!(extensions[0]["extension"], "metadataPointer");
+        assert_eq!(extensions[0]["state"]["authority"], Value::Null);
+        assert_eq!(extensions[1]["extension"], "transferFeeConfig");
+        assert_eq!(
+            extensions[1]["state"]["transferFeeConfigAuthority"],
+            transfer_fee_authority.to_string()
+        );
+        assert_eq!(
+            extensions[1]["state"]["newerTransferFee"]["transferFeeBasisPoints"],
+            100
+        );
+        assert_eq!(
+            extensions[1]["state"]["newerTransferFee"]["maximumFee"],
+            9_999_u64
+        );
+        assert_eq!(extensions[1]["state"]["olderTransferFee"]["epoch"], 7);
+        assert_eq!(
+            extensions[1]["state"]["olderTransferFee"]["maximumFee"],
+            u64::MAX
+        );
+        assert_eq!(extensions[2]["state"]["accountState"], "frozen");
+        assert_eq!(
+            extensions[3],
+            json!({"extension":"nonTransferable","state":{}})
+        );
+        assert_eq!(extensions[4]["state"]["authority"], Value::Null);
+        assert_eq!(
+            extensions[4]["state"]["programId"],
+            hook_program.to_string()
+        );
+        assert_eq!(extensions[5]["state"]["delegate"], delegate.to_string());
+        assert_eq!(
+            extensions[6]["state"]["closeAuthority"],
+            close_authority.to_string()
+        );
+        assert_eq!(extensions[7]["extension"], "tokenMetadata");
+        assert_eq!(extensions[7]["state"]["name"], "Token 2022");
+        assert_eq!(
+            extensions[7]["state"]["updateAuthority"],
+            update_authority.to_string()
+        );
+    }
+
+    #[test]
+    fn parses_all_default_account_states() {
+        for (raw, expected) in [(0, "uninitialized"), (1, "initialized"), (2, "frozen")] {
+            let data = token_2022_tlv_data(&[(
+                TOKEN_2022_DEFAULT_ACCOUNT_STATE_EXTENSION_TYPE,
+                vec![raw],
+            )]);
+            let parsed = parse_token_2022_mint_extensions(&data).unwrap();
+            let extensions: Value = serde_json::from_str(&parsed.json).unwrap();
+            assert_eq!(extensions[0]["state"]["accountState"], expected);
+        }
+    }
+
+    #[test]
+    fn skips_invalid_extension_value_but_rejects_truncated_tlv() {
+        let data = token_2022_tlv_data(&[
+            (TOKEN_2022_MINT_CLOSE_AUTHORITY_EXTENSION_TYPE, vec![1]),
+            (TOKEN_2022_NON_TRANSFERABLE_EXTENSION_TYPE, vec![]),
+        ]);
+        let parsed = parse_token_2022_mint_extensions(&data).unwrap();
+        assert_eq!(parsed.warnings.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&parsed.json).unwrap(),
+            json!([{"extension":"nonTransferable","state":{}}])
+        );
+
+        let mut truncated = vec![0; TOKEN_2022_TLV_START];
+        truncated.extend_from_slice(&TOKEN_2022_TRANSFER_HOOK_EXTENSION_TYPE.to_le_bytes());
+        truncated.extend_from_slice(&64_u16.to_le_bytes());
+        truncated.extend_from_slice(&[0; 8]);
+        assert!(parse_token_2022_mint_extensions(&truncated).is_err());
+    }
+
+    #[test]
+    fn metadata_patch_merges_fields_and_extensions_independently() {
+        let previous = metadata_fields("old").into_row(
+            "mint".to_owned(),
+            "[\"old-extension\"]".to_owned(),
+            10,
+        );
+        let fields_patch = MetadataPatch {
+            fields: Some(VersionedMetadataFields {
+                account_slot: 11,
+                source: MetadataSource::Token2022Standalone,
+                source_account: "metadata-account".to_owned(),
+                fields: metadata_fields("new"),
+            }),
+            extensions: None,
+        };
+        let merged = merge_metadata_patch("mint".to_owned(), &fields_patch, Some(&previous), 12);
+        assert_eq!(merged.name, "new");
+        assert_eq!(merged.extensions, "[\"old-extension\"]");
+        assert_eq!(merged.updated_slot, 12);
+
+        let metadata_only = merge_metadata_patch("new-mint".to_owned(), &fields_patch, None, 12);
+        assert_eq!(metadata_only.extensions, "[]");
+
+        let extensions_patch = MetadataPatch {
+            fields: None,
+            extensions: Some(VersionedExtensions {
+                account_slot: 13,
+                json: "[{\"extension\":\"nonTransferable\",\"state\":{}}]".to_owned(),
+            }),
+        };
+        let merged =
+            merge_metadata_patch("mint".to_owned(), &extensions_patch, Some(&previous), 14);
+        assert_eq!(merged.name, "old");
+        assert!(merged.extensions.contains("nonTransferable"));
+
+        let extension_only =
+            merge_metadata_patch("new-mint".to_owned(), &extensions_patch, None, 15);
+        assert!(extension_only.name.is_empty());
+        assert!(extension_only.extensions.contains("nonTransferable"));
+    }
+
+    #[test]
+    fn metadata_patch_selection_is_order_independent() {
+        fn record_in_order(reverse: bool) -> TokenMetadataFields {
+            let patches = Arc::new(Mutex::new(HashMap::new()));
+            let candidates = [
+                VersionedMetadataFields {
+                    account_slot: 20,
+                    source: MetadataSource::Metaplex,
+                    source_account: "metaplex".to_owned(),
+                    fields: metadata_fields("metaplex"),
+                },
+                VersionedMetadataFields {
+                    account_slot: 20,
+                    source: MetadataSource::Token2022Embedded,
+                    source_account: "mint".to_owned(),
+                    fields: metadata_fields("token-2022"),
+                },
+            ];
+            if reverse {
+                for candidate in candidates.into_iter().rev() {
+                    record_metadata_fields(&patches, "mint".to_owned(), candidate);
+                }
+            } else {
+                for candidate in candidates {
+                    record_metadata_fields(&patches, "mint".to_owned(), candidate);
+                }
+            }
+            let selected = patches
+                .lock()
+                .unwrap()
+                .get("mint")
+                .unwrap()
+                .fields
+                .as_ref()
+                .unwrap()
+                .fields
+                .clone();
+            selected
+        }
+
+        assert_eq!(record_in_order(false), record_in_order(true));
+        assert_eq!(record_in_order(false).name, "token-2022");
+    }
+
     #[test]
     fn parses_token_2022_extended_mint_and_its_metadata() {
         let mint = Pubkey::new_from_array([7; 32]);
@@ -4462,7 +5311,8 @@ mod tests {
             }
             _ => panic!("expected extended Token-2022 mint"),
         }
-        let parsed = parse_token_2022_mint_metadata(&data).unwrap().unwrap();
+        let parsed_extensions = parse_token_2022_mint_extensions(&data).unwrap();
+        let parsed = parsed_extensions.token_metadata.unwrap();
         assert_eq!(parsed.mint, mint);
         assert_eq!(parsed.update_authority, Some(update_authority));
         assert_eq!(parsed.name, "Token 2022");
@@ -4578,6 +5428,7 @@ mod tests {
                 "token_standard",
                 "seller_fee_basis_points",
                 "creators",
+                "extensions",
                 "updated_slot"
             ]
         );
@@ -4664,6 +5515,33 @@ mod tests {
         assert!(sql.contains("tuple(s.mint, s.owner, s.amount, s.state, s.is_deleted)"));
         assert!(sql.contains("HAVING tupleElement(latest, 5) = 0"));
         assert!(!sql.contains(" FINAL"));
+    }
+
+    #[test]
+    fn token_info_build_copies_extensions_with_empty_array_fallback() {
+        let sql = token_info_batch_insert_sql(
+            "hot_token_info_build",
+            "'mint'",
+            "raw_token_mint",
+            "raw_token_metadata",
+        );
+
+        assert!(sql.contains("token_standard, extensions, mint_updated_slot"));
+        assert!(sql.contains("ifNull(nullIf(md.extensions, ''), '[]')"));
+        assert!(sql.contains("token_standard, extensions, updated_slot FROM raw_token_metadata"));
+    }
+
+    #[test]
+    fn active_and_backup_metadata_tables_require_extensions_column() {
+        let required = required_columns();
+        for table in [
+            "raw_token_metadata",
+            "raw_token_metadata_bak",
+            "hot_token_info",
+            "hot_token_info_bak",
+        ] {
+            assert!(required.contains(&(table, "extensions", "String")));
+        }
     }
 
     #[test]

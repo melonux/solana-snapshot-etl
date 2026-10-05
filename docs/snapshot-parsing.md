@@ -193,13 +193,15 @@ owner == SPL Token Program
 
 owner == Token-2022 Program
     -> StateWithExtensions<Account/Mint>::unpack
-    -> read base balance/mint fields and TokenMetadata TLV (if present)
+    -> read base balance/mint fields and selected Mint TLV extensions
 
 owner == Metaplex Metadata Program
     -> Borsh deserialize Metadata
 ~~~
 
-SPL Token 和 Token-2022 的账户 data 不是通用 AppendVec 元数据，而是各自程序定义的二进制结构。必须先通过对应 crate 的 `unpack` 解析，再写入 ClickHouse 的业务字段。Token-2022 的 Mint 和 Account 可带 TLV extension，不能以基础布局的固定长度（Mint 82 bytes、Account 165 bytes）作为是否解析的条件；基础字段应由 `StateWithExtensions` 的 `base` 读取。Mint 内嵌的 `TokenMetadata` extension 会填充同一份 raw metadata / hot token-info 链路。
+SPL Token 和 Token-2022 的账户 data 不是通用 AppendVec 元数据，而是各自程序定义的二进制结构。必须先通过对应 crate 的 `unpack` 解析，再写入 ClickHouse 的业务字段。Token-2022 的 Mint 和 Account 可带 TLV extension，不能以基础布局的固定长度（Mint 82 bytes、Account 165 bytes）作为是否解析的条件；基础字段应由 `StateWithExtensions` 的 `base` 读取。
+
+Mint TLV 由本地安全解析器额外提取 `transferFeeConfig`、`defaultAccountState`、`nonTransferable`、`transferHook`、`permanentDelegate`、`mintCloseAuthority`、`tokenMetadata` 和 `metadataPointer`。结果按 TLV 物理顺序序列化为 RPC 风格 JSON 数组，写入 `raw_token_metadata.extensions`；未知扩展会跳过，重复类型只保留第一个。Mint 扩展、内嵌或独立 Token-2022 metadata、Metaplex metadata 会先按 mint 合并，避免不同账户的写入互相覆盖。全量构建 `hot_token_info` 时再将 `extensions` 原样透传。
 
 同理，Metaplex metadata 账户要按照其 Borsh 结构反序列化，不能把 data bytes 当成 SPL Token 数据。
 
