@@ -115,7 +115,8 @@ COMMENT '冻结 hot mint 的 Token Account 状态：full 基线仅正余额，de
 ALTER TABLE solana.hot_token_account_state
     ADD PROJECTION IF NOT EXISTS proj_by_pair
     (
-        SELECT pubkey, mint, owner, amount, state, is_deleted, updated_slot
+        SELECT pubkey, mint, owner, amount, delegate, delegated_amount,
+               state, close_authority, is_deleted, updated_slot
         ORDER BY (mint, owner, pubkey)
     );
 
@@ -245,7 +246,8 @@ SETTINGS storage_policy = 'hot_backup_policy', deduplicate_merge_projection_mode
 ALTER TABLE solana.hot_token_account_state_bak
     ADD PROJECTION IF NOT EXISTS proj_by_pair
     (
-        SELECT pubkey, mint, owner, amount, state, is_deleted, updated_slot
+        SELECT pubkey, mint, owner, amount, delegate, delegated_amount,
+               state, close_authority, is_deleted, updated_slot
         ORDER BY (mint, owner, pubkey)
     );
 
