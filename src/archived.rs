@@ -93,6 +93,11 @@ where
     }
 
     fn append_vec_count_hint(&self) -> Option<u64> {
+        // Recent Agave snapshots deliberately leave the storage list in the
+        // bank snapshot empty. The archive entries themselves are the list.
+        if self.accounts_db_fields.0.is_empty() {
+            return None;
+        }
         Some(
             self.accounts_db_fields
                 .0
@@ -223,13 +228,19 @@ where
             .map(|v| &v[..])
             .unwrap_or(&[]);
         let known_vec = known_vecs.iter().find(|entry| entry.id == (id as usize));
-        let known_vec = match known_vec {
-            None => return Err(SnapshotError::UnexpectedAppendVec),
-            Some(v) => v,
-        };
         let entry_name = entry.path()?.to_string_lossy().into_owned();
-        let expected_len = known_vec.accounts_current_len as u64;
         let archive_len = entry.size();
+        let expected_len = match known_vec {
+            Some(known_vec) => known_vec.accounts_current_len as u64,
+            None if self.accounts_db_fields.0.is_empty() => archive_len,
+            None => return Err(SnapshotError::UnexpectedAppendVec),
+        };
+        let valid_len = usize::try_from(expected_len).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "AppendVec length exceeds usize",
+            )
+        })?;
         let unused_tail = archive_len.saturating_sub(expected_len);
         let started = Instant::now();
         debug!(
@@ -242,12 +253,7 @@ where
             unused_tail as f64 / (1024.0 * 1024.0),
         );
         let mut progress_reader = AppendVecReadProgress::new(entry, slot, id, expected_len);
-        let append_vec = AppendVec::new_from_reader(
-            &mut progress_reader,
-            known_vec.accounts_current_len,
-            slot,
-            id,
-        )?;
+        let append_vec = AppendVec::new_from_reader(&mut progress_reader, valid_len, slot, id)?;
         let elapsed = started.elapsed();
         debug!(
             "[archive] Decompressed file={entry_name} slot={slot} id={id} valid_len={} bytes ({:.2} MiB) archive_len={} bytes ({:.2} MiB) unused_tail={} bytes ({:.2} MiB) elapsed={:?}",
@@ -312,6 +318,120 @@ impl ArchiveSnapshotExtractor<File> {
 #[cfg(test)]
 mod tests {
     use super::should_process_append_vec_slot;
+
+    #[test]
+    #[ignore = "requires a local snapshot archive"]
+    fn parses_sample_of_modern_snapshot_append_vecs() {
+        use super::ArchiveSnapshotExtractor;
+        use crate::SnapshotExtractor;
+        #[cfg(feature = "standalone")]
+        use solana_program::program_pack::Pack;
+        use solana_sdk::pubkey::Pubkey;
+        use std::{path::Path, str::FromStr};
+
+        let path = std::env::var("SNAPSHOT_PROBE_PATH").expect("set SNAPSHOT_PROBE_PATH");
+        let mut loader = ArchiveSnapshotExtractor::open(Path::new(&path)).unwrap();
+        assert_eq!(loader.append_vec_count_hint(), None);
+        let spl_token = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+        let token_2022 = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
+        let mut files = 0;
+        let mut accounts = 0u64;
+        let mut token_accounts = 0u64;
+        let mut token_mints = 0u64;
+        let mut token_2022_accounts = 0u64;
+        let mut bytes = 0u64;
+        let mut largest_file = 0usize;
+        #[cfg(feature = "standalone")]
+        let mut token_unpack_ok = 0u64;
+        #[cfg(feature = "standalone")]
+        let mut token_unpack_failed = 0u64;
+        #[cfg(feature = "standalone")]
+        let mut mint_unpack_failed = 0u64;
+        #[cfg(feature = "standalone")]
+        let mut token_2022_unpack_ok = 0u64;
+        #[cfg(feature = "standalone")]
+        let mut token_2022_unpack_failed = 0u64;
+        for append_vec in loader.iter().take(100) {
+            let append_vec = append_vec.unwrap();
+            let mut offset = 0;
+            let mut file_accounts = 0;
+            while offset < append_vec.len() {
+                let (account, next) = append_vec.get_account(offset).unwrap_or_else(|| {
+                    panic!(
+                        "invalid record in slot={} id={} at offset={offset} of {}",
+                        append_vec.slot(),
+                        append_vec.id(),
+                        append_vec.len()
+                    )
+                });
+                assert!(next > offset && next <= append_vec.len());
+                if account.account_meta.owner == spl_token && account.data.len() == 165 {
+                    token_accounts += 1;
+                    #[cfg(feature = "standalone")]
+                    if spl_token::state::Account::unpack(account.data).is_ok() {
+                        token_unpack_ok += 1;
+                    } else {
+                        token_unpack_failed += 1;
+                    }
+                }
+                if account.account_meta.owner == spl_token && account.data.len() == 82 {
+                    token_mints += 1;
+                    #[cfg(feature = "standalone")]
+                    if spl_token::state::Mint::unpack(account.data).is_err() {
+                        mint_unpack_failed += 1;
+                    }
+                }
+                if account.account_meta.owner == token_2022 {
+                    token_2022_accounts += 1;
+                    #[cfg(feature = "standalone")]
+                    if spl_token_2022::extension::StateWithExtensions::<
+                        spl_token_2022::state::Account,
+                    >::unpack(account.data)
+                    .is_ok()
+                        || spl_token_2022::extension::StateWithExtensions::<
+                            spl_token_2022::state::Mint,
+                        >::unpack(account.data)
+                        .is_ok()
+                    {
+                        token_2022_unpack_ok += 1;
+                    } else {
+                        token_2022_unpack_failed += 1;
+                    }
+                }
+                file_accounts += 1;
+                offset = next;
+            }
+            if append_vec.len() >= 1024 * 1024 {
+                eprintln!(
+                    "large file: slot={} id={} bytes={} accounts={file_accounts}",
+                    append_vec.slot(),
+                    append_vec.id(),
+                    append_vec.len()
+                );
+            }
+            bytes += append_vec.len() as u64;
+            largest_file = largest_file.max(append_vec.len());
+            accounts += file_accounts;
+            files += 1;
+        }
+        eprintln!("sample: files={files} bytes={bytes} largest_file={largest_file} accounts={accounts} spl_token_accounts={token_accounts} spl_token_mints={token_mints} token_2022_owner={token_2022_accounts}");
+        #[cfg(feature = "standalone")]
+        eprintln!("SPL Token unpack: ok={token_unpack_ok} failed={token_unpack_failed}");
+        #[cfg(feature = "standalone")]
+        eprintln!(
+            "SPL Token mint unpack: ok={} failed={mint_unpack_failed}",
+            token_mints - mint_unpack_failed
+        );
+        #[cfg(feature = "standalone")]
+        eprintln!(
+            "Token-2022 base unpack: ok={token_2022_unpack_ok} failed={token_2022_unpack_failed}"
+        );
+        assert_eq!(files, 100);
+        assert!(accounts > 0);
+        assert!(token_accounts > 0);
+        #[cfg(feature = "standalone")]
+        assert!(token_unpack_ok > 0);
+    }
 
     #[test]
     fn skips_append_vecs_from_already_processed_slots() {

@@ -153,7 +153,10 @@ impl UnpackedSnapshotExtractor {
             .map(|v| &v[..])
             .unwrap_or(&[]);
         let known_vec = known_vecs.iter().find(|entry| entry.id == (id as usize));
-        let known_vec = match known_vec {
+        let archive_len = path.metadata()?.len();
+        let valid_len = match known_vec {
+            Some(known_vec) => known_vec.accounts_current_len as u64,
+            None if self.accounts_db_fields.0.is_empty() => archive_len,
             None => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -166,10 +169,13 @@ impl UnpackedSnapshotExtractor {
                 )
                 .into())
             }
-            Some(v) => v,
         };
-        let archive_len = path.metadata()?.len();
-        let valid_len = known_vec.accounts_current_len as u64;
+        let valid_len_usize = usize::try_from(valid_len).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "AppendVec length exceeds usize",
+            )
+        })?;
         debug!(
             "[unpacked] Opening file={} slot={} id={} file_len={} MiB valid_len={} MiB unused_tail={} MiB",
             path.display(),
@@ -181,21 +187,19 @@ impl UnpackedSnapshotExtractor {
         );
 
         Ok(
-            AppendVec::new_from_file(path, known_vec.accounts_current_len, slot, id).map_err(
-                |e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
+            AppendVec::new_from_file(path, valid_len_usize, slot, id).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
                         "failed to open/parse appendvec {} (slot={}, id={}, expected_len={}): {}",
                         path.display(),
                         slot,
                         id,
-                        known_vec.accounts_current_len,
+                        valid_len,
                         e
                     ),
-                    )
-                },
-            )?,
+                )
+            })?,
         )
     }
 }

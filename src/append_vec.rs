@@ -229,8 +229,9 @@ impl AppendVec {
         slot: u64,
         id: u64,
     ) -> io::Result<Self> {
+        Self::sanitize_len_and_size(current_len, current_len)?;
         let mut map = MmapMut::map_anon(current_len)?;
-        io::copy(&mut reader.take(current_len as u64), &mut map.as_mut())?;
+        reader.read_exact(&mut map[..])?;
         Ok(AppendVec {
             slot,
             id,
@@ -299,5 +300,20 @@ impl AppendVec {
             },
             next,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppendVec;
+
+    #[test]
+    fn rejects_truncated_append_vec_reader() {
+        let mut reader = &b"short"[..];
+        let error = match AppendVec::new_from_reader(&mut reader, 8, 1, 1) {
+            Ok(_) => panic!("truncated AppendVec unexpectedly accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 }
